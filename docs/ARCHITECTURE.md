@@ -116,6 +116,12 @@ bool 读返回 1 字节（`0x00/0x01`）；UInt32 读返回 4 字节小端（`le
 
 每种同名服务可存在多个实例：命令路由必须走 `commandFor()` 的（service IID, characteristic type）匹配，绝不要按 UUID 全局匹配。
 
+### 命名机制（Name 特征）
+
+- 每个服务放 Name 特征 `0x23`（format `0x19`=String，properties `0x0010`=readable），值即 iOS 拼贴的默认名称。
+- **iOS 只在"添加到家庭"那一刻读一次 Name**；之后名称是 iOS 家庭数据库里的用户数据，配件端改名不会同步。要应用新名称：家庭 App 里手动改（长按拼贴 → 配件设置 → 名称），或移除配件重新添加。
+- 需要用户改名持久化到配件端时，加 Configured Name 特征 `0xE3`（String、可写），iOS 改名会回写。本项目暂未实现。
+
 ## 扩展指南：Android 控制原语
 
 新增控制项时的验证顺序：**先 adb shell su 手动验证原语 → 再接入 executor → 最后接 HomeKit**。以下原语均在 Xiaomi 13（MIUI、Magisk root）实测：
