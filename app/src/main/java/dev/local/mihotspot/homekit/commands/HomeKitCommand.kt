@@ -2,9 +2,11 @@ package dev.local.mihotspot.homekit.commands
 
 /** A command exposed through a HomeKit characteristic. */
 enum class HomeKitCommand {
-    SWITCH,
     SCREEN,
-    HOTSPOT
+    BRIGHTNESS,
+    HOTSPOT,
+    MUTE,
+    FLASHLIGHT
 }
 
 data class CommandResult(
@@ -19,4 +21,8 @@ data class CommandResult(
 interface HomeKitCommandExecutor {
     fun execute(command: HomeKitCommand, enabled: Boolean): CommandResult
     fun currentValue(command: HomeKitCommand): Boolean
+
+    /** Numeric characteristic path (for example HomeKit Brightness 0..100). */
+    fun executeValue(command: HomeKitCommand, value: Int): CommandResult = execute(command, value != 0)
+    fun currentValueInt(command: HomeKitCommand): Int? = null
 }

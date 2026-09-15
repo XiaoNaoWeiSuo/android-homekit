@@ -35,6 +35,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.ArrayDeque
+import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.math.BigInteger
@@ -71,14 +72,19 @@ import dev.local.mihotspot.homekit.commands.HomeKitCommand
  */
 class MainActivity : Activity() {
     private lateinit var accessoryInfo: TextView
+    private lateinit var statusInfo: TextView
     private lateinit var manager: BluetoothManager
     private var server: BluetoothGattServer? = null
     private var advertising = false
     private var starting = false
     private val pendingServices = ArrayDeque<BluetoothGattService>()
+    /** GATT characteristic objects are the unambiguous key when two service
+     * instances share the same standard service/characteristic UUID pair. */
+    private val gattCharacteristicDefinitions = IdentityHashMap<BluetoothGattCharacteristic, HapCharacteristic>()
     private val pduResponses = ConcurrentHashMap<String, HapResponse>()
     private val pduRequests = ConcurrentHashMap<String, HapRequestAssembly>()
     private val peerMtu = ConcurrentHashMap<String, Int>()
+    private val connectedDevices = ConcurrentHashMap.newKeySet<String>()
     private val pairSetupSessions = ConcurrentHashMap<String, PairSetupSession>()
     private val pairVerifySessions = ConcurrentHashMap<String, PairVerifySession>()
     private val commandExecutor by lazy { AndroidCommandExecutor(this) }
@@ -90,6 +96,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         manager = getSystemService(BluetoothManager::class.java)
         setContentView(buildUi())
+        updateConnectionStatus()
         createNotificationChannel()
         log("PROBE_CREATED source=Apple_HomeKitADK_f201f98")
         ensurePermissionsAndStart()
@@ -111,7 +118,7 @@ class MainActivity : Activity() {
             setPadding(pad, pad, pad, pad)
         }
         column.addView(TextView(this).apply {
-            text = "Mi Hotspot\nHomeKit 控制桥接"
+            text = "Marionette"
             textSize = 25f
         })
         column.addView(TextView(this).apply {
@@ -121,7 +128,7 @@ class MainActivity : Activity() {
         })
         val deviceName = EditText(this).apply {
             hint = "设备名称"
-            setText(commandPrefs.getString("device_name", "Mi Hotspot"))
+            setText(commandPrefs.getString("device_name", "Android"))
             setSingleLine(true)
         }
         column.addView(deviceName)
@@ -162,19 +169,46 @@ class MainActivity : Activity() {
             text = "重置配件 ID（需重新配对）"
             setOnClickListener { resetAccessoryId() }
         })
+        column.addView(Button(this).apply {
+            text = "清除配对状态（保留配件 ID）"
+            setOnClickListener { clearPairingState() }
+        })
         accessoryInfo = TextView(this).apply {
             text = "配件 ID：${accessoryPairingId()}\nRoot：${if (rootAvailable()) "可用" else "不可用"}"
             textSize = 14f
             setPadding(0, 0, 0, pad / 2)
         }
         column.addView(accessoryInfo)
+        statusInfo = TextView(this).apply {
+            textSize = 15f
+            setPadding(0, 0, 0, pad / 2)
+        }
+        column.addView(statusInfo)
         column.addView(TextView(this).apply {
-            text = "指令开关（关闭后 HomeKit 指令会被记录但不会执行）"
+            text = "功能开关"
             textSize = 16f
         })
-        addCommandToggle(column, HomeKitCommand.SWITCH, "开关", "普通授权")
-        addCommandToggle(column, HomeKitCommand.SCREEN, "手机亮屏/熄屏", "亮屏普通授权；熄屏需设备管理员，Root 可作为后备")
-        addCommandToggle(column, HomeKitCommand.HOTSPOT, "热点", "普通授权可开本地热点；Root 优先 SoftAP，互联网共享仍需系统 tethering")
+        addSectionHeader(column, "需要 Root")
+        addCommandToggle(column, HomeKitCommand.SCREEN, "屏幕电源键（按钮）", "模拟一次实体电源键，自动切换亮屏/熄屏")
+        addCommandToggle(column, HomeKitCommand.HOTSPOT, "手机热点", "Root 优先控制系统 SoftAP；免 Root 仅支持本地热点")
+        addSectionHeader(column, "免 Root / 系统授权")
+        addCommandToggle(column, HomeKitCommand.MUTE, "媒体静音", "系统媒体静音；若被 MIUI 拦截则使用 Root 音量兜底")
+        addCommandToggle(column, HomeKitCommand.FLASHLIGHT, "手机手电筒", "需要相机权限，不需要 Root")
+        column.addView(Button(this).apply {
+            text = "授权手电筒相机权限"
+            setOnClickListener {
+                if (checkSelfPermission(Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
+                } else {
+                    Toast.makeText(this@MainActivity, "相机权限已授权", Toast.LENGTH_SHORT).show()
+                }
+            }
+        })
+        column.addView(TextView(this).apply {
+            text = "屏幕亮度\nHomeKit 中通过 Brightness 滑块控制（需 Root 或允许修改系统设置）"
+            textSize = 15f
+            setPadding(0, 8, 0, 12)
+        })
         column.addView(Button(this).apply {
             text = "启动 HomeKit 服务"
             setOnClickListener { ensurePermissionsAndStart() }
@@ -200,11 +234,13 @@ class MainActivity : Activity() {
     private fun notifyCommand(command: HomeKitCommand, enabled: Boolean, success: Boolean, detail: String) {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
         val label = when (command) {
-            HomeKitCommand.SWITCH -> "开关"
-            HomeKitCommand.SCREEN -> "屏幕"
+            HomeKitCommand.SCREEN -> "屏幕电源键"
+            HomeKitCommand.BRIGHTNESS -> "屏幕亮度"
             HomeKitCommand.HOTSPOT -> "热点"
+            HomeKitCommand.MUTE -> "媒体静音"
+            HomeKitCommand.FLASHLIGHT -> "手电筒"
         }
-        val state = if (enabled) "开启" else "关闭"
+        val state = if (command == HomeKitCommand.SCREEN) "已按下" else if (enabled) "开启" else "关闭"
         val suffix = if (success) "" else "（未执行）"
         val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
@@ -220,15 +256,36 @@ class MainActivity : Activity() {
     }
 
     private fun addCommandToggle(column: LinearLayout, command: HomeKitCommand, label: String, permission: String) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 6, 0, 8)
+        }
         val check = CheckBox(this).apply {
-            text = "$label（${command.name}）\n权限：$permission"
+            text = label
+            minWidth = 0
+            setPadding(0, 0, 0, 0)
             isChecked = commandPrefs.getBoolean("command_enabled_${command.name}", true)
             setOnCheckedChangeListener { _, checked ->
                 commandPrefs.edit().putBoolean("command_enabled_${command.name}", checked).apply()
                 log("COMMAND_TOGGLE command=$command enabled=$checked")
             }
         }
-        column.addView(check)
+        row.addView(check, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        row.addView(TextView(this).apply {
+            text = permission
+            textSize = 12f
+            setTextColor(0xFF707070.toInt())
+            setPadding((getResources().displayMetrics.density * 48).toInt(), 0, 0, 0)
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        column.addView(row)
+    }
+
+    private fun addSectionHeader(column: LinearLayout, title: String) {
+        column.addView(TextView(this).apply {
+            text = title
+            textSize = 14f
+            setPadding(0, 12, 0, 2)
+        })
     }
 
     private fun resetAccessoryId() {
@@ -240,10 +297,24 @@ class MainActivity : Activity() {
             .apply()
         pairSetupSessions.clear()
         pairVerifySessions.clear()
+        updateConnectionStatus()
         if (::accessoryInfo.isInitialized) {
             accessoryInfo.text = "配件 ID：${accessoryPairingId()}\nRoot：${if (rootAvailable()) "可用" else "不可用"}"
         }
         log("ACCESSORY_ID_RESET id=${id.joinToString(":") { "%02X".format(it) }} pairing_cleared=true")
+        if (advertising) { stopProbe(); ensurePermissionsAndStart() }
+    }
+
+    /** Clears a failed / old controller pairing without changing the accessory identity. */
+    private fun clearPairingState() {
+        commandPrefs.edit()
+            .remove("controller_id")
+            .remove("controller_key")
+            .apply()
+        pairSetupSessions.clear()
+        pairVerifySessions.clear()
+        updateConnectionStatus()
+        log("PAIRING_STATE_CLEARED accessory_id_preserved=true")
         if (advertising) { stopProbe(); ensurePermissionsAndStart() }
     }
 
@@ -254,6 +325,19 @@ class MainActivity : Activity() {
         if (!finished) process.destroyForcibly()
         finished && process.exitValue() == 0
     } catch (_: Throwable) { false }
+
+    private fun updateConnectionStatus() {
+        if (!::statusInfo.isInitialized) return
+        val paired = commandPrefs.contains("controller_key")
+        val connection = when {
+            connectedDevices.isNotEmpty() -> "已连接（${connectedDevices.size}）"
+            advertising -> "等待 HomeKit 连接"
+            else -> "未连接"
+        }
+        runOnUiThread {
+            statusInfo.text = "配对状态：${if (paired) "已配对" else "未配对"}\n连接状态：$connection"
+        }
+    }
 
     private fun formatSetupCode44(digits: String): String {
         val clean = digits.filter(Char::isDigit).padEnd(8, '0').take(8)
@@ -298,6 +382,8 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_BLUETOOTH && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }) {
+            ensurePermissionsAndStart()
+        } else if (requestCode == REQUEST_CAMERA) {
             requestNotificationPermissionIfNeeded()
             startProbe()
         } else if (requestCode == REQUEST_BLUETOOTH) {
@@ -355,8 +441,8 @@ class MainActivity : Activity() {
             0x06, 0x2D, (if (isPaired) 0x00 else 0x01).toByte(), // TY, STL, SF
             *accessoryId,
             0x08, 0x00,                               // ACID: Switches
-            0x01, 0x00,                               // GSN
-            0x01,                                     // CN
+            0x05, 0x00,                               // GSN: semantic service layout v5
+            0x05,                                     // CN: force controllers to refresh cached metadata
             0x02                                      // CV
         )
         val settings = AdvertiseSettings.Builder()
@@ -403,11 +489,14 @@ class MainActivity : Activity() {
         pduResponses.clear()
         pduRequests.clear()
         peerMtu.clear()
+        gattCharacteristicDefinitions.clear()
         pairSetupSessions.clear()
         pairVerifySessions.clear()
+        connectedDevices.clear()
         advertising = false
         starting = false
         log("PROBE_STOPPED")
+        updateConnectionStatus()
     }
 
     @SuppressLint("MissingPermission")
@@ -440,7 +529,7 @@ class MainActivity : Activity() {
                 BluetoothGattCharacteristic.PERMISSION_READ
             ).apply { value = definition.iid.leBytes() })
             definition.characteristics.forEach { characteristic ->
-                addCharacteristic(BluetoothGattCharacteristic(
+                val gattCharacteristic = BluetoothGattCharacteristic(
                     hapUuid(characteristic.type),
                     BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE,
                     BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
@@ -449,7 +538,9 @@ class MainActivity : Activity() {
                     addDescriptor(BluetoothGattDescriptor(IID_DESCRIPTOR_UUID, BluetoothGattDescriptor.PERMISSION_READ).apply {
                         value = characteristic.iid.leBytes()
                     })
-                })
+                }
+                gattCharacteristicDefinitions[gattCharacteristic] = characteristic
+                addCharacteristic(gattCharacteristic)
             }
         }
     }
@@ -460,18 +551,19 @@ class MainActivity : Activity() {
         0x21 -> "Xiaomi 13".encodeToByteArray()
         0x23 -> when (characteristic.service.type) {
             0x3E -> (commandPrefs.getString("device_name", "Mi Hotspot") ?: "Mi Hotspot").encodeToByteArray()
-            0x49 -> "总开关".encodeToByteArray()
-            0x47 -> "手机屏幕".encodeToByteArray()
-            0x43 -> "手机热点".encodeToByteArray()
+            0x43 -> if (characteristic.service.iid == 0x0070) "手机手电筒".encodeToByteArray() else "手机屏幕".encodeToByteArray()
+            0x49 -> if (characteristic.service.iid == 0x0050) "媒体静音".encodeToByteArray() else "手机热点".encodeToByteArray()
             0x96 -> "手机电池".encodeToByteArray()
             else -> "HomeKit".encodeToByteArray()
         }
         0x30 -> accessoryPairingId().encodeToByteArray()
         0x52 -> "1.0".encodeToByteArray()
+        0x08 -> byteArrayOf((commandExecutor.currentValueInt(HomeKitCommand.BRIGHTNESS) ?: 0).toByte())
         0x68 -> byteArrayOf(batteryLevel())
         0x79, 0x8F -> byteArrayOf(batteryStatus(characteristic.type))
         0x4F -> byteArrayOf(0)
         0x25 -> byteArrayOf(0)
+        0x11A -> byteArrayOf(0)
         else -> byteArrayOf()
     }
 
@@ -496,18 +588,23 @@ class MainActivity : Activity() {
             advertising = true
             starting = false
             log("BLE_ADVERTISING_STARTED mode=${settingsInEffect.mode} connectable=${settingsInEffect.isConnectable}")
+            updateConnectionStatus()
         }
 
         override fun onStartFailure(errorCode: Int) {
             advertising = false
             starting = false
             log("BLE_ADVERTISING_FAILED code=$errorCode")
+            updateConnectionStatus()
         }
     }
 
     private val gattCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             log("BLE_CONNECTION address=${device.address} status=$status state=${stateName(newState)}")
+            if (newState == BluetoothProfile.STATE_CONNECTED) connectedDevices += device.address
+            else if (newState == BluetoothProfile.STATE_DISCONNECTED) connectedDevices -= device.address
+            updateConnectionStatus()
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 peerMtu.remove(device.address)
                 pduResponses.keys.removeIf { it.startsWith("${device.address}|") }
@@ -541,7 +638,7 @@ class MainActivity : Activity() {
                 }
                 log("HAP_PDU_RESPONSE uuid=${characteristic.uuid} value=${pdu.hex()} final=${response.isFinal}")
                 server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, pdu)
-                if (response.isFinal && HAP_CHARACTERISTICS[characteristicKey(characteristic)]?.type == PAIR_VERIFY_TYPE) {
+                if (response.isFinal && gattDefinition(characteristic)?.type == PAIR_VERIFY_TYPE) {
                     val verify = pairVerifySessions[device.address]
                     if (verify?.activateAfterResponse == true) {
                         verify.active = true
@@ -611,7 +708,7 @@ class MainActivity : Activity() {
         val opcode = request[1].toInt() and 0xFF
         val tid = request[2].toInt() and 0xFF
         val iid = request[3].u8() or (request[4].u8() shl 8)
-        val definition = HAP_CHARACTERISTICS[characteristicKey(characteristic)]
+        val definition = gattDefinition(characteristic)
         val pairingControl = definition?.type == PAIR_SETUP_TYPE || definition?.type == PAIR_VERIFY_TYPE
         val totalBodyBytes = if (request.size >= 7) request[5].u8() or (request[6].u8() shl 8) else 0
         val body = if (request.size >= 7) request.copyOfRange(7, request.size) else byteArrayOf()
@@ -631,7 +728,7 @@ class MainActivity : Activity() {
     }
 
     private fun processHapPdu(device: BluetoothDevice, characteristic: BluetoothGattCharacteristic, opcode: Int, tid: Int, iid: Int, requestBody: ByteArray) {
-        val definition = HAP_CHARACTERISTICS[characteristicKey(characteristic)]
+        val definition = gattDefinition(characteristic)
         val response = when (opcode) {
             HAP_OPCODE_SERVICE_SIGNATURE_READ -> {
                 val service = definition?.service
@@ -656,8 +753,17 @@ class MainActivity : Activity() {
                     HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(0)))
                 } else {
                     commandFor(definition)?.let { command ->
-                        HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(if (commandExecutor.currentValue(command)) 1 else 0)))
+                        if (command == HomeKitCommand.BRIGHTNESS) {
+                            val brightness = commandExecutor.currentValueInt(command) ?: 0
+                            log("CONTROL_STATE_READ command=$command value=$brightness service=0x%02X iid=0x%04X".format(definition.service.type, iid))
+                            HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(brightness.toByte())))
+                        } else {
+                            val enabled = commandExecutor.currentValue(command)
+                            log("CONTROL_STATE_READ command=$command enabled=$enabled service=0x%02X iid=0x%04X".format(definition.service.type, iid))
+                            HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(if (enabled) 1 else 0)))
+                        }
                     } ?: batteryCharacteristicValue(definition)?.let { value ->
+                        log("CONTROL_STATE_READ battery type=0x%02X value=${value.u8()} iid=0x%04X".format(definition.type, iid))
                         HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(value)))
                     } ?: readableCharacteristicValue(definition)?.let { value ->
                         HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, value))
@@ -678,20 +784,37 @@ class MainActivity : Activity() {
                     if (command == null || rawValue == null || rawValue.size != 1) {
                         HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                     } else {
-                        val enabled = rawValue[0].u8() != 0
-                        log("CONTROL_COMMAND_RECEIVED command=$command enabled=$enabled service=0x%02X iid=0x%04X".format(definition.service.type, iid))
+                        val numericValue = rawValue[0].u8()
+                        val enabled = numericValue != 0
+                        log("CONTROL_COMMAND_RECEIVED command=$command value=$numericValue service=0x%02X iid=0x%04X".format(definition.service.type, iid))
                         if (!commandPrefs.getBoolean("command_enabled_${command.name}", true)) {
-                            log("COMMAND_BLOCKED command=$command enabled=$enabled reason=disabled_by_user")
+                            log("COMMAND_BLOCKED command=$command value=$numericValue reason=disabled_by_user")
                             notifyCommand(command, enabled, false, "已在应用中禁用")
                             HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                         } else {
-                            val result = commandExecutor.execute(command, enabled)
-                            log("COMMAND_EXECUTE command=$command enabled=$enabled success=${result.success} message=${result.message}")
+                            val result = if (command == HomeKitCommand.BRIGHTNESS) {
+                                commandExecutor.executeValue(command, numericValue)
+                            } else {
+                                commandExecutor.execute(command, enabled)
+                            }
+                            log("COMMAND_EXECUTE command=$command value=$numericValue success=${result.success} message=${result.message}")
                             notifyCommand(command, enabled, result.success, result.message)
                             HapResponse(tid, if (result.success) HAP_STATUS_SUCCESS else HAP_STATUS_INVALID_REQUEST)
                         }
                     }
                 } else HapResponse(tid, HAP_STATUS_UNSUPPORTED_PDU)
+            }
+            HAP_OPCODE_CHARACTERISTIC_EXECUTE_WRITE -> {
+                if (definition?.type == PAIRINGS_TYPE && iid == definition.iid) {
+                    // HomeKit uses Timed Write followed by Execute Write for
+                    // Pairings management. The management request has already
+                    // been validated and acknowledged above; this PDU commits
+                    // that transaction and carries no body.
+                    log("PAIRINGS_EXECUTE_WRITE_ACK")
+                    HapResponse(tid, HAP_STATUS_SUCCESS)
+                } else {
+                    HapResponse(tid, HAP_STATUS_UNSUPPORTED_PDU)
+                }
             }
             else -> {
                 log("HAP_PDU_UNIMPLEMENTED opcode=0x%02X tid=$tid iid=0x%04X uuid=${characteristic.uuid}".format(opcode, iid))
@@ -713,19 +836,22 @@ class MainActivity : Activity() {
 
     private fun characteristicSignature(characteristic: HapCharacteristic): ByteArray {
         val service = characteristic.service
+        val unit = if (characteristic.type == 0x08) byteArrayOf(0xAD.toByte(), 0x27) else byteArrayOf(0, 0x27)
         return tlv(HAP_TLV_CHARACTERISTIC_TYPE, hapPduUuidBytes(characteristic.type)) +
             tlv(HAP_TLV_SERVICE_INSTANCE_ID, service.iid.leBytes()) +
             tlv(HAP_TLV_SERVICE_TYPE, hapPduUuidBytes(service.type)) +
             tlv(HAP_TLV_CHARACTERISTIC_PROPERTIES, characteristic.properties.leBytes()) +
-            tlv(HAP_TLV_PRESENTATION_FORMAT, byteArrayOf(characteristic.format, 0, 0, 0x27, 1, 0, 0))
+            tlv(HAP_TLV_PRESENTATION_FORMAT, byteArrayOf(characteristic.format, 0, unit[0], unit[1], 1, 0, 0))
     }
 
-    private fun commandFor(characteristic: HapCharacteristic): HomeKitCommand? = when (characteristic.service.type) {
-        0x49 -> HomeKitCommand.SWITCH
-        0x47 -> HomeKitCommand.SCREEN
-        0x43 -> HomeKitCommand.HOTSPOT
+    private fun commandFor(characteristic: HapCharacteristic): HomeKitCommand? = when {
+        characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0030 -> HomeKitCommand.SCREEN
+        characteristic.service.type == 0x43 && characteristic.type == 0x08 && characteristic.service.iid == 0x0030 -> HomeKitCommand.BRIGHTNESS
+        characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0070 -> HomeKitCommand.FLASHLIGHT
+        characteristic.service.type == 0x49 && characteristic.type == 0x25 && characteristic.service.iid == 0x0040 -> HomeKitCommand.HOTSPOT
+        characteristic.service.type == 0x49 && characteristic.type == 0x25 && characteristic.service.iid == 0x0050 -> HomeKitCommand.MUTE
         else -> null
-    }.takeIf { characteristic.type == 0x25 }
+    }
 
     private fun batteryCharacteristicValue(characteristic: HapCharacteristic): Byte? = when (characteristic.service.type) {
         0x96 -> when (characteristic.type) {
@@ -738,7 +864,12 @@ class MainActivity : Activity() {
 
     /** Handles the controller's post-pairing Pairings management transaction. */
     private fun pairingsManagementRequest(device: BluetoothDevice, body: ByteArray, tid: Int): HapResponse {
-        val tlvs = parseTlvs(body)
+        // Characteristic writes carry the Pairings TLVs inside the standard
+        // HAP-Param-Value (type 0x01) wrapper. The Pair Setup / Verify paths
+        // already unwrap this wrapper, so do the same for management writes.
+        val outer = parseTlvs(body)
+        val pairingBody = outer[HAP_TLV_VALUE]?.fold(byteArrayOf()) { acc, part -> acc + part } ?: body
+        val tlvs = parseTlvs(pairingBody)
         val method = tlvs[PAIRING_TLV_METHOD]?.firstOrNull()?.firstOrNull()?.u8()
         val state = tlvs[PAIRING_TLV_STATE]?.firstOrNull()?.firstOrNull()?.u8()
         val identifier = tlvs[PAIRING_TLV_IDENTIFIER]?.fold(byteArrayOf()) { acc, part -> acc + part }
@@ -759,9 +890,10 @@ class MainActivity : Activity() {
             }
             else -> return HapResponse(tid, HAP_STATUS_UNSUPPORTED_PDU)
         }
-        // Pairings management carries its TLVs directly (without the outer
-        // HAP_TLV_VALUE wrapper used by Pair Setup/Verify).
-        return HapResponse(tid, HAP_STATUS_SUCCESS, tlv(PAIRING_TLV_STATE, byteArrayOf(2)))
+        // The ADK Pairings write callback returns a successful HAP status; the
+        // state TLV is part of the characteristic procedure, not a response
+        // PDU body for this write-without-return-response transaction.
+        return HapResponse(tid, HAP_STATUS_SUCCESS)
     }
 
     private fun readableCharacteristicValue(characteristic: HapCharacteristic): ByteArray? = when (characteristic.type) {
@@ -819,6 +951,7 @@ class MainActivity : Activity() {
             .putString("controller_id", Base64.encodeToString(controllerId, Base64.NO_WRAP))
             .putString("controller_key", Base64.encodeToString(controllerKey, Base64.NO_WRAP))
             .apply()
+        updateConnectionStatus()
 
         val accessoryId = accessoryPairingId().encodeToByteArray()
         val accessoryPublicKey = accessoryPrivateKey.generatePublicKey().encoded
@@ -941,6 +1074,8 @@ class MainActivity : Activity() {
     )
     private fun characteristicKey(characteristic: BluetoothGattCharacteristic) =
         HapCharacteristicKey(characteristic.service?.uuid, characteristic.uuid)
+    private fun gattDefinition(characteristic: BluetoothGattCharacteristic): HapCharacteristic? =
+        gattCharacteristicDefinitions[characteristic] ?: HAP_CHARACTERISTICS[characteristicKey(characteristic)]
     private fun responseKey(device: BluetoothDevice, characteristic: BluetoothGattCharacteristic) =
         "${device.address}|${characteristic.service?.uuid}|${characteristic.uuid}"
 
@@ -1001,6 +1136,7 @@ class MainActivity : Activity() {
         private const val TAG = "MiHotspotHap"
         private const val REQUEST_BLUETOOTH = 100
         private const val REQUEST_NOTIFICATIONS = 101
+        private const val REQUEST_CAMERA = 102
         private const val NOTIFICATION_CHANNEL_ID = "homekit_commands"
         private const val NOTIFICATION_BASE_ID = 7300
         private const val APPLE_COMPANY_ID = 0x004C
@@ -1010,6 +1146,7 @@ class MainActivity : Activity() {
         private const val HAP_OPCODE_CHARACTERISTIC_READ = 0x03
         private const val HAP_OPCODE_CHARACTERISTIC_WRITE = 0x02
         private const val HAP_OPCODE_CHARACTERISTIC_TIMED_WRITE = 0x04
+        private const val HAP_OPCODE_CHARACTERISTIC_EXECUTE_WRITE = 0x05
         private const val HAP_OPCODE_SERVICE_SIGNATURE_READ = 0x06
         private const val HAP_STATUS_SUCCESS = 0x00
         private const val HAP_STATUS_UNSUPPORTED_PDU = 0x01
@@ -1142,29 +1279,45 @@ class MainActivity : Activity() {
                 HapCharacteristic(0x4F, 0x0024, 0x0001, 0x04),
                 HapCharacteristic(0x50, 0x0025, 0x0030, 0x1B)
             )),
-            HapService(0x49, 0x0030, primary = true, characteristics = listOf(
+            // The screen is represented as a Lightbulb: its on/off tile has
+            // the closest HomeKit "screen lit / screen dark" visual meaning.
+            HapService(0x43, 0x0030, primary = true, characteristics = listOf(
                 HapCharacteristic(0xA5, 0x0031, 0x0010, 0x1B),
                 HapCharacteristic(0x23, 0x0032, 0x0010, 0x19),
                 HapCharacteristic(0x25, 0x0033, 0x00B0, 0x01),
-                HapCharacteristic(0x23, 0x0034, 0x0010, 0x19)
+                HapCharacteristic(0x08, 0x0034, 0x00B0, 0x04)
             )),
-            // Standard services used as independent Siri Shortcuts targets:
-            // Outlet = screen control, Lightbulb = hotspot control.
-            HapService(0x47, 0x0040, characteristics = listOf(
-                HapCharacteristic(0x25, 0x0041, 0x00B0, 0x01),
-                HapCharacteristic(0x23, 0x0042, 0x0010, 0x19)
+            // A second Lightbulb service gives the phone flashlight its own
+            // visible Home tile while keeping the screen power button separate.
+            HapService(0x43, 0x0070, characteristics = listOf(
+                HapCharacteristic(0xA5, 0x0071, 0x0010, 0x1B),
+                HapCharacteristic(0x23, 0x0072, 0x0010, 0x19),
+                HapCharacteristic(0x25, 0x0073, 0x00B0, 0x01)
             )),
-            HapService(0x43, 0x0050, characteristics = listOf(
-                HapCharacteristic(0x25, 0x0051, 0x00B0, 0x01),
-                HapCharacteristic(0x23, 0x0052, 0x0010, 0x19)
+            // Hotspot is a generic on/off capability, so use HomeKit Switch
+            // rather than an unrelated outlet or light icon.
+            HapService(0x49, 0x0040, characteristics = listOf(
+                HapCharacteristic(0xA5, 0x0041, 0x0010, 0x1B),
+                HapCharacteristic(0x23, 0x0042, 0x0010, 0x19),
+                HapCharacteristic(0x25, 0x0043, 0x00B0, 0x01)
+            )),
+            // Home exposes a generic Switch reliably, while a standalone
+            // Speaker service is treated as a media endpoint and hidden by
+            // some Home versions. Keep the semantic label and mute behavior,
+            // but use the visible Switch service for a Siri/Home toggle.
+            HapService(0x49, 0x0050, characteristics = listOf(
+                HapCharacteristic(0xA5, 0x0051, 0x0010, 0x1B),
+                HapCharacteristic(0x23, 0x0052, 0x0010, 0x19),
+                HapCharacteristic(0x25, 0x0053, 0x00B0, 0x01)
             )),
             // Standard Battery Service. HomeKit reads these values through the
             // encrypted HAP channel so the tile can show the phone's battery.
             HapService(0x96, 0x0060, characteristics = listOf(
-                HapCharacteristic(0x68, 0x0061, 0x0010, 0x04),
-                HapCharacteristic(0x79, 0x0062, 0x0010, 0x04),
-                HapCharacteristic(0x8F, 0x0063, 0x0010, 0x04),
-                HapCharacteristic(0x23, 0x0064, 0x0010, 0x19)
+                HapCharacteristic(0xA5, 0x0061, 0x0010, 0x1B),
+                HapCharacteristic(0x23, 0x0062, 0x0010, 0x19),
+                HapCharacteristic(0x68, 0x0063, 0x0010, 0x04),
+                HapCharacteristic(0x79, 0x0064, 0x0010, 0x04),
+                HapCharacteristic(0x8F, 0x0065, 0x0010, 0x04)
             ))
         )
 
