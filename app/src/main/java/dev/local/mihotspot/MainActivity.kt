@@ -28,8 +28,12 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.os.Handler
+import android.os.Looper
+import java.util.concurrent.atomic.AtomicBoolean
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -73,10 +77,17 @@ import dev.local.mihotspot.homekit.commands.HomeKitCommand
 class MainActivity : Activity() {
     private lateinit var accessoryInfo: TextView
     private lateinit var statusInfo: TextView
+    /** In-app mirrors of the device state; tapping a button executes the same
+     * command path HomeKit uses, so the app and Home stay in sync. */
+    private val stateButtons = mutableMapOf<HomeKitCommand, Button>()
+    private var brightnessSeek: SeekBar? = null
+    private val refreshingState = AtomicBoolean(false)
+    private val brightnessDebounce = Handler(Looper.getMainLooper())
+    private var brightnessPending: Runnable? = null
     private lateinit var manager: BluetoothManager
     private var server: BluetoothGattServer? = null
     private var advertising = false
-    private var starting = false
+    @Volatile private var starting = false
     private val pendingServices = ArrayDeque<BluetoothGattService>()
     /** GATT characteristic objects are the unambiguous key when two service
      * instances share the same standard service/characteristic UUID pair. */
@@ -100,6 +111,20 @@ class MainActivity : Activity() {
         createNotificationChannel()
         log("PROBE_CREATED source=Apple_HomeKitADK_f201f98")
         ensurePermissionsAndStart()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshDeviceState()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Only tear down BLE when the Activity is genuinely finishing (back key /
+        // finish()). MIUI destroys the Activity on screen-off and other transient
+        // lifecycle events; stopping the probe there drops advertising and makes
+        // the accessory show "No Response" in the Home app.
+        if (isFinishing) stopProbe()
     }
 
     private fun loadOrCreateAccessoryPrivateKey(): Ed25519PrivateKeyParameters {
@@ -184,6 +209,39 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, pad / 2)
         }
         column.addView(statusInfo)
+        addSectionHeader(column, "当前状态（点击切换，与 HomeKit 同步）")
+        for (command in listOf(HomeKitCommand.SCREEN, HomeKitCommand.HOTSPOT, HomeKitCommand.MUTE, HomeKitCommand.FLASHLIGHT)) {
+            val button = Button(this).apply {
+                text = stateButtonLabel(command, null)
+                setOnClickListener { runCommandFromUi(command) }
+            }
+            stateButtons[command] = button
+            column.addView(button)
+        }
+        column.addView(TextView(this).apply {
+            text = "屏幕亮度（拖动调节）"
+            textSize = 14f
+        })
+        brightnessSeek = SeekBar(this).apply {
+            max = 100
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    // Debounce: MIUI sysfs writes take ~100-300 ms each; live-drag
+                    // would otherwise queue dozens of root shells.
+                    brightnessPending?.let { brightnessDebounce.removeCallbacks(it) }
+                    val target = progress
+                    brightnessPending = Runnable { setBrightnessFromUi(target) }
+                        .also { brightnessDebounce.postDelayed(it, 300L) }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar) {
+                    brightnessPending?.let { brightnessDebounce.removeCallbacks(it) }
+                    setBrightnessFromUi(seekBar.progress)
+                }
+            })
+        }
+        column.addView(brightnessSeek)
         column.addView(TextView(this).apply {
             text = "功能开关"
             textSize = 16f
@@ -339,6 +397,69 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun stateButtonLabel(command: HomeKitCommand, state: Boolean?): String {
+        val name = when (command) {
+            HomeKitCommand.SCREEN -> "屏幕电源"
+            HomeKitCommand.HOTSPOT -> "热点"
+            HomeKitCommand.MUTE -> "媒体静音"
+            HomeKitCommand.FLASHLIGHT -> "手电筒"
+            HomeKitCommand.BRIGHTNESS -> "屏幕亮度"
+        }
+        val suffix = when (state) {
+            null -> "读取中…"
+            true -> if (command == HomeKitCommand.SCREEN) "亮屏" else if (command == HomeKitCommand.MUTE) "已静音" else "开启"
+            false -> if (command == HomeKitCommand.SCREEN) "熄屏" else if (command == HomeKitCommand.MUTE) "未静音" else "关闭"
+        }
+        return "$name：$suffix"
+    }
+
+    /** Runs on a background thread: every state read spawns root shells on MIUI. */
+    private fun refreshDeviceState() {
+        if (!refreshingState.compareAndSet(false, true)) return
+        Thread {
+            try {
+                val states = listOf(
+                    HomeKitCommand.SCREEN, HomeKitCommand.HOTSPOT,
+                    HomeKitCommand.MUTE, HomeKitCommand.FLASHLIGHT
+                ).associateWith { commandExecutor.currentValue(it) }
+                val brightness = commandExecutor.currentValueInt(HomeKitCommand.BRIGHTNESS) ?: 0
+                runOnUiThread {
+                    states.forEach { (command, state) ->
+                        stateButtons[command]?.let { it.text = stateButtonLabel(command, state) }
+                    }
+                    // Don't fight the user's thumb while the SeekBar is dragged.
+                    brightnessSeek?.takeIf { !it.isPressed }?.progress = brightness
+                }
+            } catch (_: Throwable) {
+            } finally {
+                refreshingState.set(false)
+            }
+        }.start()
+    }
+
+    /** In-app toggle: same executor path as HomeKit writes, then resync the UI. */
+    private fun runCommandFromUi(command: HomeKitCommand) {
+        val button = stateButtons[command] ?: return
+        button.isEnabled = false
+        Thread {
+            val target = !commandExecutor.currentValue(command)
+            val result = commandExecutor.execute(command, target)
+            log("UI_COMMAND command=$command target=$target success=${result.success} message=${result.message}")
+            runOnUiThread {
+                button.isEnabled = true
+                Toast.makeText(this, result.message, Toast.LENGTH_SHORT).show()
+            }
+            refreshDeviceState()
+        }.start()
+    }
+
+    private fun setBrightnessFromUi(value: Int) {
+        Thread {
+            val result = commandExecutor.executeValue(HomeKitCommand.BRIGHTNESS, value)
+            log("UI_BRIGHTNESS value=$value success=${result.success} message=${result.message}")
+        }.start()
+    }
+
     private fun formatSetupCode44(digits: String): String {
         val clean = digits.filter(Char::isDigit).padEnd(8, '0').take(8)
         return "${clean.substring(0, 4)}-${clean.substring(4, 8)}"
@@ -418,14 +539,35 @@ class MainActivity : Activity() {
             return
         }
 
-        server = manager.openGattServer(this, gattCallback)
-        if (server == null) {
-            log("BLE_ERROR gatt_server=null")
-            starting = false
-            return
+        // Open the GATT server off the main thread. Immediately after `install -r`
+        // restarts the process, MIUI's Bluetooth stack can still be tearing down the
+        // previous instance's server; on the main thread openGattServer() can then
+        // block for several seconds and still return null. A background retry loop
+        // keeps the Activity responsive and recovers once the stack is ready.
+        Thread({
+            openGattServerWithRetry()
+        }, "MiHotspotHap-GattOpen").apply { isDaemon = true; start() }
+    }
+
+    private fun openGattServerWithRetry() {
+        for (attempt in 1..GATT_OPEN_MAX_ATTEMPTS) {
+            server = manager.openGattServer(this, gattCallback)
+            if (server != null) {
+                log("GATT_SERVER_OPENED attempt=$attempt")
+                queueGattDatabase()
+                addNextService()
+                return
+            }
+            log("BLE_RETRY gatt_server=null attempt=$attempt")
+            try {
+                Thread.sleep(GATT_OPEN_RETRY_DELAY_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
         }
-        queueGattDatabase()
-        addNextService()
+        log("BLE_ERROR gatt_server=null attempts=$GATT_OPEN_MAX_ATTEMPTS")
+        starting = false
     }
 
     @SuppressLint("MissingPermission")
@@ -442,7 +584,7 @@ class MainActivity : Activity() {
             *accessoryId,
             0x08, 0x00,                               // ACID: Switches
             0x05, 0x00,                               // GSN: semantic service layout v5
-            0x05,                                     // CN: force controllers to refresh cached metadata
+            0x07,                                     // CN: force controllers to refresh cached metadata
             0x02                                      // CV
         )
         val settings = AdvertiseSettings.Builder()
@@ -482,6 +624,7 @@ class MainActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private fun stopProbe() {
+        log("PROBE_STOPPED_TRACE ${Throwable().stackTraceToString().lines().drop(1).take(5).joinToString(" <- ")}")
         manager.adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
         server?.close()
         server = null
@@ -551,8 +694,12 @@ class MainActivity : Activity() {
         0x21 -> "Xiaomi 13".encodeToByteArray()
         0x23 -> when (characteristic.service.type) {
             0x3E -> (commandPrefs.getString("device_name", "Mi Hotspot") ?: "Mi Hotspot").encodeToByteArray()
-            0x43 -> if (characteristic.service.iid == 0x0070) "手机手电筒".encodeToByteArray() else "手机屏幕".encodeToByteArray()
-            0x49 -> if (characteristic.service.iid == 0x0050) "媒体静音".encodeToByteArray() else "手机热点".encodeToByteArray()
+            0x43 -> when (characteristic.service.iid) {
+                0x0070 -> "手机手电筒".encodeToByteArray()
+                0x0080 -> "屏幕亮度".encodeToByteArray()
+                else -> "屏幕电源".encodeToByteArray()
+            }
+            0x49 -> if (characteristic.service.iid == 0x0040) "手机热点".encodeToByteArray() else "媒体静音".encodeToByteArray()
             0x96 -> "手机电池".encodeToByteArray()
             else -> "HomeKit".encodeToByteArray()
         }
@@ -753,10 +900,10 @@ class MainActivity : Activity() {
                     HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(0)))
                 } else {
                     commandFor(definition)?.let { command ->
-                        if (command == HomeKitCommand.BRIGHTNESS) {
+                        if (definition.type == 0x08) {
                             val brightness = commandExecutor.currentValueInt(command) ?: 0
                             log("CONTROL_STATE_READ command=$command value=$brightness service=0x%02X iid=0x%04X".format(definition.service.type, iid))
-                            HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(brightness.toByte())))
+                            HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, brightness.leBytes32()))
                         } else {
                             val enabled = commandExecutor.currentValue(command)
                             log("CONTROL_STATE_READ command=$command enabled=$enabled service=0x%02X iid=0x%04X".format(definition.service.type, iid))
@@ -781,10 +928,13 @@ class MainActivity : Activity() {
                 } else if (definition != null && iid == definition.iid) {
                     val command = commandFor(definition)
                     val rawValue = parseTlvs(requestBody)[HAP_TLV_VALUE]?.fold(byteArrayOf()) { acc, part -> acc + part }
-                    if (command == null || rawValue == null || rawValue.size != 1) {
+                    // Bool characteristics arrive as a single byte; numeric ones
+                    // (e.g. Brightness, declared UInt32) arrive as little-endian
+                    // 2/4-byte integers, so decode by length instead of size!=1.
+                    val numericValue = rawValue?.let { decodeWriteValue(it) }
+                    if (command == null || numericValue == null) {
                         HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                     } else {
-                        val numericValue = rawValue[0].u8()
                         val enabled = numericValue != 0
                         log("CONTROL_COMMAND_RECEIVED command=$command value=$numericValue service=0x%02X iid=0x%04X".format(definition.service.type, iid))
                         if (!commandPrefs.getBoolean("command_enabled_${command.name}", true)) {
@@ -792,13 +942,14 @@ class MainActivity : Activity() {
                             notifyCommand(command, enabled, false, "已在应用中禁用")
                             HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                         } else {
-                            val result = if (command == HomeKitCommand.BRIGHTNESS) {
+                            val result = if (definition.type == 0x08) {
                                 commandExecutor.executeValue(command, numericValue)
                             } else {
                                 commandExecutor.execute(command, enabled)
                             }
                             log("COMMAND_EXECUTE command=$command value=$numericValue success=${result.success} message=${result.message}")
                             notifyCommand(command, enabled, result.success, result.message)
+                            refreshDeviceState()
                             HapResponse(tid, if (result.success) HAP_STATUS_SUCCESS else HAP_STATUS_INVALID_REQUEST)
                         }
                     }
@@ -846,8 +997,9 @@ class MainActivity : Activity() {
 
     private fun commandFor(characteristic: HapCharacteristic): HomeKitCommand? = when {
         characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0030 -> HomeKitCommand.SCREEN
-        characteristic.service.type == 0x43 && characteristic.type == 0x08 && characteristic.service.iid == 0x0030 -> HomeKitCommand.BRIGHTNESS
         characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0070 -> HomeKitCommand.FLASHLIGHT
+        characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0080 -> HomeKitCommand.BRIGHTNESS
+        characteristic.service.type == 0x43 && characteristic.type == 0x08 && characteristic.service.iid == 0x0080 -> HomeKitCommand.BRIGHTNESS
         characteristic.service.type == 0x49 && characteristic.type == 0x25 && characteristic.service.iid == 0x0040 -> HomeKitCommand.HOTSPOT
         characteristic.service.type == 0x49 && characteristic.type == 0x25 && characteristic.service.iid == 0x0050 -> HomeKitCommand.MUTE
         else -> null
@@ -1072,10 +1224,21 @@ class MainActivity : Activity() {
         (shortUuid and 0xFF).toByte(), ((shortUuid ushr 8) and 0xFF).toByte(),
         ((shortUuid ushr 16) and 0xFF).toByte(), ((shortUuid ushr 24) and 0xFF).toByte()
     )
-    private fun characteristicKey(characteristic: BluetoothGattCharacteristic) =
-        HapCharacteristicKey(characteristic.service?.uuid, characteristic.uuid)
-    private fun gattDefinition(characteristic: BluetoothGattCharacteristic): HapCharacteristic? =
-        gattCharacteristicDefinitions[characteristic] ?: HAP_CHARACTERISTICS[characteristicKey(characteristic)]
+    private fun gattDefinition(characteristic: BluetoothGattCharacteristic): HapCharacteristic? {
+        gattCharacteristicDefinitions[characteristic]?.let { return it }
+        // MIUI can hand the callback a different BluetoothGattCharacteristic
+        // instance than the one passed to addService(). A UUID-keyed lookup would
+        // collide across the two Lightbulb / two Switch services, so fall back on
+        // the globally unique instance ID carried by the IID descriptor.
+        val iid = characteristic.descriptors
+            .firstOrNull { it.uuid == IID_DESCRIPTOR_UUID }
+            ?.value
+            ?.takeIf { it.size >= 2 }
+            ?.let { it[0].u8() or (it[1].u8() shl 8) }
+        val definition = iid?.let { characteristicsByIid[it] }
+        if (definition == null) log("GATT_DEFINITION_MISS uuid=${characteristic.uuid} iid=$iid")
+        return definition
+    }
     private fun responseKey(device: BluetoothDevice, characteristic: BluetoothGattCharacteristic) =
         "${device.address}|${characteristic.service?.uuid}|${characteristic.uuid}"
 
@@ -1085,7 +1248,24 @@ class MainActivity : Activity() {
     }
 
     private fun Int.leBytes() = byteArrayOf((this and 0xFF).toByte(), ((this ushr 8) and 0xFF).toByte())
+    private fun Int.leBytes32() = byteArrayOf(
+        (this and 0xFF).toByte(), ((this ushr 8) and 0xFF).toByte(),
+        ((this ushr 16) and 0xFF).toByte(), ((this ushr 24) and 0xFF).toByte()
+    )
     private fun Byte.u8() = toInt() and 0xFF
+
+    /** Decodes a HAP BLE characteristic write value by its length: bool is one
+     * byte, UInt16/UInt32 are little-endian, and a 4-byte value above 100 is
+     * reinterpreted as float32 in case a controller honours the HAP float form. */
+    private fun decodeWriteValue(raw: ByteArray): Int? = when (raw.size) {
+        1 -> raw[0].u8()
+        2 -> raw[0].u8() or (raw[1].u8() shl 8)
+        4 -> {
+            val le = raw[0].u8() or (raw[1].u8() shl 8) or (raw[2].u8() shl 16) or (raw[3].u8() shl 24)
+            if (le in 0..100) le else Float.fromBits(le).takeIf { it.isFinite() }?.toInt()
+        }
+        else -> null
+    }
     private fun BigInteger.toUnsignedFixed(size: Int): ByteArray {
         val raw = toByteArray().let { if (it.size > 1 && it[0] == 0.toByte()) it.drop(1).toByteArray() else it }
         require(raw.size <= size)
@@ -1141,6 +1321,8 @@ class MainActivity : Activity() {
         private const val NOTIFICATION_BASE_ID = 7300
         private const val APPLE_COMPANY_ID = 0x004C
         private const val DEFAULT_ATT_MTU = 23
+        private const val GATT_OPEN_MAX_ATTEMPTS = 5
+        private const val GATT_OPEN_RETRY_DELAY_MS = 1500L
         private const val HAP_REQUEST_HEADER_BYTES = 5
         private const val HAP_OPCODE_CHARACTERISTIC_SIGNATURE_READ = 0x01
         private const val HAP_OPCODE_CHARACTERISTIC_READ = 0x03
@@ -1206,7 +1388,6 @@ class MainActivity : Activity() {
             lateinit var service: HapService
         }
 
-        private data class HapCharacteristicKey(val serviceUuid: UUID?, val characteristicUuid: UUID)
         private data class HapRequestAssembly(
             val opcode: Int,
             val tid: Int,
@@ -1279,13 +1460,21 @@ class MainActivity : Activity() {
                 HapCharacteristic(0x4F, 0x0024, 0x0001, 0x04),
                 HapCharacteristic(0x50, 0x0025, 0x0030, 0x1B)
             )),
-            // The screen is represented as a Lightbulb: its on/off tile has
-            // the closest HomeKit "screen lit / screen dark" visual meaning.
+            // Screen power is a plain on/off light: every toggle is one physical
+            // power-key press, with no brightness coupling in this service.
             HapService(0x43, 0x0030, primary = true, characteristics = listOf(
                 HapCharacteristic(0xA5, 0x0031, 0x0010, 0x1B),
                 HapCharacteristic(0x23, 0x0032, 0x0010, 0x19),
-                HapCharacteristic(0x25, 0x0033, 0x00B0, 0x01),
-                HapCharacteristic(0x08, 0x0034, 0x00B0, 0x04)
+                HapCharacteristic(0x25, 0x0033, 0x00B0, 0x01)
+            )),
+            // Screen brightness lives in its own Lightbulb so iOS does not couple
+            // the brightness slider with the power switch above. Both its On and
+            // Brightness characteristics map to the phone's backlight level.
+            HapService(0x43, 0x0080, characteristics = listOf(
+                HapCharacteristic(0xA5, 0x0081, 0x0010, 0x1B),
+                HapCharacteristic(0x23, 0x0082, 0x0010, 0x19),
+                HapCharacteristic(0x25, 0x0083, 0x00B0, 0x01),
+                HapCharacteristic(0x08, 0x0084, 0x00B0, 0x04)
             )),
             // A second Lightbulb service gives the phone flashlight its own
             // visible Home tile while keeping the screen power button separate.
@@ -1321,10 +1510,8 @@ class MainActivity : Activity() {
             ))
         )
 
-        private val HAP_CHARACTERISTICS: Map<HapCharacteristicKey, HapCharacteristic> =
-            HAP_SERVICES.flatMap { it.characteristics }.associateBy {
-                HapCharacteristicKey(hapUuid(it.service.type), hapUuid(it.type))
-            }
+        private val characteristicsByIid: Map<Int, HapCharacteristic> =
+            HAP_SERVICES.flatMap { it.characteristics }.associateBy { it.iid }
 
         private fun hapUuid(shortUuid: Int): UUID =
             UUID.fromString("%08X-0000-1000-8000-0026BB765291".format(shortUuid))
