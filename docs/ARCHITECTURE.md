@@ -14,23 +14,50 @@ Marionette 把一台 Android 手机实现为一个仅用于个人实验的 HomeK
 iPhone 家庭 App
     │ HAP 广播发现 / BLE GATT / 加密 HAP PDU
     ▼
-MainActivity.kt
+MainActivity.kt (View)
+    ├── 权限请求、原生 UI 渲染
+    └── MainViewModel
+             │
+HomeKitService.kt (Runtime)
     ├── BLE 广播：Apple manufacturer data、配件 ID、GSN/CN
     ├── GATT Server：按顺序发布 HomeKit 服务和特征
     ├── HAP 事务：签名、Pair Setup、Pair Verify、加密控制读写
-    ├── 状态：配对控制器、公钥、连接设备、通知和 UI 状态
-    └── Command boundary
+    └── 状态：配对控制器、公钥、连接设备、前台通知
+             │
+             └── Command boundary
              ▼
 homekit/commands/AndroidCommandExecutor.kt
     ├── Root shell：电源键、SoftAP、系统亮度、媒体音量兜底
     └── Android API：Camera torch、AudioManager、WifiManager、PowerManager
 ```
 
-`MainActivity` 目前同时承载 UI、BLE transport 和 HAP session；这是为快速真机验证而做的取舍。所有具副作用的手机操作集中在 `HomeKitCommandExecutor` 接口之后，后续可无破坏地将 HAP transport 拆到独立类或 Service。
+BLE/HAP runtime 由前台 `HomeKitService` 独占，UI 关闭不会停止广播。`MainViewModel` 承担 UI 状态读取、用户命令和配对码校验；所有具副作用的手机操作集中在 `HomeKitCommandExecutor` 接口之后。
+
+## 源码目录与 MVVM 边界
+
+```text
+app/src/main/java/dev/local/mihotspot/
+├── MainActivity.kt                         View：原生 Android UI、权限请求、ViewModel 渲染
+├── HomeKitService.kt                       Android Service 入口：仅绑定 Manifest 到 core runtime
+├── BootReceiver.kt                         Runtime：开机/更新后恢复前台服务
+├── data/
+│   └── AccessorySettingsRepository.kt      Model data：配件 ID、配对与用户配置持久化
+├── domain/
+│   └── HomeKitFeature.kt                   Model：功能开关的稳定产品语义与展示元数据
+├── ui/
+│   └── MainViewModel.kt                    ViewModel：UI 状态、用户命令、配对码校验与文案
+├── homekit/commands/
+│   ├── HomeKitCommand.kt                   命令边界：HAP 可执行命令、结果与接口
+│   └── AndroidCommandExecutor.kt           Android/Root 效果与真实状态读回
+└── core/homekit/
+    └── HomeKitRuntime.kt                   稳定基础设施：BLE、GATT、HAP、配对与加密
+```
+
+依赖方向固定为 `MainActivity → MainViewModel → domain/data + HomeKitCommandExecutor`。`HomeKitService` 只是 Android 生命周期入口，`core/homekit/HomeKitRuntime` 使用相同的命令接口但不依赖 View 或 ViewModel；不要再把 GATT、配对或加密逻辑放回 UI 层。
 
 ## 配对与加密通道
 
-实现位于 `app/src/main/java/dev/local/mihotspot/MainActivity.kt`：
+实现位于 `app/src/main/java/dev/local/mihotspot/HomeKitService.kt`：
 
 1. 未配对/已配对广播均包含 Apple Company ID `0x004C` 和 HAP BLE payload。
 2. iPhone 连接 GATT 后，先读取 Service/Characteristic Signature；实现会按 HAP PDU 返回服务属性、IID、类型、属性及 presentation format。
@@ -49,7 +76,7 @@ homekit/commands/AndroidCommandExecutor.kt
 
 ## GATT 服务模型
 
-所有 UUID 使用 HomeKit base UUID `00000000-0000-1000-8000-0026BB765291`。配置号（CN）当前为 **7**、全局状态号（GSN）为 **5**；增加或变更服务语义时应继续递增 CN，使家庭 App 刷新缓存。
+所有 UUID 使用 HomeKit base UUID `00000000-0000-1000-8000-0026BB765291`。配置号（CN）当前为 **8**、全局状态号（GSN）为 **6**；增加或变更服务语义时应继续递增 CN，使家庭 App 刷新缓存。
 
 | 服务 | 服务 IID | 关键特征 IID | 作用 |
 | --- | ---: | --- | --- |
@@ -64,6 +91,24 @@ homekit/commands/AndroidCommandExecutor.kt
 | Battery `0x96` | `0x0060` | Name `0x0062`、Level `0x0063`、Low `0x0064`、Charging `0x0065` | 手机电量 |
 
 同一种标准服务和特征 UUID 可出现多次（三个 Lightbulb、两个 Switch）。Android 的 UUID 不足以区分实例，因此 `gattDefinition` 先用 `IdentityHashMap<BluetoothGattCharacteristic, HapCharacteristic>` 按对象反查；MIUI 回调可能传回不同对象实例，此时退回用 IID 描述符（全局唯一）反查。请勿改回仅依 UUID 的 Map，否则名称和命令会串到其他服务。
+
+### 新增服务/开关的推荐模板
+
+先写一张定义表，再写代码。每一行都必须有唯一 service IID、唯一 characteristic IID、HomeKit type、值格式、读写属性和执行命令：
+
+| 项目 | 普通开关示例 | 数值控制示例 | 名称示例 |
+| --- | --- | --- | --- |
+| Service type | `0x49` Switch | `0x43` Lightbulb 或对应标准服务 | 所属服务 |
+| Service IID | 新分配，例如 `0x0090` | 新分配 | 不复用旧 IID |
+| Characteristic type | `0x25` On | 标准数值 UUID，例如 `0x08` Brightness | `0x23` Name + `0xE3` Configured Name |
+| Characteristic IID | 新分配，例如 `0x0093` | 每个特征单独分配 | 两个名称特征也不能共用 |
+| Properties | `0x00B0`（当前项目 On 的读写/通知组合） | 按标准服务定义 | Name=`0x0010`，Configured Name=`0x0030` |
+| Format | `0x01` Bool | 与实际值宽度一致 | `0x19` UTF-8 String |
+| 状态来源 | executor 的真实状态 | executor 的真实数值 | SharedPreferences/服务配置 |
+
+IID 是 HAP 实例身份，不是随意编号。新 IID 不能与任何已有 service/characteristic IID 冲突；同一服务内的 IID 也不能复用。定义完成后，再依次补 `HAP_SERVICES`、初始值、签名、读取、写入、命令路由和 executor。
+
+不要只增加一个 `On` 特征就假定 Home 会正确显示。Home 根据完整服务类型、特征集合、读写属性、presentation format 和配置缓存决定图标、标题及“支持/不支持”状态。
 
 ## 命令层与权限
 
@@ -83,27 +128,62 @@ homekit/commands/AndroidCommandExecutor.kt
 
 新增/修改特征时必须同时满足以下三条，否则会出现“写入到达但不执行”或“读取显示错乱”。
 
-### 1. 声明正确的 presentation format
+### 1. 先区分四个“类型”
 
-`HapCharacteristic(type, iid, properties, format)` 第 4 个参数是 HAP 格式码（见 `vendor/HomeKitADK/HAP/HAP.h`）：
+新增特征时不要只记一个 UUID 或一个数字。必须同时确定：
 
-| format 码 | 含义 | iOS 写入字节数 | 适用 |
+| 层 | 代码位置 | 必须一致的内容 |
+| --- | --- | --- |
+| HomeKit 类型 | `HapCharacteristic.type` | 特征 UUID，例如 `0x25=On`、`0x08=Brightness`、`0x23=Name` |
+| 实例身份 | `iid` + 所属 service IID | 同 UUID 的多个服务必须靠 IID 区分 |
+| 值格式 | `format` | Bool、UInt、Float、String、TLV8 等；决定 HomeKit 编解码 |
+| 读写能力 | `properties` | `0x0010=readable`、`0x0020=writable`；读写特征用 `0x0030` |
+
+`HapCharacteristic(type, iid, properties, format)` 的第 4 个参数是 HAP BLE signature 中的 presentation format，不是特征 UUID，也不是 Android `BluetoothGattCharacteristic` 的属性位。
+
+当前项目使用的格式约定：
+
+| format | 值类型 | HAP BLE 值字节 | 本项目示例 |
 | ---: | --- | --- | --- |
-| `0x01` | Bool | 1 | On 等开关 |
-| `0x02` | UInt8 | 1 | 0–255 数值 |
-| `0x03` | UInt16 | 2 | 较大数值 |
-| `0x04` | UInt32 | 4 | 本项目 Brightness 使用 |
-| `0x07` | Float | 4（IEEE754） | 温度等 |
+| `0x01` | Bool | 1，`0x00/0x01` | On |
+| `0x02` | UInt8 | 1，小端 | 0–255 的小数值 |
+| `0x03` | UInt16 | 2，小端 | 需要 16 位整数时 |
+| `0x04` | UInt32 | 4，小端 | Brightness、Battery Level 当前声明 |
+| `0x07` | Float | 4，IEEE-754 | 温度等浮点值 |
+| `0x19` | String | UTF-8 字节 | Name、Configured Name |
+| `0x1B` | TLV8/Data | TLV 或原始字节 | Pair Setup、Pair Verify |
 
-iOS 严格按声明的格式编码写入值、解析读取值。格式声明与实际编解码不一致 = 控制无效。
+不要把 `characteristic.type == 0x08` 误认为 format；`0x08` 在本项目中是 Brightness 特征 UUID，Brightness 的 format 是 `0x04`。
 
-### 2. 写入按字节长度解码，不要假设 1 字节
+已知遗留项：当前 Battery 的 `Level/Low/Charging` 定义仍使用 `format=0x04`，但读取路径返回单字节值。新增电池类特征时不要复制这个组合；应统一为“声明 UInt32 并返回 4 字节”，或把声明改为实际的一字节格式并同步验证 Home 解析结果。
 
-`processHapPdu` 的写分发用 `decodeWriteValue()`：1 字节 → bool/uint8；2/4 字节 → 小端整数；4 字节且数值超界时回退按 float32 位解释。**不要**改回 `rawValue.size != 1` 的校验——那会把 UInt32 的亮度写入静默丢弃（iOS 只收到 INVALID_REQUEST，日志里只见 `HAP_PDU_REQUEST` 不见 `COMMAND_EXECUTE`）。
+### 2. 新增不同类型值时，必须分别实现读、写、状态
 
-### 3. 读取按声明格式编码
+`processHapPdu()` 当前的 `decodeWriteValue()` 只适合 Bool/UInt 类数值。新增特征时应按特征类型分支，不能把所有写入都转成 `Int`：
 
-bool 读返回 1 字节（`0x00/0x01`）；UInt32 读返回 4 字节小端（`leBytes32()`）。长度不符会导致 iOS 解析失败、tile 状态不刷新。
+| 值类型 | 写入解码 | 读取编码 | 禁止的做法 |
+| --- | --- | --- | --- |
+| Bool | 只接受 1 字节，规范化为 `0/1` | 1 字节 | 用字符串或 4 字节整数判断开关 |
+| UInt8/16/32 | 按声明宽度以小端解码，校验 min/max | 固定返回 1/2/4 字节 | 按收到的长度猜类型 |
+| Float | 只接受 4 字节，`Float.fromBits()`，校验有限值和范围 | 4 字节 IEEE-754 | 把 float 的 bit pattern 当普通整数执行 |
+| String | UTF-8 解码，校验非空、长度和 UTF-8 合法性 | UTF-8 字节 | 走 `decodeWriteValue()` |
+| TLV8/Data | 保留原始字节，按 TLV schema 解析 | 按协议组装 TLV/字节 | 当作字符串或数字 |
+
+当前 `decodeWriteValue()` 对 1/2/4 字节整数提供兼容处理，4 字节超出 `0..100` 时尝试 Float；这只是现有 Brightness 的兼容逻辑。新增 Float、String、TLV8 特征必须增加显式 type/format 分支，避免错误值被“猜对”或静默执行。
+
+### 3. 读写链路必须闭环
+
+新增一个可控值，必须同时完成以下位置，否则会出现“写入到达但不执行”或“Home 一直正在更新”：
+
+1. `HAP_SERVICES`：服务 IID、特征 IID、UUID、`properties`、`format`。
+2. `characteristicSignature()`：类型、服务 IID、服务类型、属性和 presentation format。
+3. `initialCharacteristicValue()` / `readableCharacteristicValue()`：首次 GATT 值和 HAP 读取值。
+4. `commandFor()`：用 `(service.iid, characteristic.type)` 路由，不能只用 UUID。
+5. `processHapPdu()`：按值类型解码，成功/失败返回正确 HAP 状态。
+6. `AndroidCommandExecutor`：实际执行与真实状态读回。
+7. 若要让 Home 实时刷新：增加事件通知支持，并在底层状态变化时发送通知；仅靠进程内缓存不能证明硬件状态。
+
+bool 读必须返回 1 字节；UInt32 必须返回 4 字节小端（`leBytes32()`）。长度、格式或 TLV 外层包装不一致时，Home 可能只显示“正在更新”或“不支持”，而 Android 动作本身未必有问题。
 
 ### 各类型开关的正确建法
 
@@ -116,11 +196,35 @@ bool 读返回 1 字节（`0x00/0x01`）；UInt32 读返回 4 字节小端（`le
 
 每种同名服务可存在多个实例：命令路由必须走 `commandFor()` 的（service IID, characteristic type）匹配，绝不要按 UUID 全局匹配。
 
+### 服务元数据与 GATT 层的边界
+
+`service()` 当前为 Android GATT 特征统一创建 READ/WRITE 权限；HomeKit 真正看到的能力来自加密 HAP 的 Characteristic Signature。因此新增特征时，必须以 HAP signature 的 `properties` 和 `format` 为准，不能因为 Android GATT 层可写就认为 HomeKit 允许写入。
+
+特别注意：
+
+- Name `0x23` 是只读展示值；用户改名必须写 Configured Name `0xE3`，不能把 Name 当作普通命令处理。
+- Configured Name 写入必须按 UTF-8 处理、持久化，并让后续 Name 读取返回同一个值。
+- 新增或删除特征、改变服务类型、改变特征属性/格式或 IID 后，必须递增 CN；服务语义或状态模型变化同时递增 GSN。
+- 旧的 Home 配件可能继续使用缓存的服务定义。验证元数据时，应记录广播中的 CN/GSN，并在必要时移除旧配件后重新添加；不要通过重置配件 ID 绕过缓存。
+
+### 提交前的最小验证矩阵
+
+每个新开关或数值特征至少验证以下五条：
+
+1. Signature Read：日志中的 type、service IID、characteristic IID、properties、format 与定义表一致。
+2. Read：Home 发起读取后出现 `HAP_PDU_REQUEST opcode=0x03`，返回长度与 format 一致。
+3. Write：Home 发起写入后出现 `CONTROL_COMMAND_RECEIVED` 和 `COMMAND_EXECUTE`；只有 `HAP_PDU_REQUEST` 没有这两条，优先检查 TLV 外层和值长度。
+4. State：执行后再次读取，返回值必须来自真实底层状态，而不是只来自上次写入的缓存。
+5. Metadata：Name/Configured Name 读取和写入都成功，服务名称不会退回“灯/开关”；CN/GSN 已更新。
+
+HAP 返回状态的定位：`0x00` 是成功，`0x01` 是 Unsupported PDU，`0x04` 是无效 IID，`0x06` 是无效请求。日志中的 Home UI 文案“正在更新/不支持”不能直接等同于 Android executor 失败，必须结合对应的 `HAP_PDU_REQUEST`、响应状态和 `COMMAND_EXECUTE` 判断。
+
 ### 命名机制（Name 特征）
 
 - 每个服务放 Name 特征 `0x23`（format `0x19`=String，properties `0x0010`=readable），值即 iOS 拼贴的默认名称。
 - **iOS 只在"添加到家庭"那一刻读一次 Name**；之后名称是 iOS 家庭数据库里的用户数据，配件端改名不会同步。要应用新名称：家庭 App 里手动改（长按拼贴 → 配件设置 → 名称），或移除配件重新添加。
-- 需要用户改名持久化到配件端时，加 Configured Name 特征 `0xE3`（String、可写），iOS 改名会回写。本项目暂未实现。
+- 每个带 Name 的服务同时提供 Configured Name 特征 `0xE3`（String、可读写）；Home/iOS 改名会按服务 IID 持久化到 `SharedPreferences`，Name 读取返回该自定义名称。
+- Accessory Information 的 Configured Name 映射到应用中的 `device_name`；其他服务使用 `service_name_<service IID>` 独立保存，避免同 UUID 服务串名。
 
 ## 扩展指南：Android 控制原语
 
@@ -166,4 +270,4 @@ bool 读返回 1 字节（`0x00/0x01`）；UInt32 读返回 4 字节小端（`le
 
 ## 验证基线
 
-2026-09-15 最后一次真机启动日志确认：9 个 GATT 服务全部 `status=0` 发布，`GATT_DATABASE_PUBLISHED services=9`，随后 `BLE_ADVERTISING_STARTED ... connectable=true`，广播 `CN=0x07`。各命令在日志中均返回 `success=true`（热点/电源/静音/手电筒/亮度）。
+2026-09-15 最后一次真机启动日志确认：9 个 GATT 服务全部 `status=0` 发布，`GATT_DATABASE_PUBLISHED services=9`，随后 `BLE_ADVERTISING_STARTED ... connectable=true`，广播 `CN=0x08`。各命令在日志中均返回 `success=true`（热点/电源/静音/手电筒/亮度）。
