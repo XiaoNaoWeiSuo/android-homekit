@@ -2,6 +2,7 @@ package dev.local.mihotspot.ui
 
 import android.content.Context
 import dev.local.mihotspot.data.AccessorySettingsRepository
+import dev.local.mihotspot.data.HomeKitRecoveryResult
 import dev.local.mihotspot.domain.HomeKitFeature
 import dev.local.mihotspot.homekit.commands.AndroidCommandExecutor
 import dev.local.mihotspot.homekit.commands.CommandResult
@@ -20,12 +21,14 @@ class MainViewModel(context: Context) {
 
     data class State(
         val featureStates: Map<HomeKitFeature, Boolean>,
-        val brightness: Int
+        val brightness: Int,
+        val volume: Int
     )
 
     fun loadState(): State = State(
         featureStates = HomeKitFeature.tileFeatures.associateWith { executor.currentValue(it.command) },
-        brightness = executor.currentValueInt(HomeKitCommand.BRIGHTNESS) ?: 0
+        brightness = executor.currentValueInt(HomeKitCommand.BRIGHTNESS) ?: 0,
+        volume = executor.currentValueInt(HomeKitCommand.VOLUME) ?: 0
     )
 
     fun toggle(feature: HomeKitFeature): CommandResult {
@@ -35,6 +38,9 @@ class MainViewModel(context: Context) {
 
     fun setBrightness(value: Int): CommandResult =
         executor.executeValue(HomeKitCommand.BRIGHTNESS, value.coerceIn(0, 100))
+
+    fun setVolume(value: Int): CommandResult =
+        executor.executeValue(HomeKitCommand.VOLUME, value.coerceIn(0, 100))
 
     fun buttonLabel(feature: HomeKitFeature, state: Boolean?): String {
         val suffix = when (state) {
@@ -65,6 +71,7 @@ class MainViewModel(context: Context) {
     fun saveSetupCode(digits: String) = settings.saveSetupCode(digits)
     fun clearPairing() = settings.clearPairing()
     fun resetAccessoryId(): String = settings.resetAccessoryId()
+    fun recoverHomeKitIdentity(): HomeKitRecoveryResult = settings.recoverHomeKitIdentity()
     fun accessoryId(): String = settings.accessoryId()
     fun isFeatureEnabled(feature: HomeKitFeature): Boolean = settings.isFeatureEnabled(feature)
     fun setFeatureEnabled(feature: HomeKitFeature, enabled: Boolean) = settings.setFeatureEnabled(feature, enabled)

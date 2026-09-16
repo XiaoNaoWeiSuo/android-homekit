@@ -6,7 +6,12 @@ enum class HomeKitCommand {
     BRIGHTNESS,
     HOTSPOT,
     MUTE,
-    FLASHLIGHT
+    FLASHLIGHT,
+    GPS,
+    LOW_POWER_MODE,
+    DO_NOT_DISTURB,
+    /** Local media-volume slider; not exposed as a HomeKit tile. */
+    VOLUME
 }
 
 data class CommandResult(

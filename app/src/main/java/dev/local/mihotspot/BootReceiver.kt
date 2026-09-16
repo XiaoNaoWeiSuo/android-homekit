@@ -13,10 +13,9 @@ class BootReceiver : BroadcastReceiver() {
                 Intent.ACTION_LOCKED_BOOT_COMPLETED,
                 Intent.ACTION_MY_PACKAGE_REPLACED
             )) return
-        val service = Intent(context, HomeKitService::class.java)
+        if (!ServiceControl.isEnabled(context)) return
         try {
-            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(service)
-            else context.startService(service)
+            ServiceControl.start(context)
         } catch (error: Throwable) {
             android.util.Log.e("MiHotspotHap", "BOOT_SERVICE_START_FAILED", error)
         }

@@ -24,11 +24,16 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         HomeKitCommand.BRIGHTNESS to false,
         HomeKitCommand.HOTSPOT to false,
         HomeKitCommand.MUTE to false,
-        HomeKitCommand.FLASHLIGHT to false
+        HomeKitCommand.FLASHLIGHT to false,
+        HomeKitCommand.GPS to false,
+        HomeKitCommand.LOW_POWER_MODE to false,
+        HomeKitCommand.DO_NOT_DISTURB to false,
+        HomeKitCommand.VOLUME to false
     )
     private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var rootHotspotActive = false
     private var mediaVolumeBeforeMute: Int? = null
+    private var volumeBeforeControl: Int? = null
 
     @Synchronized
     override fun execute(command: HomeKitCommand, enabled: Boolean): CommandResult {
@@ -38,29 +43,50 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             HomeKitCommand.HOTSPOT -> setHotspot(enabled)
             HomeKitCommand.MUTE -> setMediaMuted(enabled)
             HomeKitCommand.FLASHLIGHT -> setFlashlight(enabled)
+            HomeKitCommand.GPS -> setGps(enabled)
+            HomeKitCommand.LOW_POWER_MODE -> setLowPowerMode(enabled)
+            HomeKitCommand.DO_NOT_DISTURB -> setDoNotDisturb(enabled)
+            HomeKitCommand.VOLUME -> setVolume(if (enabled) 50 else 0)
         }
         if (result.success) values[command] = enabled
         return result
     }
 
     override fun executeValue(command: HomeKitCommand, value: Int): CommandResult = synchronized(this) {
-        if (command != HomeKitCommand.BRIGHTNESS) return@synchronized execute(command, value != 0)
-        setScreenBrightness(value.coerceIn(0, 100)).also { result ->
-            if (result.success) values[command] = value > 0
+        when (command) {
+            HomeKitCommand.BRIGHTNESS -> setScreenBrightness(value.coerceIn(0, 100)).also { result ->
+                if (result.success) values[command] = value > 0
+            }
+            HomeKitCommand.VOLUME -> setVolume(value.coerceIn(0, 100)).also { result ->
+                if (result.success) values[command] = value > 0
+            }
+            else -> execute(command, value != 0)
         }
     }
 
     override fun currentValueInt(command: HomeKitCommand): Int? = synchronized(this) {
-        if (command != HomeKitCommand.BRIGHTNESS) return@synchronized null
-        val backlight = backlightNode()
-        if (backlight != null) {
-            val current = rootOutput("cat ${backlight.first}")?.trim()?.toIntOrNull()
-            if (current != null && current > 0) return@synchronized (current * 100 / backlight.second).coerceIn(0, 100)
+        when (command) {
+            HomeKitCommand.BRIGHTNESS -> {
+                val backlight = backlightNode()
+                if (backlight != null) {
+                    val current = rootOutput("cat ${backlight.first}")?.trim()?.toIntOrNull()
+                    if (current != null && current > 0) return@synchronized (current * 100 / backlight.second).coerceIn(0, 100)
+                }
+                val raw = try { Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS) } catch (_: Throwable) {
+                    rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull() ?: return@synchronized null
+                }
+                (raw * 100 / 255).coerceIn(0, 100)
+            }
+            HomeKitCommand.VOLUME -> {
+                val volumeState = mediaVolumeState()
+                if (volumeState != null) {
+                    val (current, max) = volumeState
+                    return@synchronized (current * 100 / max).coerceIn(0, 100)
+                }
+                null
+            }
+            else -> null
         }
-        val raw = try { Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS) } catch (_: Throwable) {
-            rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull() ?: return@synchronized null
-        }
-        (raw * 100 / 255).coerceIn(0, 100)
     }
 
     override fun currentValue(command: HomeKitCommand): Boolean = synchronized(this) {
@@ -78,7 +104,11 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
                     mediaVolumeIndex() == 0 ||
                     audioMuteFromDump() == true
             }
-            HomeKitCommand.FLASHLIGHT -> torchEnabled
+            HomeKitCommand.FLASHLIGHT -> torchEnabled || isTorchSysfsEnabled()
+            HomeKitCommand.GPS -> isGpsActive()
+            HomeKitCommand.LOW_POWER_MODE -> isLowPowerModeActive()
+            HomeKitCommand.DO_NOT_DISTURB -> isDoNotDisturbActive()
+            HomeKitCommand.VOLUME -> (currentValueInt(command) ?: 0) > 0
         }
     }
 
@@ -138,6 +168,18 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             for (torch in torches) ok = runRoot("echo 0 > /sys/class/leds/$torch/brightness") && ok
         }
         return ok
+    }
+
+    /** Read the kernel torch switch so external changes are reflected in the UI. */
+    private fun isTorchSysfsEnabled(): Boolean {
+        val switches = rootOutput("ls /sys/class/leds/").orEmpty()
+            .lineSequence().map { it.trim() }
+            .filter { it.startsWith("led:switch_") }
+            .toList()
+        return switches.any { switch ->
+            rootOutput("cat /sys/class/leds/$switch/brightness")
+                ?.trim()?.toIntOrNull()?.let { it > 0 } == true
+        }
     }
 
     private fun registerTorchCallback(camera: CameraManager) {
@@ -343,4 +385,98 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             else -> null
         }
     }
+
+    private fun setGps(enabled: Boolean): CommandResult {
+        // GPS/Location toggle - requires root or location settings permission
+        return if (enabled) {
+            if (runRoot("settings put secure location_mode 3")) {
+                CommandResult(true, "gps=on (root)")
+            } else {
+                // Try non-root approach
+                try {
+                    val intent = android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                    CommandResult(true, "gps=on (settings opened)")
+                } catch (t: Throwable) {
+                    CommandResult(false, "gps failed: ${t.message}")
+                }
+            }
+        } else {
+            if (runRoot("settings put secure location_mode 0")) {
+                CommandResult(true, "gps=off (root)")
+            } else {
+                CommandResult(false, "gps requires root or location settings permission")
+            }
+        }
+    }
+
+    private fun isGpsActive(): Boolean {
+        val mode = rootOutput("settings get secure location_mode")?.trim()?.toIntOrNull()
+        return mode != null && mode > 0
+    }
+
+    private fun setLowPowerMode(enabled: Boolean): CommandResult {
+        // Low power mode via settings global low_power (works on MIUI)
+        return if (enabled) {
+            if (runRoot("settings put global low_power 1")) {
+                CommandResult(true, "low-power-mode=on")
+            } else {
+                CommandResult(false, "low-power-mode requires root")
+            }
+        } else {
+            if (runRoot("settings put global low_power 0")) {
+                CommandResult(true, "low-power-mode=off")
+            } else {
+                CommandResult(false, "low-power-mode requires root")
+            }
+        }
+    }
+
+    private fun isLowPowerModeActive(): Boolean {
+        val mode = rootOutput("settings get global low_power")?.trim()
+        return mode == "1"
+    }
+
+    private fun setDoNotDisturb(enabled: Boolean): CommandResult {
+        // DND via cmd notification set_dnd (works on MIUI)
+        return if (enabled) {
+            if (runRoot("cmd notification set_dnd priority")) {
+                CommandResult(true, "dnd=on")
+            } else {
+                CommandResult(false, "dnd requires root")
+            }
+        } else {
+            if (runRoot("cmd notification set_dnd off")) {
+                CommandResult(true, "dnd=off")
+            } else {
+                CommandResult(false, "dnd requires root")
+            }
+        }
+    }
+
+    private fun isDoNotDisturbActive(): Boolean {
+        val dump = rootOutput("dumpsys notification") ?: return false
+        return dump.contains("mZenMode=ZEN_MODE_IMPORTANT_INTERRUPTIONS") ||
+            dump.contains("mZenMode=ZEN_MODE_NO_INTERRUPTIONS")
+    }
+
+    private fun setVolume(percent: Int): CommandResult {
+        val pct = percent.coerceIn(0, 100)
+        val volumeState = mediaVolumeState()
+        val maxVolume = volumeState?.second ?: 15
+        val targetVolume = (pct * maxVolume / 100).coerceIn(0, maxVolume)
+        if (pct > 0 && volumeBeforeControl == null) volumeBeforeControl = volumeState?.first
+        return if (runRoot("cmd media_session volume --stream 3 --set $targetVolume")) {
+            if (pct == 0) volumeBeforeControl = null
+            CommandResult(true, "volume=$pct (root)")
+        } else {
+            val audio = context.getSystemService(AudioManager::class.java)
+            if (audio != null) {
+                audio.setStreamVolume(AudioManager.STREAM_MUSIC, targetVolume, 0)
+                CommandResult(true, "volume=$pct (AudioManager)")
+            } else CommandResult(false, "volume control failed")
+        }
+    }
+
 }

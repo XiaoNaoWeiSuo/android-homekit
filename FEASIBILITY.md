@@ -1,4 +1,4 @@
-# Mi Hotspot HomeKit BLE feasibility gate
+# Marionette HomeKit BLE feasibility gate
 
 Checked: 2026-09-14
 

@@ -20,6 +20,8 @@ import android.app.NotificationManager
 import android.os.Build
 import android.os.BatteryManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -53,6 +55,12 @@ import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.KeyParameter
 import dev.local.mihotspot.homekit.commands.AndroidCommandExecutor
 import dev.local.mihotspot.homekit.commands.HomeKitCommand
+import dev.local.mihotspot.core.homekit.protocol.HapCharacteristicDefinition
+import dev.local.mihotspot.core.homekit.protocol.HapReadOnlyState
+import dev.local.mihotspot.core.homekit.protocol.HapServiceDefinition
+import dev.local.mihotspot.core.homekit.protocol.HapType
+import dev.local.mihotspot.core.homekit.protocol.HapValueKind
+import dev.local.mihotspot.core.homekit.protocol.HomeKitAccessoryCatalog
 
 import android.app.Service
 import android.content.Intent
@@ -65,13 +73,16 @@ open class HomeKitRuntime : Service() {
     private var advertising = false
     @Volatile private var starting = false
     private val pendingServices = ArrayDeque<BluetoothGattService>()
-    private val gattCharacteristicDefinitions = IdentityHashMap<BluetoothGattCharacteristic, HapCharacteristic>()
+    private val gattCharacteristicDefinitions = IdentityHashMap<BluetoothGattCharacteristic, HapCharacteristicDefinition>()
     private val pduResponses = ConcurrentHashMap<String, HapResponse>()
     private val pduRequests = ConcurrentHashMap<String, HapRequestAssembly>()
     private val peerMtu = ConcurrentHashMap<String, Int>()
     private val connectedDevices = ConcurrentHashMap.newKeySet<String>()
     private val pairSetupSessions = ConcurrentHashMap<String, PairSetupSession>()
     private val pairVerifySessions = ConcurrentHashMap<String, PairVerifySession>()
+    private val pendingPairingRemovals = ConcurrentHashMap<String, ByteArray>()
+    private val restartAfterPairingsResponse = ConcurrentHashMap.newKeySet<String>()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val commandExecutor by lazy { AndroidCommandExecutor(this) }
     private val commandPrefs by lazy { getSharedPreferences("homekit", MODE_PRIVATE) }
     private val notificationManager by lazy { getSystemService(NotificationManager::class.java) }
@@ -81,7 +92,7 @@ open class HomeKitRuntime : Service() {
         super.onCreate()
         manager = getSystemService(BluetoothManager::class.java)
         createNotificationChannel()
-        startForeground(FOREGROUND_NOTIFICATION_ID, foregroundNotification("正在启动 HomeKit BLE"))
+        startForeground(FOREGROUND_NOTIFICATION_ID, foregroundNotification("驱动常驻 · 正在启动 HomeKit BLE"))
         log("SERVICE_CREATED")
     }
 
@@ -132,11 +143,17 @@ open class HomeKitRuntime : Service() {
 
     private fun foregroundNotification(status: String): Notification =
         if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, SERVICE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Marionette HomeKit").setContentText(status)
+            .setSmallIcon(dev.local.mihotspot.R.drawable.ic_driver_resident)
+            .setContentTitle("HomeKit 驱动 · 配对码 ${setupCodeForNotification()}").setContentText(status)
             .setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).build()
-        else Notification.Builder(this).setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Marionette HomeKit").setContentText(status).setOngoing(true).build()
+        else Notification.Builder(this).setSmallIcon(dev.local.mihotspot.R.drawable.ic_driver_resident)
+            .setContentTitle("HomeKit 驱动 · 配对码 ${setupCodeForNotification()}").setContentText(status).setOngoing(true).build()
+
+    private fun setupCodeForNotification(): String {
+        val digits = commandPrefs.getString("setup_code_digits", DEFAULT_SETUP_CODE_DIGITS)
+            ?.filter(Char::isDigit)?.takeIf { it.length == 8 } ?: DEFAULT_SETUP_CODE_DIGITS
+        return "${digits.substring(0, 4)}-${digits.substring(4, 8)}"
+    }
 
     private fun updateServiceNotification() {
         val status = when {
@@ -155,6 +172,10 @@ open class HomeKitRuntime : Service() {
             HomeKitCommand.HOTSPOT -> "热点"
             HomeKitCommand.MUTE -> "媒体静音"
             HomeKitCommand.FLASHLIGHT -> "手电筒"
+            HomeKitCommand.GPS -> "GPS定位"
+            HomeKitCommand.LOW_POWER_MODE -> "低电量模式"
+            HomeKitCommand.DO_NOT_DISTURB -> "免打扰模式"
+            HomeKitCommand.VOLUME -> "媒体音量"
         }
         val state = if (command == HomeKitCommand.SCREEN) "已按下" else if (enabled) "开启" else "关闭"
         val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, NOTIFICATION_CHANNEL_ID) else Notification.Builder(this)
@@ -236,8 +257,8 @@ open class HomeKitRuntime : Service() {
             0x06, 0x2D, (if (isPaired) 0x00 else 0x01).toByte(), // TY, STL, SF
             *accessoryId,
             0x08, 0x00,                               // ACID: Switches
-            0x06, 0x00,                               // GSN: configured service names
-            0x08,                                     // CN: force controllers to refresh cached metadata
+            0x0F, 0x00,                               // GSN: restore verified BLE Battery metadata profile
+            0x13,                                     // CN: EV characteristics now expose BLE Indicate + CCCD
             0x02                                      // CV
         )
         val settings = AdvertiseSettings.Builder()
@@ -253,7 +274,7 @@ open class HomeKitRuntime : Service() {
             .setIncludeDeviceName(true)
             .build()
         try {
-            adapter.name = commandPrefs.getString("device_name", "Mi Hotspot") ?: "Mi Hotspot"
+            adapter.name = commandPrefs.getString("device_name", "Marionette") ?: "Marionette"
             advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback)
             log("BLE_ADVERTISING_REQUESTED paired=$isPaired payload=${hapData.hex()}")
         } catch (t: Throwable) {
@@ -288,6 +309,8 @@ open class HomeKitRuntime : Service() {
         gattCharacteristicDefinitions.clear()
         pairSetupSessions.clear()
         pairVerifySessions.clear()
+        pendingPairingRemovals.clear()
+        restartAfterPairingsResponse.clear()
         connectedDevices.clear()
         advertising = false
         starting = false
@@ -298,14 +321,14 @@ open class HomeKitRuntime : Service() {
     @SuppressLint("MissingPermission")
     private fun queueGattDatabase() {
         pendingServices.clear()
-        pendingServices.addAll(HAP_SERVICES.map(::service))
+        pendingServices.addAll(HomeKitAccessoryCatalog.services.map(::service))
     }
 
     @SuppressLint("MissingPermission")
     private fun addNextService() {
         val next = pendingServices.pollFirst()
         if (next == null) {
-            log("GATT_DATABASE_PUBLISHED services=${HAP_SERVICES.size}")
+            log("GATT_DATABASE_PUBLISHED services=${HomeKitAccessoryCatalog.services.size}")
             startAdvertisingAfterGattPublished()
             return
         }
@@ -317,7 +340,7 @@ open class HomeKitRuntime : Service() {
         }
     }
 
-    private fun service(definition: HapService): BluetoothGattService {
+    private fun service(definition: HapServiceDefinition): BluetoothGattService {
         return BluetoothGattService(hapUuid(definition.type), BluetoothGattService.SERVICE_TYPE_PRIMARY).apply {
             addCharacteristic(BluetoothGattCharacteristic(
                 SERVICE_IID_UUID,
@@ -325,15 +348,30 @@ open class HomeKitRuntime : Service() {
                 BluetoothGattCharacteristic.PERMISSION_READ
             ).apply { value = definition.iid.leBytes() })
             definition.characteristics.forEach { characteristic ->
+                // HAP-over-BLE 7.4.6 requires every HAP EV characteristic to
+                // expose the BLE Indicate property and the standard CCCD. HAP
+                // metadata alone is insufficient: Home otherwise enumerates an
+                // E3 ConfiguredName signature but does not fetch its value,
+                // then falls back to generated "Switch 1" / "Light 1" labels.
+                val supportsEvents = characteristic.properties and HAP_PROPERTY_EVENT != 0
+                val gattProperties = BluetoothGattCharacteristic.PROPERTY_READ or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    if (supportsEvents) BluetoothGattCharacteristic.PROPERTY_INDICATE else 0
                 val gattCharacteristic = BluetoothGattCharacteristic(
                     hapUuid(characteristic.type),
-                    BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE,
+                    gattProperties,
                     BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
                 ).apply {
                     value = initialCharacteristicValue(characteristic)
                     addDescriptor(BluetoothGattDescriptor(IID_DESCRIPTOR_UUID, BluetoothGattDescriptor.PERMISSION_READ).apply {
                         value = characteristic.iid.leBytes()
                     })
+                    if (supportsEvents) {
+                        addDescriptor(BluetoothGattDescriptor(
+                            CLIENT_CHARACTERISTIC_CONFIGURATION_UUID,
+                            BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                        ).apply { value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE })
+                    }
                 }
                 gattCharacteristicDefinitions[gattCharacteristic] = characteristic
                 addCharacteristic(gattCharacteristic)
@@ -341,23 +379,31 @@ open class HomeKitRuntime : Service() {
         }
     }
 
-    private fun initialCharacteristicValue(characteristic: HapCharacteristic): ByteArray = when (characteristic.type) {
-        0x14 -> byteArrayOf(0)
-        0x20 -> "Xiaomi".encodeToByteArray()
-        0x21 -> "Xiaomi 13".encodeToByteArray()
-        0x23, 0xE3 -> when (characteristic.service.type) {
-            0x3E -> (commandPrefs.getString("device_name", "Mi Hotspot") ?: "Mi Hotspot").encodeToByteArray()
-            else -> configuredServiceName(characteristic.service).encodeToByteArray()
+    private fun initialCharacteristicValue(characteristic: HapCharacteristicDefinition): ByteArray {
+        characteristic.control?.takeIf { it.valueKind == HapValueKind.UINT32 }?.let { control ->
+            return (commandExecutor.currentValueInt(control.command) ?: 0).leBytes32()
         }
-        0x30 -> accessoryPairingId().encodeToByteArray()
-        0x52 -> "1.0".encodeToByteArray()
-        0x08 -> byteArrayOf((commandExecutor.currentValueInt(HomeKitCommand.BRIGHTNESS) ?: 0).toByte())
-        0x68 -> byteArrayOf(batteryLevel())
-        0x79, 0x8F -> byteArrayOf(batteryStatus(characteristic.type))
-        0x4F -> byteArrayOf(0)
-        0x25 -> byteArrayOf(0)
-        0x11A -> byteArrayOf(0)
-        else -> byteArrayOf()
+        characteristic.readOnlyState?.let {
+            return batteryCharacteristicValue(characteristic) ?: byteArrayOf()
+        }
+        return when (characteristic.type) {
+            0x14 -> byteArrayOf(0)
+            0x20 -> "Xiaomi".encodeToByteArray()
+            0x21 -> "Xiaomi 13".encodeToByteArray()
+            0x23 -> when (characteristic.service.type) {
+                0x3E -> (commandPrefs.getString("device_name", "Marionette") ?: "Marionette").encodeToByteArray()
+                else -> serviceDisplayName(characteristic.service).encodeToByteArray()
+            }
+            CONFIGURED_NAME_TYPE -> configuredServiceName(characteristic.service).encodeToByteArray()
+            0x30 -> accessoryPairingId().encodeToByteArray()
+            0x52 -> "1.0".encodeToByteArray()
+            0x68 -> byteArrayOf(batteryLevel())
+            0x79, 0x8F -> byteArrayOf(batteryStatus(characteristic.type))
+            0x4F -> byteArrayOf(0)
+            0x25 -> byteArrayOf(0)
+            0x11A -> byteArrayOf(0)
+            else -> byteArrayOf()
+        }
     }
 
     private fun batteryLevel(): Byte {
@@ -404,6 +450,8 @@ open class HomeKitRuntime : Service() {
                 pduRequests.keys.removeIf { it.startsWith("${device.address}|") }
                 pairSetupSessions.remove(device.address)
                 pairVerifySessions.remove(device.address)
+                pendingPairingRemovals.remove(device.address)
+                restartAfterPairingsResponse.remove(device.address)
             }
         }
 
@@ -439,6 +487,17 @@ open class HomeKitRuntime : Service() {
                         log("CONTROL_SESSION_ACTIVE")
                     }
                 }
+                if (response.isFinal &&
+                    gattDefinition(characteristic)?.type == PAIRINGS_TYPE &&
+                    restartAfterPairingsResponse.remove(device.address)
+                ) {
+                    log("PAIRINGS_REMOVE_RESPONSE_SENT restart_scheduled=true")
+                    mainHandler.postDelayed({
+                        log("PAIRINGS_REMOVE_RESTART advertising_with_sf_unpaired=true")
+                        stopProbe()
+                        if (checkBluetoothPermissions()) startProbe()
+                    }, PAIRING_REMOVAL_RESTART_DELAY_MS)
+                }
                 if (response.isFinal) pduResponses.remove(key)
                 return
             }
@@ -451,6 +510,22 @@ open class HomeKitRuntime : Service() {
             val value = descriptor.value ?: byteArrayOf()
             log("GATT_DESCRIPTOR_READ uuid=${descriptor.uuid} offset=$offset value=${value.hex()}")
             server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.drop(offset).toByteArray())
+        }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
+        ) {
+            if (!preparedWrite && offset == 0 && descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
+                descriptor.value = value
+                log("GATT_CCCD_WRITE characteristic=${descriptor.characteristic.uuid} value=${value.hex()}")
+            }
+            if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
         }
 
         override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
@@ -546,7 +621,7 @@ open class HomeKitRuntime : Service() {
                     HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(0)))
                 } else {
                     commandFor(definition)?.let { command ->
-                        if (definition.type == 0x08) {
+                        if (definition.control?.valueKind == HapValueKind.UINT32) {
                             val brightness = commandExecutor.currentValueInt(command) ?: 0
                             log("CONTROL_STATE_READ command=$command value=$brightness service=0x%02X iid=0x%04X".format(definition.service.type, iid))
                             HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, brightness.leBytes32()))
@@ -556,9 +631,15 @@ open class HomeKitRuntime : Service() {
                             HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(if (enabled) 1 else 0)))
                         }
                     } ?: batteryCharacteristicValue(definition)?.let { value ->
-                        log("CONTROL_STATE_READ battery type=0x%02X value=${value.u8()} iid=0x%04X".format(definition.type, iid))
-                        HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, byteArrayOf(value)))
+                        log("CONTROL_STATE_READ battery type=0x%02X value=${value.hex()} iid=0x%04X".format(definition.type, iid))
+                        HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, value))
                     } ?: readableCharacteristicValue(definition)?.let { value ->
+                        if (definition.type == 0x23 || definition.type == CONFIGURED_NAME_TYPE) {
+                            log(
+                                "SERVICE_NAME_READ type=0x%02X service=0x%04X iid=0x%04X name=%s"
+                                    .format(definition.type, definition.service.iid, iid, value.toString(Charsets.UTF_8))
+                            )
+                        }
                         HapResponse(tid, HAP_STATUS_SUCCESS, tlv(HAP_TLV_VALUE, value))
                     } ?: HapResponse(tid, HAP_STATUS_UNSUPPORTED_PDU)
                 }
@@ -572,14 +653,23 @@ open class HomeKitRuntime : Service() {
                 } else if (definition?.type == PAIRINGS_TYPE && iid == definition.iid) {
                     pairingsManagementRequest(device, requestBody, tid)
                 } else if (definition?.type == CONFIGURED_NAME_TYPE && iid == definition.iid) {
-                    val rawValue = parseTlvs(requestBody)[HAP_TLV_VALUE]?.fold(byteArrayOf()) { acc, part -> acc + part }
+                    val rawValue = parseTlvs(requestBody)[HAP_TLV_VALUE]
+                        ?.fold(byteArrayOf()) { acc, part -> acc + part }
                     val configuredName = rawValue?.toString(Charsets.UTF_8)?.trim()
-                    if (configuredName.isNullOrEmpty() || configuredName.toByteArray().size > MAX_CONFIGURED_NAME_BYTES) {
+                    if (rawValue == null || configuredName.isNullOrEmpty() || rawValue.size > MAX_CONFIGURED_NAME_BYTES) {
                         HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                     } else {
-                        saveConfiguredName(definition.service, configuredName)
-                        log("CONFIGURED_NAME_UPDATED service=0x%04X name=$configuredName".format(definition.service.iid))
-                        HapResponse(tid, HAP_STATUS_SUCCESS)
+                        if (saveConfiguredName(definition.service, configuredName)) {
+                            log("CONFIGURED_NAME_UPDATED service=0x%04X iid=0x%04X name=$configuredName".format(definition.service.iid, iid))
+                            HapResponse(tid, HAP_STATUS_SUCCESS)
+                        } else {
+                            // Home generated this category label itself. Acknowledging
+                            // the write makes it the controller's final title, even
+                            // though the accessory keeps returning its Chinese E3
+                            // value. Reject it so Home retains the just-read E3 name.
+                            log("CONFIGURED_NAME_FALLBACK_REJECTED service=0x%04X iid=0x%04X name=$configuredName".format(definition.service.iid, iid))
+                            HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
+                        }
                     }
                 } else if (definition != null && iid == definition.iid) {
                     val command = commandFor(definition)
@@ -598,7 +688,7 @@ open class HomeKitRuntime : Service() {
                             notifyCommand(command, enabled, false, "已在应用中禁用")
                             HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                         } else {
-                            val result = if (definition.type == 0x08) {
+                            val result = if (definition.control?.valueKind == HapValueKind.UINT32) {
                                 commandExecutor.executeValue(command, numericValue)
                             } else {
                                 commandExecutor.execute(command, enabled)
@@ -614,9 +704,10 @@ open class HomeKitRuntime : Service() {
             HAP_OPCODE_CHARACTERISTIC_EXECUTE_WRITE -> {
                 if (definition?.type == PAIRINGS_TYPE && iid == definition.iid) {
                     // HomeKit uses Timed Write followed by Execute Write for
-                    // Pairings management. The management request has already
-                    // been validated and acknowledged above; this PDU commits
-                    // that transaction and carries no body.
+                    // Pairings management. Commit a queued removal here, then
+                    // keep the encrypted session alive until Home has read this
+                    // final response.
+                    commitPendingPairingRemoval(device)
                     log("PAIRINGS_EXECUTE_WRITE_ACK")
                     HapResponse(tid, HAP_STATUS_SUCCESS)
                 } else {
@@ -632,7 +723,7 @@ open class HomeKitRuntime : Service() {
         log("HAP_PDU_REQUEST opcode=0x%02X tid=$tid iid=0x%04X responseBody=${response.body.hex()}".format(opcode, iid))
     }
 
-    private fun serviceSignature(service: HapService): ByteArray {
+    private fun serviceSignature(service: HapServiceDefinition): ByteArray {
         val properties = when {
             service.primary -> 0x0001
             service.supportsConfiguration -> 0x0004
@@ -641,7 +732,7 @@ open class HomeKitRuntime : Service() {
         return if (properties == 0) byteArrayOf() else tlv(HAP_TLV_SERVICE_PROPERTIES, properties.leBytes())
     }
 
-    private fun characteristicSignature(characteristic: HapCharacteristic): ByteArray {
+    private fun characteristicSignature(characteristic: HapCharacteristicDefinition): ByteArray {
         val service = characteristic.service
         val unit = if (characteristic.type == 0x08) byteArrayOf(0xAD.toByte(), 0x27) else byteArrayOf(0, 0x27)
         return tlv(HAP_TLV_CHARACTERISTIC_TYPE, hapPduUuidBytes(characteristic.type)) +
@@ -651,23 +742,13 @@ open class HomeKitRuntime : Service() {
             tlv(HAP_TLV_PRESENTATION_FORMAT, byteArrayOf(characteristic.format, 0, unit[0], unit[1], 1, 0, 0))
     }
 
-    private fun commandFor(characteristic: HapCharacteristic): HomeKitCommand? = when {
-        characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0030 -> HomeKitCommand.SCREEN
-        characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0070 -> HomeKitCommand.FLASHLIGHT
-        characteristic.service.type == 0x43 && characteristic.type == 0x25 && characteristic.service.iid == 0x0080 -> HomeKitCommand.BRIGHTNESS
-        characteristic.service.type == 0x43 && characteristic.type == 0x08 && characteristic.service.iid == 0x0080 -> HomeKitCommand.BRIGHTNESS
-        characteristic.service.type == 0x49 && characteristic.type == 0x25 && characteristic.service.iid == 0x0040 -> HomeKitCommand.HOTSPOT
-        characteristic.service.type == 0x49 && characteristic.type == 0x25 && characteristic.service.iid == 0x0050 -> HomeKitCommand.MUTE
-        else -> null
-    }
+    private fun commandFor(characteristic: HapCharacteristicDefinition): HomeKitCommand? = characteristic.control?.command
 
-    private fun batteryCharacteristicValue(characteristic: HapCharacteristic): Byte? = when (characteristic.service.type) {
-        0x96 -> when (characteristic.type) {
-            0x68 -> batteryLevel()
-            0x79, 0x8F -> batteryStatus(characteristic.type)
-            else -> null
-        }
-        else -> null
+    private fun batteryCharacteristicValue(characteristic: HapCharacteristicDefinition): ByteArray? = when (characteristic.readOnlyState) {
+        HapReadOnlyState.BATTERY_LEVEL -> batteryLevel().u8().leBytes32()
+        HapReadOnlyState.BATTERY_LOW -> batteryStatus(0x79).u8().leBytes32()
+        HapReadOnlyState.BATTERY_CHARGING -> batteryStatus(0x8F).u8().leBytes32()
+        null -> null
     }
 
     /** Handles the controller's post-pairing Pairings management transaction. */
@@ -684,9 +765,13 @@ open class HomeKitRuntime : Service() {
         log("PAIRINGS_REQUEST method=$method state=$state identifier=${identifier?.decodeToString()}")
         if (state != 1) return HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
         when (method) {
-            // Home may clean up a stale copy of the controller pairing directly
-            // after Pair Setup. Keep the just-established key for this bridge.
-            PAIRING_METHOD_REMOVE -> log("PAIRINGS_REMOVE_ACK preserve_current_pairing=true")
+            PAIRING_METHOD_REMOVE -> {
+                if (identifier == null) return HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
+                // HAP Pairings is a timed-write control point. Preserve the
+                // request until Execute Write commits it.
+                pendingPairingRemovals[device.address] = identifier
+                log("PAIRINGS_REMOVE_QUEUED controller=${identifier.decodeToString()}")
+            }
             PAIRING_METHOD_ADD -> {
                 val key = tlvs[PAIRING_TLV_PUBLIC_KEY]?.fold(byteArrayOf()) { acc, part -> acc + part }
                 if (identifier == null || key == null || key.size != 32) return HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
@@ -704,31 +789,84 @@ open class HomeKitRuntime : Service() {
         return HapResponse(tid, HAP_STATUS_SUCCESS)
     }
 
-    private fun readableCharacteristicValue(characteristic: HapCharacteristic): ByteArray? = when (characteristic.type) {
+    /** Commits HAP Remove Pairing for this single-controller implementation. */
+    private fun commitPendingPairingRemoval(device: BluetoothDevice) {
+        val requestedId = pendingPairingRemovals.remove(device.address) ?: return
+        val encodedSavedId = commandPrefs.getString("controller_id", null)
+        val savedId = try {
+            encodedSavedId?.let { Base64.decode(it, Base64.NO_WRAP) }
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+
+        // HAP requires success when the requested pairing does not exist.
+        if (savedId == null || !savedId.contentEquals(requestedId)) {
+            log("PAIRINGS_REMOVE_NOT_FOUND controller=${requestedId.decodeToString()} success=true")
+            return
+        }
+
+        // This runtime stores one admin controller. Removing it therefore
+        // removes all controller material, matching ADK cleanup semantics.
+        val persisted = commandPrefs.edit()
+            .remove("controller_id")
+            .remove("controller_key")
+            .commit()
+        if (!persisted) {
+            log("PAIRINGS_REMOVE_FAILED controller=${requestedId.decodeToString()} reason=persistence")
+            return
+        }
+        restartAfterPairingsResponse += device.address
+        log("PAIRINGS_REMOVE_APPLIED controller=${requestedId.decodeToString()} paired=false")
+    }
+
+    private fun readableCharacteristicValue(characteristic: HapCharacteristicDefinition): ByteArray? = when (characteristic.type) {
         0x14, 0x20, 0x21, 0x23, 0x30, 0x52, CONFIGURED_NAME_TYPE -> initialCharacteristicValue(characteristic)
         else -> null
     }
 
-    private fun configuredServiceName(service: HapService): String {
-        val defaultName = when (service.type) {
-            0x43 -> when (service.iid) {
-                0x0070 -> "手机手电筒"
-                0x0080 -> "屏幕亮度"
-                else -> "屏幕电源"
-            }
-            0x49 -> if (service.iid == 0x0040) "手机热点" else "媒体静音"
-            0x96 -> "手机电池"
-            else -> "HomeKit"
-        }
-        return commandPrefs.getString("service_name_${service.iid}", defaultName) ?: defaultName
+    /** Legacy Name value retained alongside the modern Configured Name value. */
+    private fun serviceDisplayName(service: HapServiceDefinition): String = requireNotNull(service.defaultName) {
+        "Only functional services may expose a service-level Name: iid=0x%04X".format(service.iid)
     }
 
-    private fun saveConfiguredName(service: HapService, name: String) {
-        if (service.type == 0x3E) {
-            commandPrefs.edit().putString("device_name", name).apply()
-        } else {
-            commandPrefs.edit().putString("service_name_${service.iid}", name).apply()
+    /**
+     * Modern Home versions use Configured Name as the display name of each
+     * functional service. Name remains on Accessory Information and as a
+     * backwards-compatible service value, while 0xE3 is authoritative here.
+     */
+    private fun configuredServiceName(service: HapServiceDefinition): String {
+        val defaultName = serviceDisplayName(service)
+        val savedName = commandPrefs.getString("service_name_${service.iid}", null)?.trim()
+        if (savedName != null && isGeneratedCategoryName(savedName, service.type)) {
+            // Home may try to seed ConfiguredName with its generic category
+            // label ("灯 1" / "开关 2"). It is not a user-selected name and must
+            // never become the accessory's persisted default on the next pair.
+            commandPrefs.edit().remove("service_name_${service.iid}").apply()
+            log("CONFIGURED_NAME_FALLBACK_CLEARED service=0x%04X name=$savedName".format(service.iid))
+            return defaultName
         }
+        return savedName ?: defaultName
+    }
+
+    /** Returns false when Home attempts to replace a real name with its own category fallback. */
+    private fun saveConfiguredName(service: HapServiceDefinition, name: String): Boolean {
+        if (isGeneratedCategoryName(name, service.type)) {
+            commandPrefs.edit().remove("service_name_${service.iid}").apply()
+            log("CONFIGURED_NAME_FALLBACK_IGNORED service=0x%04X name=$name".format(service.iid))
+            return false
+        }
+        commandPrefs.edit().putString("service_name_${service.iid}", name).apply()
+        return true
+    }
+
+    private fun isGeneratedCategoryName(name: String, serviceType: Int): Boolean {
+        val normalized = name.replace(" ", "")
+        val category = when (serviceType) {
+            0x43 -> "灯"
+            0x49 -> "开关"
+            else -> return false
+        }
+        return normalized == category || normalized.matches(Regex("^${category}\\d+$"))
     }
 
     /** Produces a real SRP-3072 Pair Setup M2 from the setup code shown in the UI. */
@@ -902,7 +1040,7 @@ open class HomeKitRuntime : Service() {
         (shortUuid and 0xFF).toByte(), ((shortUuid ushr 8) and 0xFF).toByte(),
         ((shortUuid ushr 16) and 0xFF).toByte(), ((shortUuid ushr 24) and 0xFF).toByte()
     )
-    private fun gattDefinition(characteristic: BluetoothGattCharacteristic): HapCharacteristic? {
+    private fun gattDefinition(characteristic: BluetoothGattCharacteristic): HapCharacteristicDefinition? {
         gattCharacteristicDefinitions[characteristic]?.let { return it }
         // MIUI can hand the callback a different BluetoothGattCharacteristic
         // instance than the one passed to addService(). A UUID-keyed lookup would
@@ -1005,6 +1143,7 @@ open class HomeKitRuntime : Service() {
         private const val DEFAULT_ATT_MTU = 23
         private const val GATT_OPEN_MAX_ATTEMPTS = 5
         private const val GATT_OPEN_RETRY_DELAY_MS = 1500L
+        private const val PAIRING_REMOVAL_RESTART_DELAY_MS = 750L
         private const val HAP_REQUEST_HEADER_BYTES = 5
         private const val HAP_OPCODE_CHARACTERISTIC_SIGNATURE_READ = 0x01
         private const val HAP_OPCODE_CHARACTERISTIC_READ = 0x03
@@ -1026,6 +1165,9 @@ open class HomeKitRuntime : Service() {
         private const val HAP_TLV_CHARACTERISTIC_PROPERTIES = 0x0A
         private const val HAP_TLV_PRESENTATION_FORMAT = 0x0C
         private const val HAP_TLV_SERVICE_PROPERTIES = 0x0F
+        private const val HAP_PROPERTY_EVENT = 0x0080
+        private val CLIENT_CHARACTERISTIC_CONFIGURATION_UUID: UUID =
+            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val SERVICE_SIGNATURE_TYPE = 0xA5
         private const val PAIRING_FEATURES_TYPE = 0x4F
         private const val PAIR_SETUP_TYPE = 0x4C
@@ -1057,20 +1199,6 @@ open class HomeKitRuntime : Service() {
         private val ED25519_X509_PREFIX = byteArrayOf(0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00)
         private val SERVICE_IID_UUID = UUID.fromString("E604E95D-A759-4817-87D3-AA005083A0D1")
         private val IID_DESCRIPTOR_UUID = UUID.fromString("DC46F0FE-81D2-4616-B5D9-6ABDD796939A")
-
-        private class HapService(
-            val type: Int,
-            val iid: Int,
-            val primary: Boolean = false,
-            val supportsConfiguration: Boolean = false,
-            characteristics: List<HapCharacteristic>
-        ) {
-            val characteristics = characteristics.onEach { it.service = this }
-        }
-
-        private class HapCharacteristic(val type: Int, val iid: Int, val properties: Int, val format: Byte) {
-            lateinit var service: HapService
-        }
 
         private data class HapRequestAssembly(
             val opcode: Int,
@@ -1122,87 +1250,8 @@ open class HomeKitRuntime : Service() {
             }
         }
 
-        private val HAP_SERVICES: List<HapService> = listOf(
-            HapService(0x3E, 0x0001, characteristics = listOf(
-                HapCharacteristic(0x14, 0x0002, 0x0020, 0x01),
-                HapCharacteristic(0x20, 0x0003, 0x0010, 0x19),
-                HapCharacteristic(0x21, 0x0004, 0x0010, 0x19),
-                HapCharacteristic(0x23, 0x0005, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0008, 0x0030, 0x19),
-                HapCharacteristic(0x30, 0x0006, 0x0010, 0x19),
-                HapCharacteristic(0x52, 0x0007, 0x0010, 0x19)
-            )),
-            HapService(0xA2, 0x0010, supportsConfiguration = true, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0011, 0x0010, 0x1B),
-                HapCharacteristic(0x37, 0x0012, 0x0010, 0x19)
-            )),
-            HapService(0x55, 0x0020, characteristics = listOf(
-                // Pair Setup / Pair Verify are the two HAP control points that permit
-                // unauthenticated BLE transactions. These bits are what lets Home
-                // advance from discovery to Pair Setup M1.
-                HapCharacteristic(0x4C, 0x0022, 0x0003, 0x1B),
-                HapCharacteristic(0x4E, 0x0023, 0x0003, 0x1B),
-                HapCharacteristic(0x4F, 0x0024, 0x0001, 0x04),
-                HapCharacteristic(0x50, 0x0025, 0x0030, 0x1B)
-            )),
-            // Screen power is a plain on/off light: every toggle is one physical
-            // power-key press, with no brightness coupling in this service.
-            HapService(0x43, 0x0030, primary = true, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0031, 0x0010, 0x1B),
-                HapCharacteristic(0x23, 0x0032, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0034, 0x0030, 0x19),
-                HapCharacteristic(0x25, 0x0033, 0x00B0, 0x01)
-            )),
-            // Screen brightness lives in its own Lightbulb so iOS does not couple
-            // the brightness slider with the power switch above. Both its On and
-            // Brightness characteristics map to the phone's backlight level.
-            HapService(0x43, 0x0080, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0081, 0x0010, 0x1B),
-                HapCharacteristic(0x23, 0x0082, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0085, 0x0030, 0x19),
-                HapCharacteristic(0x25, 0x0083, 0x00B0, 0x01),
-                HapCharacteristic(0x08, 0x0084, 0x00B0, 0x04)
-            )),
-            // A second Lightbulb service gives the phone flashlight its own
-            // visible Home tile while keeping the screen power button separate.
-            HapService(0x43, 0x0070, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0071, 0x0010, 0x1B),
-                HapCharacteristic(0x23, 0x0072, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0074, 0x0030, 0x19),
-                HapCharacteristic(0x25, 0x0073, 0x00B0, 0x01)
-            )),
-            // Hotspot is a generic on/off capability, so use HomeKit Switch
-            // rather than an unrelated outlet or light icon.
-            HapService(0x49, 0x0040, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0041, 0x0010, 0x1B),
-                HapCharacteristic(0x23, 0x0042, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0044, 0x0030, 0x19),
-                HapCharacteristic(0x25, 0x0043, 0x00B0, 0x01)
-            )),
-            // Home exposes a generic Switch reliably, while a standalone
-            // Speaker service is treated as a media endpoint and hidden by
-            // some Home versions. Keep the semantic label and mute behavior,
-            // but use the visible Switch service for a Siri/Home toggle.
-            HapService(0x49, 0x0050, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0051, 0x0010, 0x1B),
-                HapCharacteristic(0x23, 0x0052, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0054, 0x0030, 0x19),
-                HapCharacteristic(0x25, 0x0053, 0x00B0, 0x01)
-            )),
-            // Standard Battery Service. HomeKit reads these values through the
-            // encrypted HAP channel so the tile can show the phone's battery.
-            HapService(0x96, 0x0060, characteristics = listOf(
-                HapCharacteristic(0xA5, 0x0061, 0x0010, 0x1B),
-                HapCharacteristic(0x23, 0x0062, 0x0010, 0x19),
-                HapCharacteristic(CONFIGURED_NAME_TYPE, 0x0066, 0x0030, 0x19),
-                HapCharacteristic(0x68, 0x0063, 0x0010, 0x04),
-                HapCharacteristic(0x79, 0x0064, 0x0010, 0x04),
-                HapCharacteristic(0x8F, 0x0065, 0x0010, 0x04)
-            ))
-        )
-
-        private val characteristicsByIid: Map<Int, HapCharacteristic> =
-            HAP_SERVICES.flatMap { it.characteristics }.associateBy { it.iid }
+        private val characteristicsByIid: Map<Int, HapCharacteristicDefinition> =
+            HomeKitAccessoryCatalog.services.flatMap { it.characteristics }.associateBy { it.iid }
 
         private fun hapUuid(shortUuid: Int): UUID =
             UUID.fromString("%08X-0000-1000-8000-0026BB765291".format(shortUuid))

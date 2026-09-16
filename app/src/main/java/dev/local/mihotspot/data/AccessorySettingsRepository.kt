@@ -30,6 +30,30 @@ class AccessorySettingsRepository(context: Context) {
         return id.joinToString(":") { "%02X".format(it) }
     }
 
+    /**
+     * Creates a completely new HAP-BLE identity for recovery from a stale Home
+     * database. The accessory ID alone is not enough: retain neither the old
+     * pairing controller nor the old Ed25519 seed, otherwise Home can merge a
+     * newly advertised device into a stale accessory record.
+     */
+    fun recoverHomeKitIdentity(): HomeKitRecoveryResult {
+        val id = ByteArray(6).also(secureRandom::nextBytes)
+        val serviceNameKeys = preferences.all.keys.filter { it.startsWith(SERVICE_NAME_PREFIX) }
+        val committed = preferences.edit()
+            .putString("device_id", Base64.encodeToString(id, Base64.NO_WRAP))
+            .remove("controller_id")
+            .remove("controller_key")
+            .remove("accessory_seed")
+            .putLong("homekit_recovery_at", System.currentTimeMillis())
+            .apply { serviceNameKeys.forEach(::remove) }
+            .commit()
+        check(committed) { "Unable to persist HomeKit recovery state" }
+        return HomeKitRecoveryResult(
+            accessoryId = id.joinToString(":") { "%02X".format(it) },
+            clearedServiceNames = serviceNameKeys.size
+        )
+    }
+
     fun accessoryId(): String {
         val encoded = preferences.getString("device_id", null)
         val bytes = try { encoded?.let { Base64.decode(it, Base64.NO_WRAP) } } catch (_: IllegalArgumentException) { null }
@@ -38,7 +62,10 @@ class AccessorySettingsRepository(context: Context) {
 
     private companion object {
         const val DEFAULT_SETUP_CODE_DIGITS = "47382915"
+        const val SERVICE_NAME_PREFIX = "service_name_"
         val DEFAULT_ACCESSORY_ID = byteArrayOf(0x02, 0x13, 0x37, 0x42, 0x51, 0x6D)
         val secureRandom = SecureRandom()
     }
 }
+
+data class HomeKitRecoveryResult(val accessoryId: String, val clearedServiceNames: Int)
