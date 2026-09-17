@@ -260,17 +260,11 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
                 "settings put system screen_brightness_mode 0; settings put system screen_brightness $level"
             )
 
-            val settingActual = try {
-                Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
-            } catch (_: Throwable) {
-                rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull()
-            }
             if (settingUpdated) {
-                val panelActual = backlight?.let { rootOutput("cat ${it.first}")?.trim()?.toIntOrNull() }
-                return CommandResult(
-                    true,
-                    "screen-brightness=$pct (settings level=$level readback=$settingActual panel=$panelActual)"
-                )
+                // Do not perform root readbacks on the command's critical path.
+                // MIUI applies the settings value asynchronously; the state
+                // poller performs verification shortly after the HAP response.
+                return CommandResult(true, "screen-brightness=$pct (settings level=$level)")
             }
 
             // Only use a raw panel write when the Android setting route is not

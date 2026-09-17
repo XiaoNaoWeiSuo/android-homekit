@@ -99,6 +99,8 @@ class MainActivity : Activity() {
     private var pairingCardKeyLabel: TextView? = null
     private var pairingCardKey: TextView? = null
     private var pairingModeSummary: TextView? = null
+    private var strategySummary: TextView? = null
+    private var strategyRadioGroup: RadioGroup? = null
     private var pairingPayloadText: TextView? = null
     private var mainPage: View? = null
     private var settingsPage: View? = null
@@ -397,6 +399,7 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
         settingsRoot.addView(buildSettingsHeader())
+        settingsRoot.addView(buildBroadcastStrategySettings())
         settingsRoot.addView(buildPairingSettings())
         settingsRoot.addView(buildHotspotSettings())
         settingsRoot.addView(buildNfcSettings())
@@ -432,6 +435,67 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(0xFF222222.toInt())
         }, LinearLayout.LayoutParams(0, -2, 1f))
+    }
+
+    private fun buildBroadcastStrategySettings(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(sectionHeader("广播与响应策略"))
+        addView(TextView(this@MainActivity).apply {
+            text = "控制 BLE 广播间隔与重连优先级；档位互斥，修改后立即重启广播应用。"
+            textSize = 12f
+            setTextColor(0xFF666666.toInt())
+            setPadding(0, 0, 0, dp(4))
+        })
+        strategySummary = TextView(this@MainActivity).apply {
+            textSize = 12f
+            setTextColor(0xFF245AA8.toInt())
+            setPadding(0, 0, 0, dp(4))
+        }
+        addView(strategySummary)
+
+        val group = RadioGroup(this@MainActivity).apply {
+            orientation = RadioGroup.VERTICAL
+        }
+        BroadcastStrategy.entries.forEach { strategy ->
+            group.addView(RadioButton(this@MainActivity).apply {
+                id = View.generateViewId()
+                tag = strategy.storageValue
+                text = when (strategy) {
+                    BroadcastStrategy.AUTO -> "自动 · 白天低延迟，夜间低功耗"
+                    BroadcastStrategy.LOW_LATENCY -> "低延迟 · 优先响应速度"
+                    BroadcastStrategy.BALANCED -> "均衡 · 响应与功耗折中"
+                    BroadcastStrategy.LOW_POWER -> "低功耗 · 优先降低待机耗电"
+                }
+                textSize = 13f
+                isChecked = ServiceControl.broadcastStrategy(this@MainActivity) == strategy
+                setPadding(0, dp(2), 0, dp(2))
+            })
+        }
+        strategyRadioGroup = group
+        group.setOnCheckedChangeListener { radioGroup, checkedId ->
+            val selected = radioGroup.findViewById<RadioButton>(checkedId)
+                ?.tag?.toString()?.let(BroadcastStrategy::fromStorage) ?: return@setOnCheckedChangeListener
+            if (selected == ServiceControl.broadcastStrategy(this@MainActivity)) return@setOnCheckedChangeListener
+            ServiceControl.setBroadcastStrategy(this@MainActivity, selected)
+            updateBroadcastStrategySummary()
+            log("BROADCAST_STRATEGY_CHANGED configured=${selected.storageValue}")
+            if (ServiceControl.isEnabled(this@MainActivity)) restartHomeKitService()
+            else Toast.makeText(this@MainActivity, "已保存，启动服务后生效", Toast.LENGTH_SHORT).show()
+        }
+        addView(group)
+        updateBroadcastStrategySummary()
+    }
+
+    private fun updateBroadcastStrategySummary() {
+        val configured = ServiceControl.broadcastStrategy(this)
+        val paired = getSharedPreferences("homekit", MODE_PRIVATE).contains("controller_key")
+        val effective = ServiceControl.effectiveBroadcastStrategy(this, paired)
+        val reason = when {
+            configured != BroadcastStrategy.AUTO -> "手动指定"
+            paired && ServiceControl.isNightQuietWindow() -> "自动挡 · 夜间静默时段"
+            else -> "自动挡 · 当前优先响应"
+        }
+        strategySummary?.text = "当前生效：${effective.title}（$reason）"
     }
 
     private fun buildPairingSettings(): View = LinearLayout(this).apply {
@@ -923,6 +987,7 @@ class MainActivity : Activity() {
 
     private fun showSettingsPage() {
         updatePairingCard()
+        updateBroadcastStrategySummary()
         mainPage?.visibility = View.GONE
         settingsPage?.visibility = View.VISIBLE
     }

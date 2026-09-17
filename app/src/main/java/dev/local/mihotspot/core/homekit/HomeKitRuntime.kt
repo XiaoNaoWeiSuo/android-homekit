@@ -26,6 +26,7 @@ import android.os.BatteryManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.UserManager
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -62,6 +63,7 @@ import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.KeyParameter
 import dev.local.mihotspot.ServiceControl
 import dev.local.mihotspot.HomeKitUiEvents
+import dev.local.mihotspot.BroadcastStrategy
 import dev.local.mihotspot.homekit.commands.AndroidCommandExecutor
 import dev.local.mihotspot.homekit.commands.HomeKitCommand
 import dev.local.mihotspot.homekit.controls.HomeKitControlLifecycle
@@ -91,6 +93,8 @@ open class HomeKitRuntime : Service() {
     private var advertising = false
     private var activeAdvertiseMode: Int? = null
     @Volatile private var starting = false
+    @Volatile private var gattTrafficSinceConnection = false
+    private var protocollessDisconnectStreak = 0
     private val pendingServices = ArrayDeque<BluetoothGattService>()
     private val gattCharacteristicDefinitions = IdentityHashMap<BluetoothGattCharacteristic, HapCharacteristicDefinition>()
     private val gattCharacteristicsByIid = ConcurrentHashMap<Int, BluetoothGattCharacteristic>()
@@ -441,7 +445,7 @@ open class HomeKitRuntime : Service() {
         mainHandler.post {
             if (!ServiceControl.isEnabled(this) || !checkBluetoothPermissions()) return@post
             val paired = getSharedPreferences("homekit", MODE_PRIVATE).contains("controller_key")
-            val desiredMode = desiredAdvertiseMode(paired)
+            val desiredMode = desiredAdvertiseMode(this, paired)
             val modeChanged = advertising && activeAdvertiseMode != desiredMode
             log("BLE_HEALTH_CHECK reason=$reason advertising=$advertising server=${server != null} activeMode=$activeAdvertiseMode desiredMode=$desiredMode")
             val safeToRestart = connectedDevices.isEmpty()
@@ -468,7 +472,7 @@ open class HomeKitRuntime : Service() {
             *accessoryId,
             0x08, 0x00,                               // ACID: Switches
             *currentStateNumber().leBytes(),           // GSN
-            0x17,                                     // CN: includes the mobile-data Switch service
+            CURRENT_CONFIG_NUMBER.toByte(),           // CN: HAP database configuration number
             0x02                                      // CV
         )
         val setupHash = if (pairingBroadcastMode() == PairingBroadcastMode.QR_SETUP_PAYLOAD) {
@@ -481,7 +485,7 @@ open class HomeKitRuntime : Service() {
             // manufacturer-data framing outside this byte array.
             it[1] = (0x2D + setupHash.size).toByte()
         } + setupHash
-        val advertiseMode = desiredAdvertiseMode(isPaired)
+        val advertiseMode = desiredAdvertiseMode(this, isPaired)
         val settings = AdvertiseSettings.Builder()
             // Before pairing, discovery speed matters. After pairing, Home
             // already knows the accessory and balanced advertising saves radio
@@ -704,15 +708,30 @@ open class HomeKitRuntime : Service() {
     private val gattCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             log("BLE_CONNECTION address=${device.address} status=$status state=${stateName(newState)}")
+            var gsnChanged = false
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevices += device.address
                 connectedDeviceRefs[device.address] = device
                 stateNumberIncrementedForConnection = false
+                gattTrafficSinceConnection = false
                 startStatePolling()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                val hadGattTraffic = gattTrafficSinceConnection
+                gsnChanged = stateNumberIncrementedForConnection
                 connectedDevices -= device.address
                 connectedDeviceRefs.remove(device.address)
                 stateNumberIncrementedForConnection = false
+                gattTrafficSinceConnection = false
+                if (hadGattTraffic) {
+                    protocollessDisconnectStreak = 0
+                } else {
+                    protocollessDisconnectStreak += 1
+                    log("BLE_PROTOCOLLESS_DISCONNECT streak=$protocollessDisconnectStreak")
+                    if (protocollessDisconnectStreak >= PROTOCOLLESS_DISCONNECT_RESTART_THRESHOLD) {
+                        protocollessDisconnectStreak = 0
+                        scheduleProbeRecovery("protocolless_disconnect")
+                    }
+                }
             }
             updateServiceNotification()
             publishRuntimeStatus()
@@ -728,9 +747,11 @@ open class HomeKitRuntime : Service() {
                 pendingPairingRemovals.remove(device.address)
                 restartAfterPairingsResponse.remove(device.address)
                 // Android's advertiser data is static after start. Rebuild it
-                // after disconnect so a GSN changed while connected is visible
-                // to Home on the next discovery pass.
-                refreshAdvertisementWithCurrentState()
+                // only when the GSN actually changed while connected. A blind
+                // refresh on every disconnect creates a reconnect storm on MIUI.
+                if (gsnChanged) {
+                    refreshAdvertisementWithCurrentState()
+                }
             }
         }
 
@@ -761,6 +782,7 @@ open class HomeKitRuntime : Service() {
         }
 
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
+            gattTrafficSinceConnection = true
             val key = responseKey(device, characteristic)
             val response = pduResponses[key]
             if (response != null && offset == 0) {
@@ -806,6 +828,7 @@ open class HomeKitRuntime : Service() {
         }
 
         override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, descriptor: BluetoothGattDescriptor) {
+            gattTrafficSinceConnection = true
             val value = if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
                 val definition = gattDefinition(descriptor.characteristic)
                 if (definition?.let {
@@ -830,6 +853,7 @@ open class HomeKitRuntime : Service() {
             offset: Int,
             value: ByteArray
         ) {
+            gattTrafficSinceConnection = true
             if (!preparedWrite && offset == 0 && descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
                 val definition = gattDefinition(descriptor.characteristic)
                 val iid = definition?.iid
@@ -856,6 +880,7 @@ open class HomeKitRuntime : Service() {
         }
 
         override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
+            gattTrafficSinceConnection = true
             log("GATT_WRITE uuid=${characteristic.uuid} prepared=$preparedWrite offset=$offset value=${value.hex()}")
             if (!preparedWrite && offset == 0) {
                 handleHapPduWrite(device, characteristic, value)
@@ -1021,6 +1046,7 @@ open class HomeKitRuntime : Service() {
                         HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                     } else {
                         val enabled = numericValue != 0
+                        val commandStartedAt = SystemClock.elapsedRealtime()
                         log("CONTROL_COMMAND_RECEIVED command=$command value=$numericValue service=0x%02X iid=0x%04X".format(definition.service.type, iid))
                         if (!commandPrefs.getBoolean("command_enabled_${command.name}", true)) {
                             log("COMMAND_BLOCKED command=$command value=$numericValue reason=disabled_by_user")
@@ -1032,17 +1058,25 @@ open class HomeKitRuntime : Service() {
                             } else {
                                 lifecycle.executeBoolean(enabled)
                             }
-                            log("COMMAND_EXECUTE command=$command value=$numericValue success=${result.success} message=${result.message}")
-                            notifyCommand(command, enabled, result.success, result.message)
+                            val elapsedMs = SystemClock.elapsedRealtime() - commandStartedAt
+                            log("COMMAND_EXECUTE command=$command value=$numericValue success=${result.success} elapsedMs=$elapsedMs message=${result.message}")
+                            // Keep the GATT callback thread focused on completing the
+                            // HAP transaction. Notification and state readback may
+                            // involve Binder/root I/O and must not hold up the response.
+                            mainHandler.post {
+                                notifyCommand(command, enabled, result.success, result.message)
+                                updateServiceNotification()
+                            }
                             if (result.success) {
                                 // ADK suppresses the indication while the same
                                 // characteristic is being written. The state
                                 // poller observes the committed Android state and
                                 // raises the event after the HAP write completes.
-                                refreshObservedControlState(definition)
-                                publishControlState(command)
+                                mainHandler.post {
+                                    refreshObservedControlState(definition)
+                                    publishControlState(command)
+                                }
                             }
-                            updateServiceNotification()
                             HapResponse(tid, if (result.success) HAP_STATUS_SUCCESS else HAP_STATUS_INVALID_REQUEST)
                         }
                     }
@@ -1721,15 +1755,19 @@ open class HomeKitRuntime : Service() {
         private const val STATE_POLL_INITIAL_DELAY_SECONDS = 2L
         private const val STATE_POLL_INTERVAL_SECONDS = 10L
         private const val BLUETOOTH_RECOVERY_DELAY_MS = 1500L
-        private fun desiredAdvertiseMode(paired: Boolean): Int = when {
-            !paired -> AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
-            ServiceControl.isNightQuietWindow() -> AdvertiseSettings.ADVERTISE_MODE_LOW_POWER
-            else -> AdvertiseSettings.ADVERTISE_MODE_BALANCED
+        private fun desiredAdvertiseMode(context: android.content.Context, paired: Boolean): Int = when (
+            ServiceControl.effectiveBroadcastStrategy(context, paired)
+        ) {
+            BroadcastStrategy.LOW_LATENCY -> AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
+            BroadcastStrategy.BALANCED -> AdvertiseSettings.ADVERTISE_MODE_BALANCED
+            BroadcastStrategy.LOW_POWER -> AdvertiseSettings.ADVERTISE_MODE_LOW_POWER
+            BroadcastStrategy.AUTO -> AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
         }
         private const val PROBE_RECOVERY_DELAY_MS = 5000L
         private const val EVENT_RETRY_DELAY_MS = 100L
         private const val GATT_OPEN_MAX_ATTEMPTS = 5
         private const val GATT_OPEN_RETRY_DELAY_MS = 1500L
+        private const val PROTOCOLLESS_DISCONNECT_RESTART_THRESHOLD = 3
         private const val PAIRING_REMOVAL_RESTART_DELAY_MS = 750L
         private const val HAP_REQUEST_HEADER_BYTES = 5
         private const val HAP_OPCODE_CHARACTERISTIC_SIGNATURE_READ = 0x01
@@ -1763,7 +1801,9 @@ open class HomeKitRuntime : Service() {
         private const val PROTOCOL_RESPONSE_TLV_CURRENT_STATE_NUMBER = 0x01
         private const val PROTOCOL_RESPONSE_TLV_CURRENT_CONFIG_NUMBER = 0x02
         private const val PROTOCOL_RESPONSE_TLV_ADVERTISING_ID = 0x03
-        private const val CURRENT_CONFIG_NUMBER = 0x17
+        // Incremented after changing the GATT/HAP database so paired
+        // controllers invalidate cached characteristic handles.
+        private const val CURRENT_CONFIG_NUMBER = 0x18
         private const val HAP_PROPERTY_EVENT = 0x0080
         private val CLIENT_CHARACTERISTIC_CONFIGURATION_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")

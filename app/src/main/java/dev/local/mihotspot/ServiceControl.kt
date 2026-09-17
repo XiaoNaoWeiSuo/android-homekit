@@ -12,6 +12,7 @@ import java.util.Calendar
 object ServiceControl {
     private const val PREFS = "homekit"
     private const val KEY_ENABLED = "driver_service_enabled"
+    private const val KEY_BROADCAST_STRATEGY = "broadcast_strategy"
     private const val WATCHDOG_INTERVAL_MS = 30L * 60L * 1000L
     private const val NIGHT_START_HOUR = 23
     private const val DAY_START_HOUR = 7
@@ -22,6 +23,29 @@ object ServiceControl {
     fun setEnabled(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_ENABLED, enabled).apply()
+    }
+
+    fun broadcastStrategy(context: Context): BroadcastStrategy =
+        BroadcastStrategy.fromStorage(
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_BROADCAST_STRATEGY, BroadcastStrategy.AUTO.storageValue)
+        )
+
+    fun setBroadcastStrategy(context: Context, strategy: BroadcastStrategy) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(KEY_BROADCAST_STRATEGY, strategy.storageValue).apply()
+    }
+
+    fun effectiveBroadcastStrategy(context: Context, paired: Boolean): BroadcastStrategy {
+        val configured = broadcastStrategy(context)
+        if (configured != BroadcastStrategy.AUTO) return configured
+        return if (paired && isNightQuietWindow()) {
+            BroadcastStrategy.LOW_POWER
+        } else {
+            // Before pairing and during daytime, prioritize quick discovery and
+            // reconnects. Auto still enters low power overnight after pairing.
+            BroadcastStrategy.LOW_LATENCY
+        }
     }
 
     fun start(context: Context) {
