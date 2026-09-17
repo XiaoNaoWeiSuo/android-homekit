@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<config>
+    <!-- Allow the system BLE foreground driver to remain available in Doze. -->
+    <allow-in-power-save package="dev.local.mihotspot" />
+</config>

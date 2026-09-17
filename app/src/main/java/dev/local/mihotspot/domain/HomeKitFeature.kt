@@ -1,26 +1,31 @@
 package dev.local.mihotspot.domain
 
 import dev.local.mihotspot.homekit.commands.HomeKitCommand
+import dev.local.mihotspot.homekit.controls.HomeKitControlModel
+import dev.local.mihotspot.homekit.controls.HomeKitControlModels
 
 /** Product-level feature metadata shared by the ViewModel and HomeKit runtime. */
 enum class HomeKitFeature(
-    val command: HomeKitCommand,
-    val title: String,
-    val enabledLabel: String,
-    val disabledLabel: String
+    val control: HomeKitControlModel
 ) {
-    SCREEN(HomeKitCommand.SCREEN, "屏幕电源", "亮屏", "熄屏"),
-    BRIGHTNESS(HomeKitCommand.BRIGHTNESS, "屏幕亮度", "开启", "关闭"),
-    HOTSPOT(HomeKitCommand.HOTSPOT, "热点", "开启", "关闭"),
-    MUTE(HomeKitCommand.MUTE, "媒体静音", "已静音", "未静音"),
-    FLASHLIGHT(HomeKitCommand.FLASHLIGHT, "手电筒", "开启", "关闭"),
-    GPS(HomeKitCommand.GPS, "GPS定位", "开启", "关闭"),
-    LOW_POWER_MODE(HomeKitCommand.LOW_POWER_MODE, "低电量模式", "开启", "关闭"),
-    DO_NOT_DISTURB(HomeKitCommand.DO_NOT_DISTURB, "免打扰模式", "开启", "关闭"),
+    SCREEN(HomeKitControlModels.SCREEN),
+    BRIGHTNESS(HomeKitControlModels.BRIGHTNESS),
+    HOTSPOT(HomeKitControlModels.HOTSPOT),
+    MUTE(HomeKitControlModels.MUTE),
+    FLASHLIGHT(HomeKitControlModels.FLASHLIGHT),
+    GPS(HomeKitControlModels.GPS),
+    LOW_POWER_MODE(HomeKitControlModels.LOW_POWER_MODE),
+    DO_NOT_DISTURB(HomeKitControlModels.DO_NOT_DISTURB),
+    MOBILE_DATA(HomeKitControlModels.MOBILE_DATA),
     ;
 
+    val command: HomeKitCommand get() = control.command
+    val title: String get() = control.title
+    val enabledLabel: String get() = control.enabledLabel
+    val disabledLabel: String get() = control.disabledLabel
+
     companion object {
-        val tileFeatures = listOf(SCREEN, HOTSPOT, MUTE, FLASHLIGHT, GPS, LOW_POWER_MODE, DO_NOT_DISTURB)
+        val tileFeatures = listOf(SCREEN, HOTSPOT, MUTE, FLASHLIGHT, GPS, LOW_POWER_MODE, DO_NOT_DISTURB, MOBILE_DATA)
         fun from(command: HomeKitCommand): HomeKitFeature = entries.first { it.command == command }
     }
 }

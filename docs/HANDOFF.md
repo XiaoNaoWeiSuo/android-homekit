@@ -1,147 +1,120 @@
-# Marionette：交接与运行手册
+# Marionette HomeKit 交接与排障手册
 
-更新日期：2026-09-15
+更新日期：2026-09-16
 
-## 当前可交接状态
+这份手册给接手项目的人使用。先看结论和日志证据，再动配对或安装状态；不要用“重装一次”代替定位。
 
-项目已经在 Xiaomi 13 上完成以下真机验证：
+## 当前已验证结论
 
-- HomeKit BLE 配件可广播、被家庭 App 发现并完成配对。
-- Pair Setup / Pair Verify 后可进入加密控制通道。
-- 最近一次已安装 APK 的配对状态以广播中的 `paired=` 为准（排查时“重置配件 ID”会清空 pairing，需重新配对）。最新 MVVM 拆分 APK 已构建；设备重新连接后需再执行 `install -r`。
-- 13 个 GATT 服务已成功发布，最后日志无崩溃、无 `BLE_ADVERTISING_FAILED`。
-- 已实现屏幕电源键按钮、屏幕亮度、热点、媒体静音、手电筒、电池状态、GPS定位、低电量模式、免打扰模式与 Android 通知。屏幕电源与亮度已拆分为两个独立 tile。
+- Xiaomi 13 真机可被 iPhone 家庭 App 发现、配对并完成 Pair Verify。
+- HAP 加密控制读写可用，按钮名称、布尔状态、亮度、音量、电池电量和充电状态均已完成同步验证。
+- 14 个 GATT 服务可以稳定发布；状态轮询在无 BLE 连接时仍运行，重新连接后可继续同步。
+- 移动数据使用 Root 的 `settings` + `svc data` 双路径切换，并在写入后回读确认真实开关状态。
+- 屏幕亮度以 Android 系统亮度档位（1–255）作为 HomeKit 百分比真值；Root 设备通过 `settings put system` 写入，背光节点只作为系统设置路径不可用时的最终回退，不能将小米背光原始值线性映射为 HomeKit 百分比。
+- Activity 内的亮度/音量滑块已采用最新值合并、串行写入和短暂稳定窗口，避免定时状态刷新与用户拖动互相覆盖。
+- 每个按钮现在由 `homekit/controls/HomeKitControl.kt` 的模型和生命周期统一驱动；HAP 只是适配层。
 
-工作目录：`/Users/lin/Desktop/xiaomi13`  
-真机序列号：`510af65c`  
-包名：`dev.local.mihotspot`  
-入口：`dev.local.mihotspot.MainActivity`
+关键文件：
 
-## 不要做的事
-
-- 不要为普通升级或排障点击/调用“重置配件 ID”或“清除配对状态”。这会让 iPhone 端已有家庭配对失效。
-- 不要删除应用数据、执行 `pm clear`，也不要卸载后以会清数据的方式重装。
-- 不要只以 UUID 查找 HomeKit 特征定义，也不要以“service UUID + characteristic UUID”为 PDU 请求/响应缓存建 key。三个 Lightbulb 和多个 Switch 会因此发生服务串线；`gattDefinition` 按 GATT characteristic 对象反查，失败时退回按 IID 描述符（全局唯一）反查，`responseKey` 必须按同一个 IID 隔离。
-- 不要在未递增 CN/GSN 的情况下改变服务清单或 IID。Home 会缓存元数据。
-
-## 关键源码
-
-| 路径 | 负责内容 |
+| 文件 | 作用 |
 | --- | --- |
-| `app/src/main/java/dev/local/mihotspot/MainActivity.kt` | View：原生 UI、运行时权限、启动/重启前台服务、渲染 ViewModel 状态 |
-| `app/src/main/java/dev/local/mihotspot/ui/MainViewModel.kt` | ViewModel：UI 状态读取、用户命令、亮度控制、配对码校验与按钮文案 |
-| `app/src/main/java/dev/local/mihotspot/HomeKitService.kt` | Android 前台 Service 入口；仅绑定 Manifest 与 core runtime |
-| `app/src/main/java/dev/local/mihotspot/BootReceiver.kt` | 开机、解锁启动和应用更新后恢复 HomeKit 前台服务 |
-| `app/src/main/java/dev/local/mihotspot/domain/HomeKitFeature.kt` | Model：功能开关的稳定语义、标题与状态文案 |
-| `app/src/main/java/dev/local/mihotspot/data/AccessorySettingsRepository.kt` | Model data：配件 ID、配对和用户配置持久化 |
-| `app/src/main/java/dev/local/mihotspot/core/homekit/HomeKitRuntime.kt` | Core 基础设施：BLE/GATT、HAP PDU、SRP、Pair Verify、加密会话；只消费协议数据库 |
-| `app/src/main/java/dev/local/mihotspot/core/homekit/protocol/HomeKitAccessoryCatalog.kt` | 稳定协议数据库：功能服务 IID、服务类型、默认名称、Name/ConfiguredName、值类型、只读状态与命令绑定；启动时校验协议不变量 |
-| `app/src/main/java/dev/local/mihotspot/homekit/commands/HomeKitCommand.kt` | 命令枚举及 HAP/Android 边界接口 |
-| `app/src/main/java/dev/local/mihotspot/homekit/commands/AndroidCommandExecutor.kt` | Root 与 Android API 的实际手机控制 |
-| `app/src/main/AndroidManifest.xml` | BLE、Wi-Fi、相机、通知等权限 |
-| `docs/ARCHITECTURE.md` | 完整架构、服务 IID、状态与限制 |
-| `vendor/HomeKitADK` | Apple 开源 ADK 参考实现；勿将它当成 Android 可直接编译组件 |
+| `app/src/main/java/dev/local/mihotspot/homekit/controls/HomeKitControl.kt` | 所有按钮的模型、生命周期、状态快照和登记表 |
+| `app/src/main/java/dev/local/mihotspot/core/homekit/protocol/HomeKitAccessoryCatalog.kt` | HAP 服务、特征、IID、名称、格式和模型绑定 |
+| `app/src/main/java/dev/local/mihotspot/core/homekit/HomeKitRuntime.kt` | BLE/GATT、配对、加密 PDU、HAP 读写和事件同步 |
+| `app/src/main/java/dev/local/mihotspot/homekit/commands/AndroidCommandExecutor.kt` | Android/Root 实际执行与真实状态读取 |
+| `app/src/main/java/dev/local/mihotspot/domain/HomeKitFeature.kt` | 控制模型在 UI 中的投影 |
 
-## 构建、安装、启动
+## 构建、安装和启动
 
-Gradle 9.1 可与本机 Android Studio JBR 一起使用。以下命令均在项目根目录执行：
+在项目根目录执行：
 
 ```sh
 JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home' \
   '/Users/lin/.gradle/wrapper/dists/gradle-9.1.0-all/7wzd0jkjit61aq2p43wpjgij9/gradle-9.1.0/bin/gradle' \
   --offline --no-daemon :app:assembleDebug
 
-adb -s 510af65c install -r app/build/outputs/apk/debug/app-debug.apk
-adb -s 510af65c shell pm grant dev.local.mihotspot android.permission.BLUETOOTH_ADVERTISE
-adb -s 510af65c shell pm grant dev.local.mihotspot android.permission.BLUETOOTH_CONNECT
-adb -s 510af65c shell am force-stop dev.local.mihotspot
-adb -s 510af65c shell am start -n dev.local.mihotspot/.MainActivity
+adb devices
+adb -s <设备序列号> install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s <设备序列号> shell am force-stop dev.local.mihotspot
+adb -s <设备序列号> shell am start -n dev.local.mihotspot/.MainActivity
 ```
 
-`install -r` 会保留 `SharedPreferences`，因此保留配对。打开 `MainActivity` 后会请求权限并启动 `HomeKitService`；BLE/GATT 不再由 Activity 承载，关闭 UI 不应停止配件。手电筒还需要应用内“授权手电筒相机权限”按钮；不能把 `CAMERA` 作为服务启动前置条件，否则用户拒绝相机权限会误阻断 BLE 配件。
+`install -r` 可以直接安装升级包，并保留应用数据和 HomeKit 配对身份。普通升级不要使用 `pm clear`，不要卸载重装；只有明确要重新配对时，才在应用内清除配对或重置配件 ID。
 
-最新 APK：`app/build/outputs/apk/debug/app-debug.apk`。
-
-## 健康检查
-
-启动后读取日志：
+KernelSU 集成使用：
 
 ```sh
-adb -s 510af65c logcat -d -s MiHotspotHap:I '*:S'
+./build-kernelsu-module.sh
 ```
 
-正常基线必须包含：
+生成的 `marionette-kernelsu-module.zip` 在 KernelSU Manager 中安装。调协议时优先安装 debug APK，确认状态稳定后再做模块包。
+
+## 日志基线
+
+读取运行日志：
+
+```sh
+adb -s <设备序列号> logcat -d -s MiHotspotHap:I '*:S'
+```
+
+启动成功至少应看到：
 
 ```text
-GATT_DATABASE_PUBLISHED services=13
+SERVICE_CREATED
+STATE_POLLING_STARTED intervalSeconds=10
+GATT_DATABASE_PUBLISHED services=14
 BLE_ADVERTISING_REQUESTED paired=true ...
 BLE_ADVERTISING_STARTED ... connectable=true
 ```
 
-含义：
+一次完整控制同步的关键顺序通常是：
 
-- `paired=true`：Android 端还保存着 iPhone controller key，不代表该瞬间有活跃 BLE 连接。
-- `BLE_CONNECTION ... CONNECTED` / `DISCONNECTED`：家庭 App 的真实 GATT 连接变化，前台服务通知据此更新；Activity 只展示配对状态与后台服务提示。
-- `PAIR_SETUP_M6`：新的配对已写入 controller key。
-- `PAIRINGS_REMOVE_QUEUED` / `PAIRINGS_REMOVE_APPLIED`：Home 的删除请求已暂存 / 已在 Execute Write 时真正清除 controller key。
-- `PAIRINGS_REMOVE_RESPONSE_SENT` / `paired=false`：删除响应已送出，服务重启并以 SF=1 未配对状态广播。
-- `CONTROL_SESSION_ACTIVE`：Pair Verify 后加密通道已建立。
-- `CONTROL_COMMAND_RECEIVED` 与 `COMMAND_EXECUTE`：HomeKit 指令已到达及 Android 执行结果。
-- `CONTROL_STATE_READ`：Home 正在读取热点、静音、亮度、电量等状态。
-
-如需只看异常：
-
-```sh
-adb -s 510af65c logcat -d | rg -i 'FATAL EXCEPTION|AndroidRuntime|MiHotspotHap:.*(ERROR|FAILED|Exception)'
+```text
+BLE_CONNECTION ... CONNECTED
+PAIR_VERIFY_M4 ...
+CONTROL_SESSION_ACTIVE
+HAP_EVENT_SUBSCRIBED ... iid=...
+CONTROL_STATE_READ ...
+HAP_EVENT_INDICATION_QUEUED ...
 ```
 
-## iPhone/Home 测试顺序
+不要只看“已连接”。`PAIR_VERIFY_M4` 只证明加密会话建立；`HAP_EVENT_SUBSCRIBED` 才证明 Home 正在订阅状态事件；`CONTROL_STATE_READ` 才证明 Home 真正读到了对应值。
 
-1. 打开 Android app，确认"配对状态：已配对"与"连接状态：由 HomeKit 后台服务维护"，并确认系统前台通知显示 HomeKit 广播中。
-2. 当前 CN 为 19、GSN 为 15。Accessory Information 使用 Name `0x23`，各功能服务由 `HomeKitAccessoryCatalog` 强制同时返回相同的 Name `0x23` 和 ConfiguredName `0xE3`；`0xE3` 按现代 Home 要求声明为 String、PW+PR+EV (`0x00B0`)，并在 Android GATT 中提供 BLE Indicate 与 CCCD `0x2902`（EV 缺失这两项时 iOS 会忽略 E3 的值并生成“开关/灯 + 编号”）。Battery `0x68/0x79/0x8F` 当前保留已验证可配对的 BLE read profile（UInt32、PR、4 字节）；实验性的 UInt8+PR+EV 会在 `M6` 后触发 iOS Remove Pairing，必须等 BLE 事件路径完成后再启用。移除并重新添加时确认 `PAIRINGS_REMOVE_APPLIED`、`paired=false`、新 `PAIR_SETUP_M6` 与全部 `SERVICE_NAME_READ type=0xE3`。
-3. 先测试热点、静音和手电筒；手电筒走 sysfs `led:torch_*`（无需相机权限，最可靠），相机权限只是无 Root 兜底。
-4. 测试屏幕时注意"屏幕电源"与"屏幕亮度"是两个独立 tile：电源的每次操作都是一次电源键按下，不要将 tile 的 bool 外观误认为会强制目标状态；亮度 tile 的滑块与开关都控制背光。
-5. 测试 GPS 定位、低电量模式和免打扰模式：这些功能需要 root 权限或系统设置权限。
+## 按日志定位问题
 
-### 配对/命名自救
-
-若家庭 App 出现“开关/灯 + 编号”、旧的“锁”卡片，或扫描到同一应用的两个 HAP 配件：先在家庭 App 删除所有旧 Marionette 卡片，再在 Android app 的“设备管理”点 **一键修复 HomeKit 配对/命名**。该操作不是普通“清除配对”：它先停止旧 BLE 广播，再轮换 Device ID 和 Ed25519 配件身份、清除 controller 与所有 `service_name_*` 缓存，最后以单一 `SF=1` 广播重新启动。不要在旧卡片仍存在时点击，否则 Home 仍会保留一条不可连接的历史记录。
-6. 发生问题后，不要先重置；先导出上述 logcat，重点保留从 `BLE_CONNECTION` 到 `COMMAND_EXECUTE` 的连续日志。
-
-## 常见故障定位
-
-| 现象 | 先检查 | 处理方向 |
+| 现象 | 优先检查 | 常见原因 |
 | --- | --- | --- |
-| 家庭 App 看不到新服务 | 广播中的 CN/GSN、`GATT_DATABASE_PUBLISHED` | 保留配对，关闭/重开家庭 App 后再等一次连接；新增服务时递增 CN/GSN |
-| 配对失败 | `PAIR_SETUP_PARSE`、M2/M4/M6、是否误清 controller key | 不要重置 ID；只在用户确认后清除配对状态并重新配对 |
-| 已配对但控制无效 | `CONTROL_SESSION_ACTIVE`、`CONTROL_COMMAND_RECEIVED`、`COMMAND_EXECUTE` | 区分 HAP 收包失败、应用内开关禁用、Root/API 权限失败 |
-| 有 `HAP_PDU_REQUEST` 但无 `COMMAND_EXECUTE` | 写入值字节长度与声明 format（Bool=1 字节，UInt32=4 字节小端） | 写分发必须按长度解码（`decodeWriteValue`），不要假设 1 字节；读取返回长度也要与声明一致 |
-| 命令 success=true 但物理无效 | 把 executor 原语拿到 `adb shell su -c` 手动复现；sysfs 读回“粘住”≠硬件动作 | 分层排查见 ARCHITECTURE.md“排查法”；灯/屏幕必须肉眼确认 |
-| UI 按钮无效但 HomeKit 同功能有效 | 状态读回函数（`currentValue`/`isHotspotActive`）是否恒真/恒假 | UI 是“读状态→取反→执行”；读回误判会让每次点击同向（曾导致热点 UI 永远只发“关”） |
-| 手电筒失败 | `flashlight=` 执行结果、`led:torch_*` 节点 | sysfs **必须先写 torch 电流再写 switch 使能**（PM8550 使能瞬间锁存电流）；无节点时回退 `CameraManager`（需 CAMERA） |
-| 热点状态显示错误 | `dumpsys wifi \| grep curState=` | 只有存活 SoftApManager 报 `curState=StartedState`；停止实例是 `<QUIT>`，勿按 "enabled"/"active" 子串匹配 |
-| 热点显示开但不能上网 | `hotspot=` 执行结果、系统 SoftAP 状态 | LocalOnlyHotspot 本来不提供网络；Root SoftAP 仍要按 OEM tethering 实测 |
-| 静音无效 | `media-muted` 结果、`cmd media_session` 输出 | 已用 Root `cmd media_session volume --set 0`；确认 root 可用且命令返回 `volume is 0` |
-| 服务/名称串线 | 命令 service IID、`gattDefinition` | 检查是否误按 UUID 查表；相同 service UUID 的实例必须按对象或 IID 映射 |
-| 名称回退为“灯/开关 1…” | `PAIRINGS_REMOVE_APPLIED`、新 `PAIR_SETUP_M6`、`SERVICE_NAME_READ type=0xE3`、`CONFIGURED_NAME_FALLBACK_REJECTED` | 先证明是全新配对，再确认每个功能服务的 ConfiguredName 值正确且签名为 String/PW+PR+EV。Home 写回的 `灯`/`灯 N`/`开关`/`开关 N` 是自动标题，必须清除旧 `service_name_*` 并以 HAP invalid-request 拒绝该写入；只读到 `0x23` 不足以证明现代 Home 收到了服务拼贴名称 |
-| 配对后立刻消失/名称退回通用名 | `PAIR_SETUP_M6` 后只有 Signature Read，接着 `PAIRINGS_REMOVE_APPLIED` | 控制器在读取 `0x23/0xE3` 前放弃数据库；先回退最近变更的服务签名。已确认 Battery 的 UInt8+PR+EV profile 会触发此流程，当前不要启用 |
-| 家庭 App 显示感叹号/无响应 | 前台通知是否仍存在、是否反复出现 `PROBE_STOPPED` 后 `SERVICE_CREATED` | 前台 Service 已承载 BLE；若 MIUI 强杀后仍残留死 GATT server，开关一次蓝牙后打开应用以重启服务 |
+| 一直“正在连接” | `BLE_ADVERTISING_STARTED`、`BLE_CONNECTION`、`PAIR_VERIFY_M4` | 广播未启动、旧 GATT 状态未清理、蓝牙权限/系统电源管理阻断 |
+| 能配对但按钮显示“不支持” | `HAP_PDU_REQUEST ... status=...`、Characteristic Signature、`HAP_EVENT_SUBSCRIBED` | HAP 属性、presentation format、IID、CCCD 或 ConfiguredName 不符合预期 |
+| 电池正常，所有按钮没有值 | 是否有控制特征的 `CONTROL_STATE_READ` | Home 没接受控制特征；重点查 `0x01B0`、Int32 `0x10`、布尔值 1 字节和 Service Signature |
+| 移动数据写入失败 | `COMMAND_EXECUTE command=MOBILE_DATA` 的 message、Root 状态、写入后的实际值 | 普通应用无 `MODIFY_PHONE_STATE`；Root 未授权、`svc data` 被厂商策略拦截，或设备没有可用数据 modem |
+| Home 显示“灯/开关 1” | `SERVICE_NAME_READ` 中的 `0x23` 与 `0xE3` | legacy Name 或 ConfiguredName 缺失、类型/属性错误，或错误接受了 Home 生成的 ConfiguredName |
+| Android 改了状态，Home 不变 | `CONTROL_STATE_CHANGED`、`HAP_GSN_INCREMENTED`、`HAP_EVENT_INDICATION_QUEUED` | 轮询被停止、真实状态读取错误、未订阅、GSN 未递增或 indication 未排队 |
+| 主动更新后短暂更新又失败 | 同时检查 `HAP_GSN_INCREMENTED` 和广播刷新 | 只改内存状态，没有让广播携带新的 GSN；当前实现会在无连接时刷新广播 |
+| 重新安装后无法配对 | `paired=`、`controller_key` 是否还在 | 使用了卸载、清数据或重置配件身份，而不是 `install -r` |
 
-## 修改服务前的清单
+电池日志不能作为协议整体正常的证明：电池是只读 UInt8，控制按钮是可读写、可事件通知的另一组特征。历史上“只有电池正常”的根因就是 Home 拒绝/跳过了控制特征，不能通过继续改 Android 开关执行器解决。
 
-1. 分配新的 service IID 和 characteristic IID，保证全局唯一。
-2. 只在 `HomeKitAccessoryCatalog.kt` 用 `functionalService(...)` 增加功能服务；它强制生成 Name、ConfiguredName 和 Signature，并校验 IID 全局唯一。不要在 `HomeKitRuntime` 手写服务清单或 `commandFor()` 路由。
-3. 明确值特征的 type、properties、format 和值宽度：Bool 使用 `booleanControl(...)`，UInt32 使用 `uint32Control(...)`，只读状态使用 `readOnly(...)`；不要把特征 UUID、format、Android GATT 属性混为一谈。
-4. 新值类型先扩展 `HapValueKind` 和 catalog 校验，再在 runtime 增加对应的显式编解码；String/TLV8/Float 不得直接套用整数 `decodeWriteValue()`。
-5. 更新 `HomeKitCommand`、`AndroidCommandExecutor`、UI 启用开关和通知 label；命令由 catalog 的 `HapControlBinding` 自动路由，状态必须读真实底层状态。
-6. 递增广播 GSN/CN；服务定义、IID、属性或格式变化后，旧 Home 配件必要时移除并重新添加。
-7. 构建、`install -r`、启动并确认服务数增加且没有 `GATT_SERVICE_ADDED status != 0`。
-8. 在 iPhone 上验证 Signature Read、Read、Write、状态回读、名称和图标；服务改名由 Home 的名称编辑保存在 Home 数据库。
+## 接手开发时的硬规则
 
-## 后续建议
+- 所有按钮先加到 `HomeKitControlModels`，再接入 UI 和 HAP；不要在三个层次分别复制名称、命令和状态判断。
+- Runtime 通过 `HomeKitControlLifecycle` 读取和写入控制值；只有 `AndroidCommandExecutor` 接触 Android 系统副作用。
+- HAP 读写/事件缓存必须按全局 IID 或 GATT characteristic 对象隔离，不能只按 UUID。多个 Lightbulb/Switch 服务会复用特征 UUID。
+- 当前功能控制只有两种图标服务：4 个 Light Bulb 和 6 个 Switch；Home 不支持通过名称自定义图标。若迁移到 Switch、Speaker 或 Stateless Programmable Switch，必须按新服务的必需特征完整实现，并递增 CN、删除旧配对后验证。
+- 主 Activity 的 NFC 前台分发必须声明 NFC 权限，并在未 armed 时不调用 `disableForegroundDispatch`；MIUI 缺少该保护会在 Activity 退后台时杀掉承载 HomeKit Service 的整个进程。
+- 服务/IID 一旦发布不要随意改。新增移动数据服务后 CN 已从 `0x16` 提升到 `0x17`；后续改变服务数据库仍要递增 CN，并删除旧配对重新验证。只改执行器不需要改 CN。
+- HAP 的 Int32 是 4 字节小端，不能因为某个值看起来像 0/1 就按 Bool 解码；电池 UInt8 才是 1 字节。
+- `ConfiguredName` 的 `0x00B0` 和控制特征的 `0x01B0` 不可混用；前者用于可编辑名称，后者用于按钮状态和事件。
+- 状态事件是“零长度 Indicate 后 Home 回读”，不是把业务值直接塞进 indication；必须确认 CCCD、订阅、GSN、回读四件事。
+- 屏幕电源是按键动作，不是普通目标状态；亮度和音量的 `On` 与滑块写入必须共享一个模型生命周期。
 
-- 已完成 BLE server/HAP session 到前台 `HomeKitService` 的迁移，并以 `MainActivity → MainViewModel → HomeKitCommandExecutor` 保持 UI 与运行时解耦。
-- 下一步将 `HomeKitService` 内的 HAP transport、Pairing session 与 accessory database 继续拆成独立类，并为它们补单元测试。
-- 为手电筒在应用启动/相机授权后立即注册 torch callback，改善外部改变手电筒后的冷启动状态同步。
-- 当前只支持单 controller pairing 的 Add/Remove；后续若支持多家庭，再补 List Pairings、权限与“最后一个管理员移除时清理全部 pairing”的完整模型。
-- 若追求真正的“按钮”服务语义，可实验 Stateless Programmable Switch；但当前“电源”用 Lightbulb `On` 是为了保证家庭 App 内有稳定、可直接点按的 tile。
+## 最小回归流程
+
+1. 编译并用 `install -r` 更新，确认服务启动和 14 个服务发布。
+2. 在 Home 中打开配件详情，确认每个功能名称不是自动生成名称。
+3. 逐个读取屏幕电源、亮度、热点、移动数据、静音、手电筒、GPS、低电量模式、免打扰和音量；同时确认日志有对应 `CONTROL_STATE_READ`。
+4. 从 Android 设置或系统动作改变状态，等待一个轮询周期，确认 `CONTROL_STATE_CHANGED → HAP_GSN_INCREMENTED → HAP_EVENT_INDICATION_QUEUED`。
+5. 从 Home 写入布尔值和亮度/音量滑块，确认 `CONTROL_COMMAND_RECEIVED → COMMAND_EXECUTE`，并在 Android 侧核对真实状态；亮度应看到 `screen-brightness=... (panel+settings)` 或明确的回退路径。
+6. 断开、重连、重启 Home 再做一次全量读取；不要在这个过程中清除配对，除非是在验证全新配对流程。
+
+如需重新配对，优先使用应用内“清除配对状态”，保留配件 ID；只有要模拟新配件时才重置配件 ID。协议参考以 [Apple HomeKitADK BLE 实现](https://github.com/apple/HomeKitADK/blob/master/HAP/HAPBLEAccessoryServer%2BAdvertising.c) 为准，真机日志以本手册的运行时证据为准。

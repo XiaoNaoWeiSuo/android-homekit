@@ -44,4 +44,5 @@ kotlin {
 dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.20")
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    implementation("com.google.zxing:core:3.5.3")
 }

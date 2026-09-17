@@ -3,10 +3,15 @@ package dev.local.mihotspot.ui
 import android.content.Context
 import dev.local.mihotspot.data.AccessorySettingsRepository
 import dev.local.mihotspot.data.HomeKitRecoveryResult
+import dev.local.mihotspot.data.HotspotConfiguration
+import dev.local.mihotspot.data.HotspotSettingsRepository
 import dev.local.mihotspot.domain.HomeKitFeature
 import dev.local.mihotspot.homekit.commands.AndroidCommandExecutor
 import dev.local.mihotspot.homekit.commands.CommandResult
-import dev.local.mihotspot.homekit.commands.HomeKitCommand
+import dev.local.mihotspot.homekit.controls.HomeKitControlLifecycle
+import dev.local.mihotspot.homekit.controls.HomeKitControlModels
+import dev.local.mihotspot.homekit.HomeKitSetupPayload
+import dev.local.mihotspot.homekit.PairingBroadcastMode
 
 /**
  * Presentation state and user-initiated actions for MainActivity.
@@ -17,7 +22,11 @@ import dev.local.mihotspot.homekit.commands.HomeKitCommand
  */
 class MainViewModel(context: Context) {
     private val executor = AndroidCommandExecutor(context.applicationContext)
+    private val controlLifecycles = HomeKitControlModels.all.associate { model ->
+        model.command to HomeKitControlLifecycle(model, executor)
+    }
     private val settings = AccessorySettingsRepository(context.applicationContext)
+    private val hotspotSettings = HotspotSettingsRepository(context.applicationContext)
 
     data class State(
         val featureStates: Map<HomeKitFeature, Boolean>,
@@ -26,21 +35,26 @@ class MainViewModel(context: Context) {
     )
 
     fun loadState(): State = State(
-        featureStates = HomeKitFeature.tileFeatures.associateWith { executor.currentValue(it.command) },
-        brightness = executor.currentValueInt(HomeKitCommand.BRIGHTNESS) ?: 0,
-        volume = executor.currentValueInt(HomeKitCommand.VOLUME) ?: 0
+        featureStates = HomeKitFeature.tileFeatures.associateWith { lifecycle(it).currentBoolean() },
+        brightness = lifecycle(HomeKitFeature.BRIGHTNESS).currentPercentage(),
+        volume = controlLifecycles.getValue(HomeKitControlModels.VOLUME.command).currentPercentage()
     )
 
     fun toggle(feature: HomeKitFeature): CommandResult {
-        val target = !executor.currentValue(feature.command)
-        return executor.execute(feature.command, target)
+        val target = !lifecycle(feature).currentBoolean()
+        return lifecycle(feature).executeBoolean(target)
     }
 
+    fun currentValue(feature: HomeKitFeature): Boolean = lifecycle(feature).currentBoolean()
+
+    fun toggleFromCurrent(feature: HomeKitFeature, current: Boolean): CommandResult =
+        lifecycle(feature).executeBoolean(!current)
+
     fun setBrightness(value: Int): CommandResult =
-        executor.executeValue(HomeKitCommand.BRIGHTNESS, value.coerceIn(0, 100))
+        lifecycle(HomeKitFeature.BRIGHTNESS).executePercentage(value)
 
     fun setVolume(value: Int): CommandResult =
-        executor.executeValue(HomeKitCommand.VOLUME, value.coerceIn(0, 100))
+        controlLifecycles.getValue(HomeKitControlModels.VOLUME.command).executePercentage(value)
 
     fun buttonLabel(feature: HomeKitFeature, state: Boolean?): String {
         val suffix = when (state) {
@@ -60,19 +74,34 @@ class MainViewModel(context: Context) {
     }
 
     fun formatSetupCode(digits: String): String {
-        val clean = digits.filter(Char::isDigit).padEnd(8, '0').take(8)
-        return "${clean.substring(0, 4)}-${clean.substring(4, 8)}"
+        return HomeKitSetupPayload.formatSetupCode(digits)
     }
 
     val deviceName: String get() = settings.deviceName
     val setupCodeDigits: String get() = settings.setupCodeDigits
+    val setupId: String get() = settings.setupId
+    val pairingBroadcastMode: PairingBroadcastMode get() = settings.pairingBroadcastMode
+    val isConnected: Boolean get() = settings.isRuntimeConnected
+    val setupPayload: String get() = HomeKitSetupPayload.create(setupCodeDigits, setupId)
     val isPaired: Boolean get() = settings.isPaired
     fun saveDeviceName(name: String) = settings.saveDeviceName(name)
     fun saveSetupCode(digits: String) = settings.saveSetupCode(digits)
+    fun setPairingBroadcastMode(mode: PairingBroadcastMode) = settings.setPairingBroadcastMode(mode)
     fun clearPairing() = settings.clearPairing()
     fun resetAccessoryId(): String = settings.resetAccessoryId()
     fun recoverHomeKitIdentity(): HomeKitRecoveryResult = settings.recoverHomeKitIdentity()
     fun accessoryId(): String = settings.accessoryId()
     fun isFeatureEnabled(feature: HomeKitFeature): Boolean = settings.isFeatureEnabled(feature)
     fun setFeatureEnabled(feature: HomeKitFeature, enabled: Boolean) = settings.setFeatureEnabled(feature, enabled)
+    fun hotspotConfiguration(): HotspotConfiguration = hotspotSettings.configuration()
+    fun saveHotspotConfiguration(configuration: HotspotConfiguration) = hotspotSettings.save(configuration)
+    fun restartHotspotIfActive(): CommandResult {
+        val hotspot = lifecycle(HomeKitFeature.HOTSPOT)
+        if (!hotspot.currentBoolean()) return CommandResult(true, "hotspot=not-running")
+        hotspot.executeBoolean(false)
+        return hotspot.executeBoolean(true)
+    }
+
+    private fun lifecycle(feature: HomeKitFeature): HomeKitControlLifecycle =
+        controlLifecycles.getValue(feature.command)
 }

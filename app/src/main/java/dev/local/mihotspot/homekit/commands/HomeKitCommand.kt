@@ -10,6 +10,7 @@ enum class HomeKitCommand {
     GPS,
     LOW_POWER_MODE,
     DO_NOT_DISTURB,
+    MOBILE_DATA,
     /** Local media-volume slider; not exposed as a HomeKit tile. */
     VOLUME
 }

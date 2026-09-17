@@ -1,283 +1,142 @@
-# Marionette：HomeKit-over-BLE 技术架构
+# Marionette HomeKit-over-BLE 架构定稿
 
-更新日期：2026-09-15
+更新日期：2026-09-16
 
-## 目标与边界
+这份文档记录已经在 Xiaomi 13 真机验证通过的实现原则。它不是 HAP 教程；遇到问题时，先按这里的边界和不变量判断，再看 `HANDOFF.md` 的日志排障流程。
 
-Marionette 把一台 Android 手机实现为一个仅用于个人实验的 HomeKit BLE 配件。iPhone 的“家庭”App 通过 HAP-over-BLE 与手机配对、验证并发送控制指令；Android 再把这些指令映射为本机动作。
+## 1. 系统边界
 
-当前实现面向 Xiaomi 13（Android 13、已 Root）验证，不是 MFi 认证产品，也不适合直接用于商业分发或安全关键控制。
-
-## 运行时结构
+Marionette 把 Android 手机实现成一个面向个人实验的 HomeKit BLE 配件：
 
 ```text
 iPhone 家庭 App
-    │ HAP 广播发现 / BLE GATT / 加密 HAP PDU
-    ▼
-MainActivity.kt (View)
-    ├── 权限请求、原生 UI 渲染
-    └── MainViewModel
-             │
-HomeKitService.kt (Runtime)
-    ├── BLE 广播：Apple manufacturer data、配件 ID、GSN/CN
-    ├── GATT Server：按顺序发布 HomeKit 服务和特征
-    ├── HAP 事务：签名、Pair Setup、Pair Verify、加密控制读写
-    └── 状态：配对控制器、公钥、连接设备、前台通知
-             │
-             └── Command boundary
-             ▼
-homekit/commands/AndroidCommandExecutor.kt
-    ├── Root shell：电源键、SoftAP、系统亮度、媒体音量兜底
-    └── Android API：Camera torch、AudioManager、WifiManager、PowerManager
+  └─ BLE 广播发现 / GATT / Pair Setup / Pair Verify / 加密 HAP PDU
+       └─ HomeKitRuntime
+            ├─ HAP 协议适配：服务、特征、IID、签名、读写、事件
+            ├─ BLE 传输：GATT Server、Indicate、CCCD、广播刷新
+            └─ HomeKitControlLifecycle
+                 └─ AndroidCommandExecutor
+                      └─ Android API / Root shell / sysfs
 ```
 
-BLE/HAP runtime 由前台 `HomeKitService` 独占，UI 关闭不会停止广播。`MainViewModel` 承担 UI 状态读取、用户命令和配对码校验；所有具副作用的手机操作集中在 `HomeKitCommandExecutor` 接口之后。
-
-## 源码目录与 MVVM 边界
+依赖方向必须保持单向：
 
 ```text
-app/src/main/java/dev/local/mihotspot/
-├── MainActivity.kt                         View：原生 Android UI、权限请求、ViewModel 渲染
-├── HomeKitService.kt                       Android Service 入口：仅绑定 Manifest 到 core runtime
-├── BootReceiver.kt                         Runtime：开机/更新后恢复前台服务
-├── data/
-│   └── AccessorySettingsRepository.kt      Model data：配件 ID、配对与用户配置持久化
-├── domain/
-│   └── HomeKitFeature.kt                   Model：功能开关的稳定产品语义与展示元数据
-├── ui/
-│   └── MainViewModel.kt                    ViewModel：UI 状态、用户命令、配对码校验与文案
-├── homekit/commands/
-│   ├── HomeKitCommand.kt                   命令边界：HAP 可执行命令、结果与接口
-│   └── AndroidCommandExecutor.kt           Android/Root 效果与真实状态读回
-└── core/homekit/
-    ├── HomeKitRuntime.kt                   稳定基础设施：BLE、GATT、HAP、配对与加密
-    └── protocol/
-        └── HomeKitAccessoryCatalog.kt      不可变协议数据库：服务、IID、名称、值类型与命令绑定
+HomeKitControlModel（产品语义）
+        ↑
+HomeKitAccessoryCatalog（HAP 映射） ← HomeKitRuntime（BLE/HAP 会话）
+        ↓                                  ↓
+  HomeKitFeature（UI 投影）       AndroidCommandExecutor（真实状态）
 ```
 
-依赖方向固定为 `MainActivity → MainViewModel → domain/data + HomeKitCommandExecutor`。`HomeKitService` 只是 Android 生命周期入口，`core/homekit/HomeKitRuntime` 使用相同的命令接口但不依赖 View 或 ViewModel；不要再把 GATT、配对或加密逻辑放回 UI 层。
+`HomeKitRuntime` 是前台 Service 的稳定核心，Activity 关闭不应影响广播和状态轮询。UI 只通过 `MainViewModel` 和命令接口工作，不能承载 GATT、配对或加密状态机。
 
-## 配对与加密通道
+## 2. 按钮的可复用模型与生命周期
 
-运行时位于 `app/src/main/java/dev/local/mihotspot/core/homekit/HomeKitRuntime.kt`，协议数据库位于 `core/homekit/protocol/HomeKitAccessoryCatalog.kt`；`HomeKitService.kt` 仅是 Android Service 入口：
+按钮不再由 UI、HAP 目录和运行时各自维护一份命令/名称/状态逻辑。统一模型位于：
 
-1. 未配对/已配对广播均包含 Apple Company ID `0x004C` 和 HAP BLE payload。
-2. iPhone 连接 GATT 后，先读取 Service/Characteristic Signature；实现会按 HAP PDU 返回服务属性、IID、类型、属性及 presentation format。
-3. Pair Setup 使用 SRP-3072，完成 M1–M6；控制器 identifier 和 Ed25519 public key 存入 `SharedPreferences("homekit")`。
-4. Pair Verify 以 Curve25519/X25519、HKDF-SHA-512 和 Ed25519 建立会话。
-5. 后续控制 PDU 使用 ChaCha20-Poly1305 保护；读、写方向分别维护 nonce。
-6. Pairings `Remove Pairing` 先暂存目标 controller identifier，在 Execute Write 时提交；目标存在则删除 `controller_id/controller_key`，目标不存在也返回成功。删除响应发送完成后重建 GATT/广播，使 SF 切换为未配对 `1`。
+`app/src/main/java/dev/local/mihotspot/homekit/controls/HomeKitControl.kt`
 
-配对持久化键：
+其中：
 
-- `device_id`：6-byte 配件 ID，也是 BLE 广播中的 device ID。
-- `accessory_seed`：配件 Ed25519 私钥种子。
-- `controller_id`、`controller_key`：当前家庭控制器的 pairing identity/key。
-- `setup_code_digits`：UI 中的 8 位 `4-4` 录入值；SRP 内部转换为 HAP 标准 `3-2-3` 格式。
+- `HomeKitControlModel`：按钮的命令、标题、状态文案、值类型和交互语义；完全不依赖 HAP UUID、IID、BLE 属性或 TLV。
+- `HomeKitControlLifecycle`：一个按钮的完整运行时生命周期，统一负责真实状态读取、写入和规范化快照。
+- `HomeKitControlModels`：所有按钮的唯一登记表。
+- `HomeKitFeature` 只是模型在 UI 层的投影，不再重复定义名称和命令。
 
-不要在普通升级、排查 UI 或增加服务时清除上述数据。`重置配件 ID` 或 `清除配对状态` 只应由用户明确操作；但 Home 发出的标准 Remove Pairing 必须真正删除匹配的 controller pairing，不能只返回成功并继续保留 key。
+每个按钮都必须经过同一条链路：
 
-## GATT 服务模型
+```text
+HomeKitControlModels 登记
+  → HAP catalog 把模型映射为一个或多个特征
+  → HAP read/write 进入对应 Lifecycle
+  → Lifecycle 调 AndroidCommandExecutor
+  → 读取 Android 真实状态
+  → 轮询比较快照 / 发送 HAP event / 更新 UI
+```
 
-所有 UUID 使用 HomeKit base UUID `00000000-0000-1000-8000-0026BB765291`。配置号（CN）当前为 **18**、全局状态号（GSN）为 **15**；增加或变更服务语义时应继续递增 CN，使家庭 App 刷新缓存。
+亮度和音量是最容易出错的例子：一个模型同时暴露 `On` 布尔特征和 `Brightness` Int32 特征。两个特征必须共享同一个生命周期；布尔写入代表 0 或 100，滑块写入代表 0–100，读取都回到 Android 的实际亮度/音量。轮询时则按 HAP 特征 IID 分别记录快照，确保两个特征都能收到变化通知。
 
-| 服务 | 服务 IID | 关键特征 IID | 作用 |
-| --- | ---: | --- | --- |
-| Accessory Information `0x3E` | `0x0001` | `0x0002`–`0x0007` | 厂商、型号、序列号、名称 |
-| Protocol Information `0xA2` | `0x0010` | `0x0011`、`0x0012` | HAP BLE 协议配置 |
-| Pairing `0x55` | `0x0020` | `0x0022`–`0x0025` | Pair Setup、Pair Verify、Pairings |
-| 屏幕电源 Lightbulb `0x43` | `0x0030` | Name `0x0032`、On `0x0033`、ConfiguredName `0x0034` | 电源键按钮：每次写入 = 一次电源键按下 |
-| 屏幕亮度 Lightbulb `0x43` | `0x0080` | Name `0x0082`、On `0x0083`、Brightness `0x0084`、ConfiguredName `0x0085` | 屏幕背光（On 与 Brightness 都映射到背光） |
-| 手机手电筒 Lightbulb `0x43` | `0x0070` | Name `0x0072`、On `0x0073`、ConfiguredName `0x0074` | 手电筒 |
-| 手机热点 Switch `0x49` | `0x0040` | Name `0x0042`、On `0x0043`、ConfiguredName `0x0044` | 热点 |
-| 媒体静音 Switch `0x49` | `0x0050` | Name `0x0052`、On `0x0053`、ConfiguredName `0x0054` | 媒体静音 |
-| Battery `0x96` | `0x0060` | Name `0x0062`、Level `0x0063`、Low `0x0064`、Charging `0x0065`、ConfiguredName `0x0066` | 手机电量；当前使用已验证可配对的 BLE 读取 profile |
-| GPS定位 Switch `0x49` | `0x0090` | Name `0x0092`、On `0x0093`、ConfiguredName `0x0094` | GPS定位开关 |
-| 低电量模式 Switch `0x49` | `0x00A0` | Name `0x00A2`、On `0x00A3`、ConfiguredName `0x00A4` | 低电量模式开关 |
-| 免打扰模式 Switch `0x49` | `0x00B0` | Name `0x00B2`、On `0x00B3`、ConfiguredName `0x00B4` | 免打扰模式开关 |
-| 音量控制 Lightbulb `0x43` | `0x00C0` | Name `0x00C2`、On `0x00C3`、Brightness `0x00C4`、ConfiguredName `0x00C5` | 媒体音量（On 与 Brightness 都映射到音量） |
+Activity 内的两个数值滑块还必须做输入隔离：拖动期间、写入队列未清空期间和写入完成后的短暂稳定窗口内，禁止定时刷新或 HomeKit 广播事件回写滑块；连续拖动值合并为最新值并串行执行，避免旧写入完成后把鼠标位置拉回去。
 
-同一种标准服务和特征 UUID 可出现多次（四个 Lightbulb、多个 Switch）。Android 的 UUID 不足以区分实例，因此 `gattDefinition` 先用 `IdentityHashMap<BluetoothGattCharacteristic, HapCharacteristicDefinition>` 按对象反查；MIUI 回调可能传回不同对象实例，此时退回用 IID 描述符（全局唯一）反查。请勿改回仅依 UUID 的 Map，否则名称和命令会串到其他服务。
+屏幕电源是 `PRESS` 语义：Home 的布尔写入触发一次电源键动作，不能把它误当成“设置目标亮/灭”。其它开关是 `SET_STATE` 语义。新增按钮时先明确这两件事，再写 Android 执行器。
 
-### 新增服务/开关的推荐模板
+当前控制模型：
 
-先写一张定义表，再写代码。每一行都必须有唯一 service IID、唯一 characteristic IID、HomeKit type、值格式、读写属性和执行命令：
-
-| 项目 | 普通开关示例 | 数值控制示例 | 名称示例 |
+| 模型 | Android 命令 | 类型 | 交互 |
 | --- | --- | --- | --- |
-| Service type | `0x49` Switch | `0x43` Lightbulb 或对应标准服务 | 所属服务 |
-| Service IID | 新分配，例如 `0x0090` | 新分配 | 不复用旧 IID |
-| Characteristic type | `0x25` On | 标准数值 UUID，例如 `0x08` Brightness | `0xE3` ConfiguredName；兼容保留 `0x23` Name |
-| Characteristic IID | 新分配，例如 `0x0093` | 每个特征单独分配 | 两个名称特征 IID 都必须全局唯一 |
-| Properties | `0x00B0`（当前项目 On 的读写/通知组合） | 按标准服务定义 | ConfiguredName=`0x00B0`，Name=`0x0010` |
-| Format | `0x01` Bool | 与实际值宽度一致 | `0x19` UTF-8 String |
-| 状态来源 | executor 的真实状态 | executor 的真实数值 | SharedPreferences/服务配置 |
+| 屏幕电源 | `SCREEN` | Boolean | Press |
+| 屏幕亮度 | `BRIGHTNESS` | Percentage | Set state |
+| 手机热点 | `HOTSPOT` | Boolean | Set state |
+| 媒体静音 | `MUTE` | Boolean | Set state |
+| 手电筒 | `FLASHLIGHT` | Boolean | Set state |
+| GPS 定位 | `GPS` | Boolean | Set state |
+| 低电量模式 | `LOW_POWER_MODE` | Boolean | Set state |
+| 免打扰模式 | `DO_NOT_DISTURB` | Boolean | Set state |
+| 移动数据 | `MOBILE_DATA` | Boolean | Set state |
+| 媒体音量 | `VOLUME` | Percentage | Set state |
 
-IID 是 HAP 实例身份，不是随意编号。新 IID 不能与任何已有 service/characteristic IID 冲突；同一服务内的 IID 也不能复用。功能服务只能在 `HomeKitAccessoryCatalog.kt` 通过 `functionalService(...)` 声明：工厂自动加入 Service Signature、只读 Name `0x23` 与协议正确的 ConfiguredName `0xE3`，并在类加载时验证 IID 全局唯一、名称非空、`0xE3=String/PW+PR+EV`。不要回到 `HomeKitRuntime` 手写服务或名称分支。
+亮度执行以 Android 用户亮度档位为唯一百分比标尺：无 Root 时写入 `Settings.System.SCREEN_BRIGHTNESS`，Root 时优先通过 Root 执行同一条 `settings put system` 路径。小米显示服务会按设备校准曲线把 1–255 档位映射到 `/sys/class/backlight/*/brightness`，因此不能把背光节点原始值线性换算成 HomeKit 百分比；背光节点只用于无系统设置路径时的最终回退。读取也优先系统档位，保证 HomeKit 写入 60 后回读仍是 60。
 
-不要只增加一个 `On` 特征就假定 Home 会正确显示。Home 根据完整服务类型、特征集合、读写属性、presentation format 和配置缓存决定图标、标题及“支持/不支持”状态。
+热点由 `HotspotSettingsRepository` 保存一套配置，`AndroidCommandExecutor` 启动前先执行 `cmd wifi stop-softap`，再按该配置启动唯一 SoftAP，禁止回退到 `LocalOnlyHotspot`，以免同时出现两个个人热点。SSID、密码和频段可直接应用；Wi‑Fi 6、自动关闭时长等 SoftApConfiguration 的系统/厂商参数需通过二级页面的系统热点设置入口落地。
 
-## 命令层与权限
+`AndroidCommandExecutor` 是唯一的副作用边界。它不能只返回“命令执行成功后猜测的值”；`currentValue` / `currentValueInt` 必须尽可能读取系统真实状态，否则 Home 的同步会在重启、系统设置或外部操作后漂移。
 
-枚举与边界接口在 `homekit/commands/HomeKitCommand.kt`，Android 实现在 `AndroidCommandExecutor.kt`。
+移动数据的读取优先使用 `TelephonyManager.isDataEnabled()`，它表示用户移动数据开关，而不是当前是否已经连上蜂窝网络；Root 环境下回退到 `settings get global mobile_data`。写入同时执行 `settings put global mobile_data 0|1` 和 `svc data enable|disable`，并回读确认。普通应用不能直接调用 `setDataEnabled()`，因为官方 API 要求 `MODIFY_PHONE_STATE` 或运营商权限；本项目依赖 Root 执行平台 shell 命令。
 
-| 命令 | HomeKit 写入 | Android 动作 | 权限/降级 | 状态读回 |
-| --- | --- | --- | --- | --- |
-| `SCREEN` | 任意 bool 写入都视作一次按键 | Root：`input keyevent 26` | 无 Root 时：Device Admin 锁屏或 wake lock 亮屏 | `PowerManager.isInteractive` |
-| `BRIGHTNESS` | `0..100`（On 则 100/0；写入按声明的 UInt32 解析 1/2/4 字节小端值，读取回 4 字节） | 优先写 `/sys/class/backlight/*/brightness` | 无 backlight 节点时 `WRITE_SETTINGS` 或 Root `settings put` | sysfs 读回映射到 `0..100` |
-| `HOTSPOT` | bool | Root SoftAP；否则 LocalOnlyHotspot | Root 可控制系统 SoftAP；免 Root 不是互联网共享 | `dumpsys wifi` 中存活 SoftApManager 的 `curState=StartedState`（停止的实例是 `<QUIT>`） |
-| `MUTE` | bool | Root `cmd media_session volume --stream 3 --set 0` | `AudioManager.setStreamMute` 仅作标记；MIUI 上以 media_session 为准 | `cmd media_session --get` / `dumpsys audio` |
-| `FLASHLIGHT` | bool | sysfs `led:torch_*` / `led:switch_*`：**必须先写 torch 电流、再写 switch 使能**（PM8550 驱动在使能瞬间锁存电流，顺序反了不亮） | 无节点时 `CameraManager.setTorchMode`（需 CAMERA） | 本进程 torch 状态 |
+## 3. HAP 协议适配
 
-屏幕电源与屏幕亮度已拆分为两个 Lightbulb：电源灯只有 `On`，避免 iOS 在“关灯”时联动写 `Brightness=0`（从而误触发熄屏）。电源灯不把 bool 当最终状态，而把每次写入解释为一次“电源键按下”；亮度灯则把 `On` 与 `Brightness` 都映射到手机背光。
+协议目录位于 `core/homekit/protocol/HomeKitAccessoryCatalog.kt`。它只做两件事：定义固定的 HAP 数据库，以及把 `HomeKitControlModel` 适配成 HAP 特征。`HapControlBinding` 保存模型引用和线上值类型，不能重新保存另一套 command 字符串。
 
-## 扩展指南：特征值编码
+当前固定不变量：
 
-新增/修改特征时必须同时满足以下三条，否则会出现“写入到达但不执行”或“读取显示错乱”。
+| 项目 | 定值/规则 |
+| --- | --- |
+| Apple HAP BLE Service UUID | `00000000-0000-1000-8000-0026BB765291` |
+| Service IID characteristic | `E604E95D-A759-4817-87D3-AA005083A0D1` |
+| Characteristic IID descriptor | `DC46F0FE-81D2-4616-B5D9-6ABDD796939A` |
+| HAP 可读可写可事件通知 | `0x01B0`：PR + PW + EV + 断开期间事件支持 |
+| ConfiguredName | `0x00B0`：PR + PW + EV |
+| HAP Int32 的 BLE presentation format | `0x10`，小端 4 字节 |
+| HAP UInt8 的 BLE presentation format | `0x04`，1 字节 |
+| 当前配置号 CN | `0x17` |
 
-### 1. 先区分四个“类型”
+所有功能服务都必须同时提供：Service Signature (`0xA5`)、legacy Name (`0x23`) 和 ConfiguredName (`0xE3`)。三个值都要有正确的实例 ID、服务归属和 `String` presentation format。缺少其中任何一个，Home 可能显示自动生成的“开关 1/灯 1”，或者先显示“正在更新”再变成“不支持”。
 
-新增特征时不要只记一个 UUID 或一个数字。必须同时确定：
+当前发布 14 个服务：Accessory Information、Protocol Information、Pairing、屏幕电源、屏幕亮度、手电筒、热点、移动数据、静音、电池、GPS、低电量模式、免打扰和音量控制。功能服务的服务 IID、特征 IID 和名称一旦被 Home 缓存，后续版本应保持不变。
 
-| 层 | 代码位置 | 必须一致的内容 |
-| --- | --- | --- |
-| HomeKit 类型 | `HapCharacteristic.type` | 特征 UUID，例如 `0x25=On`、`0x08=Brightness`、`0x23=Name` |
-| 实例身份 | `iid` + 所属 service IID | 同 UUID 的多个服务必须靠 IID 区分 |
-| 值格式 | `format` | Bool、UInt、Float、String、TLV8 等；决定 HomeKit 编解码 |
-| 读写能力 | `properties` | `0x0010=readable`、`0x0020=writable`；读写特征用 `0x0030` |
+移动数据使用独立 Switch 服务：服务 IID `0x00D0`、Service Signature `0x00D1`、Name `0x00D2`、On `0x00D3`、ConfiguredName `0x00D4`。
 
-`HapCharacteristic(type, iid, properties, format)` 的第 4 个参数是 HAP BLE signature 中的 presentation format，不是特征 UUID，也不是 Android `BluetoothGattCharacteristic` 的属性位。
+Home 的图标由 HAP 服务类型决定，不能通过 `Name` 或 `ConfiguredName` 任意指定。当前 10 个控制模型实际只有两种控制图标服务：Light Bulb 4 个（屏幕电源、屏幕亮度、手电筒、媒体音量），Switch 6 个（热点、移动数据、媒体静音、GPS、低电量模式、免打扰）；另有 1 个 Battery Service，14 个服务中的其余 3 个是协议/配对基础服务。官方 HAP 还定义了 Speaker、Stateless Programmable Switch 等其它服务，但每种服务都有自己的必需特征和语义，不能只替换一个 UUID 来换图标。
 
-当前项目使用的格式约定：
+语义上，屏幕电源后续可以迁移为 Switch，媒体音量可以评估迁移为 Speaker；屏幕亮度和手电筒使用 Light Bulb 是合理的，热点、移动数据、静音、GPS、低电量模式和免打扰使用 Switch 是最稳妥的映射。服务类型或特征清单变更会触发 Home 的缓存迁移，必须递增 CN、删除旧配对并重新验证，因此不要在稳定版本中直接改现有服务类型。
 
-| format | 值类型 | HAP BLE 值字节 | 本项目示例 |
-| ---: | --- | --- | --- |
-| `0x01` | Bool | 1，`0x00/0x01` | On |
-| `0x02` | UInt8 | 1，小端 | 0–255 的小数值 |
-| `0x03` | UInt16 | 2，小端 | 需要 16 位整数时 |
-| `0x04` | UInt32 | 4，小端 | Brightness、音量控制、当前 BLE Battery 互操作 profile |
-| `0x07` | Float | 4，IEEE-754 | 温度等浮点值 |
-| `0x19` | String | UTF-8 字节 | Name、Configured Name |
-| `0x1B` | TLV8/Data | TLV 或原始字节 | Pair Setup、Pair Verify |
+## 4. 配对、连接和状态同步
 
-不要把 `characteristic.type == 0x08` 误认为 format；`0x08` 在本项目中是 Brightness 特征 UUID，Brightness 的 format 是 `0x04`。
+配对身份保存在 `SharedPreferences("homekit")`：配件 ID、配件 Ed25519 私钥种子、controller identifier/key 和配对码。普通 `install -r` 会保留这些数据；清除应用数据或卸载会破坏配对身份。
 
-Battery 的 IP HAP 定义通常为 `UInt8 + Notify`，但本项目的 HAP-over-BLE runtime 尚未实现事件订阅/通知路径；在 Xiaomi 13 与当前 iOS 上声明该 profile 会使控制器在 `PAIR_SETUP_M6` 后、尚未读取名称前主动 Remove Pairing。当前 catalog 使用 `legacyBatteryState(...)` 固化已验证可配对的读取 profile（UInt32、Paired Read、4 字节小端），直到 BLE 事件路径完成端到端验证。Accessory Category Identifier（ACID）只是整台配件的 UI 分类提示，不决定 Battery 服务是否被 Home 识别。
+状态同步不是“写成功后改一个内存变量”，而是以下生命周期：
 
-### 2. 新增不同类型值时，必须分别实现读、写、状态
+1. Service 创建后启动 10 秒周期的状态轮询，断开 BLE 也不停止。
+2. 每个 HAP 控制特征通过对应 `HomeKitControlLifecycle` 读取 Android 真实值。
+3. 按特征 IID 与上次快照比较；变化时递增 GSN，更新广播，并向已订阅的控制器排队事件。
+4. HAP EV 特征使用 GATT Indicate 和标准 CCCD。指示内容为零长度，Home 收到后按 IID 回读加密 HAP 特征值。
+5. 连接建立后只在本连接周期内最多递增一次 GSN；断开后保留上次状态快照，不要把变化检测重置成“未知”。
+6. GSN 变化且当前无连接时，停止并重新启动广播，让 Home 能看到新的状态版本；CN 只有在服务数据库变化时才递增。
 
-`processHapPdu()` 当前的 `decodeWriteValue()` 只适合 Bool/UInt 类数值。新增特征时应按特征类型分支，不能把所有写入都转成 `Int`：
+事件流和普通读必须都走同一个生命周期。普通读成功不能证明事件同步正确；要同时确认 Home 发来了订阅配置、Android 发送了 indication、随后 Home 又回读了值。
 
-| 值类型 | 写入解码 | 读取编码 | 禁止的做法 |
-| --- | --- | --- | --- |
-| Bool | 只接受 1 字节，规范化为 `0/1` | 1 字节 | 用字符串或 4 字节整数判断开关 |
-| UInt8/16/32 | 按声明宽度以小端解码，校验 min/max | 固定返回 1/2/4 字节 | 按收到的长度猜类型 |
-| Float | 只接受 4 字节，`Float.fromBits()`，校验有限值和范围 | 4 字节 IEEE-754 | 把 float 的 bit pattern 当普通整数执行 |
-| String | UTF-8 解码，校验非空、长度和 UTF-8 合法性 | UTF-8 字节 | 走 `decodeWriteValue()` |
-| TLV8/Data | 保留原始字节，按 TLV schema 解析 | 按协议组装 TLV/字节 | 当作字符串或数字 |
+## 5. 新增按钮的步骤
 
-当前 `decodeWriteValue()` 对 1/2/4 字节整数提供兼容处理，4 字节超出 `0..100` 时尝试 Float；这只是现有 Brightness 的兼容逻辑。新增 Float、String、TLV8 特征必须增加显式 type/format 分支，避免错误值被“猜对”或静默执行。
+1. 在 `HomeKitControlModels` 增加一个完整模型，明确真实读取方式、写入语义和值类型。
+2. 在 `HomeKitAccessoryCatalog` 分配全局唯一且稳定的服务 IID/特征 IID，并引用该模型；不要直接传 `HomeKitCommand`。
+3. 为布尔值使用标准 Bool；为百分比使用 HAP Int32、BLE `0x10` 和 `0..100` 范围。
+4. 让 `HomeKitControlLifecycle` 覆盖读、写、快照三条路径；不要在 Runtime 里直接调用执行器读取控制状态。
+5. 验证 Name、ConfiguredName、Characteristic Signature、CCCD 和事件属性。
+6. 若改变服务清单或 IID，递增 CN，并在真机上删除旧配对后重新配对验证；只改 Android 执行细节不应改 IID。
 
-### 3. 读写链路必须闭环
+## 6. 参考与限制
 
-新增一个可控值，必须同时完成以下位置，否则会出现“写入到达但不执行”或“Home 一直正在更新”：
+协议行为以 Apple 开源 [HomeKitADK 的 BLE 广播与事件实现](https://github.com/apple/HomeKitADK/blob/master/HAP/HAPBLEAccessoryServer%2BAdvertising.c) 为主要参考；ADK 是协议参考，不能直接当作 Android GATT 实现使用。
 
-1. `HomeKitAccessoryCatalog`：用 `functionalService(...)` 分配 service/characteristic IID、名称和标准服务类型；它自动生成 Signature、Name 和 ConfiguredName。
-2. 值特征：布尔开关用 `booleanControl(...)`，滑块/数值用 `uint32Control(...)`，只读状态用 `readOnly(...)`；每个控制特征在定义中绑定 `HomeKitCommand + HapValueKind`。
-3. `characteristicSignature()`：从 catalog 统一读取类型、服务 IID、服务类型、属性和 presentation format。
-4. `processHapPdu()`：按 `HapValueKind` 解码并执行绑定命令，成功/失败返回正确 HAP 状态；不得新加 `(service IID, type)` 的 `when` 路由。
-5. `AndroidCommandExecutor`：实际执行与真实状态读回。
-6. 若要让 Home 实时刷新：增加事件通知支持，并在底层状态变化时发送通知；仅靠进程内缓存不能证明硬件状态。
-
-bool 读必须返回 1 字节；UInt32 必须返回 4 字节小端（`leBytes32()`）。长度、格式或 TLV 外层包装不一致时，Home 可能只显示“正在更新”或“不支持”，而 Android 动作本身未必有问题。
-
-### 各类型开关的正确建法
-
-| 想要的交互 | 服务/特征组合 | 注意 |
-| --- | --- | --- |
-| 普通开关（热点、静音、手电筒） | Switch `0x49` + On `0x25`（Bool） | 无 Brightness 时 iOS 只做纯开关 |
-| 开关 + 滑块（亮度） | Lightbulb `0x43` + On + Brightness `0x08`（UInt32） | iOS 开/关时可能联动写 Brightness=100/0，两个特征要映射到同一底层状态 |
-| “按钮”语义（按一下触发动作） | 无真正的可点按按钮类型；用 Lightbulb/Switch 的 On，**每次写入都当一次触发**，忽略目标状态 | Stateless Programmable Switch 是输入设备，家庭 App 无法反向点按 |
-| 只读状态（电量） | Battery `0x96` + Level/Low/Charging（当前为已验证 BLE read profile） | 不注册命令；Home 主页面未必显示百分比，详情页/低电量提示是预期入口 |
-
-每种同名服务可存在多个实例：命令路由来自 catalog 中每个特征的 `HapControlBinding`，绝不要按 UUID 全局匹配，也不要在 runtime 新增 `(service IID, characteristic type)` 的路由表。
-
-### 服务元数据与 GATT 层的边界
-
-`service()` 当前为 Android GATT 特征统一创建 READ/WRITE 权限；HomeKit 真正看到的能力来自加密 HAP 的 Characteristic Signature。因此新增特征时，必须以 HAP signature 的 `properties` 和 `format` 为准，不能因为 Android GATT 层可写就认为 HomeKit 允许写入。
-
-特别注意：
-
-- Name `0x23` 是旧版、只读的初始名称；Configured Name `0xE3` 是现代 Home 对功能服务使用的可读写展示名称，两者都不能进入普通命令分支。
-- Apple 的公开 ADK R14 仍把 Name 列为 Switch/Lightbulb 的可选特征，但当前 HomeSpan（已在 iOS 26.4 验证）明确改用 ConfiguredName 命名一个 Accessory 内的各个功能服务。当前项目同时保留 `0x23` 兼容旧控制器，并以 `0xE3` 为现代 Home 的权威服务名。
-- ConfiguredName 必须声明 String `0x19`、`PW+PR+EV = 0x00B0`。旧实验使用 `0x0030`，缺少 EV/Notify，不能作为协议正确实现。
-- 重复的标准服务会拥有相同的 service UUID 与 Name UUID `0x23`。定义查找必须以特征实例/IID 区分，不能只按 UUID 全局匹配。
-- 新增或删除特征、改变服务类型、改变特征属性/格式或 IID 后，必须递增 CN；服务语义或状态模型变化同时递增 GSN。
-- 旧的 Home 配件可能继续使用缓存的服务定义。验证元数据时，应记录广播中的 CN/GSN；需要重新添加时，还必须从日志确认完整生命周期：`PAIRINGS_REMOVE_APPLIED` → `paired=false`/SF=1 → `PAIR_SETUP_M6`。只在 Home UI 中点了移除、但配件端仍为 `paired=true`，不算一次全新配对。
-
-### 提交前的最小验证矩阵
-
-每个新开关或数值特征至少验证以下五条：
-
-1. Signature Read：日志中的 type、service IID、characteristic IID、properties、format 与定义表一致。
-2. Read：Home 发起读取后出现 `HAP_PDU_REQUEST opcode=0x03`，返回长度与 format 一致。
-3. Write：Home 发起写入后出现 `CONTROL_COMMAND_RECEIVED` 和 `COMMAND_EXECUTE`；只有 `HAP_PDU_REQUEST` 没有这两条，优先检查 TLV 外层和值长度。
-4. State：执行后再次读取，返回值必须来自真实底层状态，而不是只来自上次写入的缓存。
-5. Metadata：每个功能服务的 `0x23` 与 `0xE3` 都返回同一个定义名称，`0xE3` 签名为 properties `0x00B0`、format `0x19`；CN/GSN 已更新。
-
-HAP 返回状态的定位：`0x00` 是成功，`0x01` 是 Unsupported PDU，`0x04` 是无效 IID，`0x06` 是无效请求。日志中的 Home UI 文案“正在更新/不支持”不能直接等同于 Android executor 失败，必须结合对应的 `HAP_PDU_REQUEST`、响应状态和 `COMMAND_EXECUTE` 判断。
-
-### 命名机制（Name 与 Configured Name）
-
-- Accessory Information 使用只读 Name `0x23` 命名整个配件；Lightbulb、Switch、Battery 等功能服务使用 ConfiguredName `0xE3` 命名服务拼贴，并兼容保留相同值的 `0x23`。
-- `0x23` 主要在配对时初始化；`0xE3` 可由 Home 读取和写回，因此写入必须按 service IID 单独持久化，不能按重复的 service UUID 保存。
-- Home 也可能将自己的自动标题（`灯`、`灯 2`、`开关`、`开关 4`）写回 `0xE3`。这不是用户命名，runtime 必须删除已有的此类持久化值（`CONFIGURED_NAME_FALLBACK_CLEARED`）并拒绝新的此类写入（`CONFIGURED_NAME_FALLBACK_IGNORED`）；绝不能让它覆盖 catalog 的默认中文名。其他用户自定义名称仍按 service IID 持久化。
-- 不能对上述写入返回成功：Home 会把成功响应视为最终名称。必须在删除缓存后返回 HAP `Invalid Request` 并记录 `CONFIGURED_NAME_FALLBACK_REJECTED`。这是协议层的命名仲裁，不是 UI 过滤。
-- 发生历史配对、错误类别或双卡片时，用 app 的“一键修复 HomeKit 配对/命名”创建全新身份：停止旧广播 → 轮换 Device ID 与 `accessory_seed` → 删除 controller 和所有 `service_name_*` → 再以 SF=1 启动。仅清 controller 或仅换 Device ID 都不足以保证 Home 不合并旧记录。
-- 排障时不能只看 `0x23`。新配对必须同时看到每个功能服务的 `SERVICE_NAME_READ type=0xE3`，值正确且签名 properties 为 `0x00B0`。
-
-## 扩展指南：Android 控制原语
-
-新增控制项时的验证顺序：**先 adb shell su 手动验证原语 → 再接入 executor → 最后接 HomeKit**。以下原语均在 Xiaomi 13（MIUI、Magisk root）实测：
-
-| 功能 | 原语 | 验证命令 | 坑 |
-| --- | --- | --- | --- |
-| 电源键 | `input keyevent 26` | `su -c 'input keyevent 26'` | 无 |
-| 背光亮度 | `echo N > /sys/class/backlight/panel0-backlight/brightness`（N = pct×max/100，0 会熄屏，故最小钳到 1%） | 写后 `cat` 读回 | `Settings.System` 在 MIUI 上会被钳制且非线性，只做兜底 |
-| 手电筒 | **先** `echo 500 > /sys/class/leds/led:torch_N/brightness`，**再** `echo 1 > /sys/class/leds/led:switch_N/brightness` | 写完看灯，不要只看读回值 | PM8550 驱动在 switch 使能瞬间锁存电流；顺序反了写入成功但灯不亮。关闭顺序相反 |
-| 热点开/关 | `cmd wifi start-softap SSID wpa2 PASS` / `cmd wifi stop-softap` | 状态看 `dumpsys wifi \| grep curState=` 里存活的 `curState=StartedState` | 停止的 SoftApManager 也留在 dump 里（`curState=<QUIT>`）；绝不能按 "enabled"/"active" 子串匹配（`client_control_is_enabled=false` 恒在） |
-| 媒体静音 | `cmd media_session volume --stream 3 --set 0`，静音前记录原音量用于恢复 | `cmd media_session volume --stream 3 --get` 读回 `volume is 0` | `AudioManager.setStreamMute` 对第三方 UID 无效，只能当标记 |
-
-状态读回的正确性同样关键：UI 开关是“读状态 → 取反 → 执行”，读回恒真/恒假会让 UI 每次点击都变成同一个方向（本次热点 UI 失效的根因）。新增命令时必须让 `currentValue()` 反映真实硬件状态，而不是只返回进程内缓存。
-
-## “日志 success=true 但物理无效”的排查法
-
-1. **分发层**：确认日志出现 `CONTROL_COMMAND_RECEIVED` + `COMMAND_EXECUTE`。只有 `HAP_PDU_REQUEST` 没有这两条 = 写分发把值丢弃了（检查值长度/格式解码）。
-2. **执行层**：把 executor 里的原语原样拿到 `adb shell su -c '...'` 手动跑一遍。adb 下也无效 = 原语本身错（本次手电筒的写入顺序）。
-3. **硬件层**：sysfs 写入后 `cat` 读回会“粘住”，但**读回成功 ≠ 硬件动作**。灯、屏幕这类必须肉眼确认。
-4. **状态层**：UI 控件无效但 HomeKit 有效（或反过来）时，先怀疑状态读回函数误判，而不是执行路径——两条路径共用同一个 executor。
-
-## UI 与状态
-
-应用 UI 由 `buildUi()` 原生构建，包含：
-
-- 设备名称、配对码、配件 ID 与配对状态操作。
-- 配对状态：是否已保存 `controller_key`。
-- 连接状态：是否有活动 BLE GATT 对端；未连接但广播中显示“等待 HomeKit 连接”。
-- Root 与免 Root/系统授权分组的命令启用开关。关闭某项后，HAP 请求会被记录、通知为“未执行”，但不会产生系统副作用。
-- 手电筒 `CAMERA` 授权按钮。
-
-系统通知使用每个命令稳定的 notification ID，避免 HomeKit 轮询形成通知刷屏。
-
-## 重要限制与下一步
-
-- 仅保存一个 controller pairing；已实现该 controller 的 Add/Remove，List Pairings 与完整多控制器管理还未成为目标。
-- 手电筒外部状态只有在 torch callback 已注册后能实时追踪；首次从外部打开后的完整冷启动同步可进一步加强。
-- 屏幕“按钮”使用 Lightbulb UI 兼容 Home 的可见 tile，不是 Stateless Programmable Switch 服务。
-- LocalOnlyHotspot 不提供手机蜂窝网络共享；Root SoftAP 的 OEM 行为需真机验证。
-- BLE 仍由 `MainActivity` 承载：`onDestroy` 只在 `isFinishing`（真正退出）时停掉 GATT/广播，瞬时销毁不再中断广播；`openGattServer` 移到了后台线程并带有限重试。若 MIUI 上滑清理强杀进程，仍会残留已死的 GATT server，需要开关一次蓝牙才能恢复。彻底根治要把它迁到前台 Service。
-- `MainActivity` 过大。下一步适合拆出 `HapBleServer`、`HapSessionManager`、`AccessoryDatabase` 与 `MainActivity` UI controller，并为 Pair Setup/Verify 与 PDU fragmentation 添加单元测试。
-
-## 验证基线
-
-2026-09-15 名称回归基线：广播为 `GSN=0x000F`、`CN=0x13`；Accessory Information 使用 Name `0x23`，每个功能服务同时提供一致的 Name `0x23` 与 ConfiguredName `0xE3`，其中 `0xE3` 为 String、properties `0x00B0`。HAP-over-BLE 的所有 EV 特征还必须在实际 GATT 中具备 `Indicate` 与标准 CCCD `0x2902`，否则 iOS 会读取 E3 的签名却不读取其值，继而生成“开关/灯 + 编号”。若发现历史的 `service_name_*` 含“灯/开关 + 可选数字”，启动建库时必须出现对应 `CONFIGURED_NAME_FALLBACK_CLEARED`，而不是将它返回给 Home。重新添加还必须有 `PAIRINGS_REMOVE_APPLIED`、SF=1、新的 `PAIR_SETUP_M6` 以及全部 `type=0xE3` 名称读取作为证据。
+当前实现针对已 Root 的 Xiaomi 13 / Android 13 验证，不是 MFi 认证产品，也不适用于安全关键控制。Root shell、Android 版本差异、厂商电源管理和 Home 的元数据缓存都属于部署边界。

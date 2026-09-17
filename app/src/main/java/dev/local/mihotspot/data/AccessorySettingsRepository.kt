@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Base64
 import java.security.SecureRandom
 import dev.local.mihotspot.domain.HomeKitFeature
+import dev.local.mihotspot.homekit.PairingBroadcastMode
 
 /** Persistent accessory identity and configuration; no Android view dependency. */
 class AccessorySettingsRepository(context: Context) {
@@ -12,9 +13,18 @@ class AccessorySettingsRepository(context: Context) {
     val deviceName: String get() = preferences.getString("device_name", "Android") ?: "Android"
     val setupCodeDigits: String get() = preferences.getString("setup_code_digits", DEFAULT_SETUP_CODE_DIGITS) ?: DEFAULT_SETUP_CODE_DIGITS
     val isPaired: Boolean get() = preferences.contains("controller_key")
+    val setupId: String
+        get() = preferences.getString("setup_id", null) ?: createSetupId()
+    val pairingBroadcastMode: PairingBroadcastMode
+        get() = runCatching {
+            PairingBroadcastMode.valueOf(preferences.getString("pairing_broadcast_mode", null) ?: "QR_SETUP_PAYLOAD")
+        }.getOrDefault(PairingBroadcastMode.QR_SETUP_PAYLOAD)
+    val isRuntimeConnected: Boolean get() = preferences.getBoolean("runtime_connected", false)
 
     fun saveDeviceName(name: String) = preferences.edit().putString("device_name", name).apply()
     fun saveSetupCode(digits: String) = preferences.edit().putString("setup_code_digits", digits).apply()
+    fun setPairingBroadcastMode(mode: PairingBroadcastMode) =
+        preferences.edit().putString("pairing_broadcast_mode", mode.name).apply()
 
     fun clearPairing() = preferences.edit().remove("controller_id").remove("controller_key").apply()
     fun isFeatureEnabled(feature: HomeKitFeature): Boolean = preferences.getBoolean("command_enabled_${feature.command.name}", true)
@@ -24,6 +34,7 @@ class AccessorySettingsRepository(context: Context) {
         val id = ByteArray(6).also(secureRandom::nextBytes)
         preferences.edit()
             .putString("device_id", Base64.encodeToString(id, Base64.NO_WRAP))
+            .putString("setup_id", randomSetupId())
             .remove("controller_id")
             .remove("controller_key")
             .apply()
@@ -41,6 +52,7 @@ class AccessorySettingsRepository(context: Context) {
         val serviceNameKeys = preferences.all.keys.filter { it.startsWith(SERVICE_NAME_PREFIX) }
         val committed = preferences.edit()
             .putString("device_id", Base64.encodeToString(id, Base64.NO_WRAP))
+            .putString("setup_id", randomSetupId())
             .remove("controller_id")
             .remove("controller_key")
             .remove("accessory_seed")
@@ -58,6 +70,17 @@ class AccessorySettingsRepository(context: Context) {
         val encoded = preferences.getString("device_id", null)
         val bytes = try { encoded?.let { Base64.decode(it, Base64.NO_WRAP) } } catch (_: IllegalArgumentException) { null }
         return (bytes?.takeIf { it.size == 6 } ?: DEFAULT_ACCESSORY_ID).joinToString(":") { "%02X".format(it) }
+    }
+
+    private fun createSetupId(): String = randomSetupId().also {
+        preferences.edit().putString("setup_id", it).commit()
+    }
+
+    private fun randomSetupId(): String {
+        val alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return buildString(4) {
+            repeat(4) { append(alphabet[secureRandom.nextInt(alphabet.length)]) }
+        }
     }
 
     private companion object {

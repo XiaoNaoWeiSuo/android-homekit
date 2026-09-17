@@ -7,15 +7,17 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.content.Context
-import android.net.wifi.WifiManager
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.telephony.TelephonyManager
 import android.os.Handler
 import android.os.Looper
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
+import dev.local.mihotspot.data.HotspotSettingsRepository
 
 /** Android implementation kept independent from the HAP GATT server. */
 class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecutor {
@@ -28,9 +30,10 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         HomeKitCommand.GPS to false,
         HomeKitCommand.LOW_POWER_MODE to false,
         HomeKitCommand.DO_NOT_DISTURB to false,
+        HomeKitCommand.MOBILE_DATA to false,
         HomeKitCommand.VOLUME to false
     )
-    private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
+    private val hotspotSettings = HotspotSettingsRepository(context.applicationContext)
     private var rootHotspotActive = false
     private var mediaVolumeBeforeMute: Int? = null
     private var volumeBeforeControl: Int? = null
@@ -46,6 +49,7 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             HomeKitCommand.GPS -> setGps(enabled)
             HomeKitCommand.LOW_POWER_MODE -> setLowPowerMode(enabled)
             HomeKitCommand.DO_NOT_DISTURB -> setDoNotDisturb(enabled)
+            HomeKitCommand.MOBILE_DATA -> setMobileData(enabled)
             HomeKitCommand.VOLUME -> setVolume(if (enabled) 50 else 0)
         }
         if (result.success) values[command] = enabled
@@ -67,15 +71,21 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
     override fun currentValueInt(command: HomeKitCommand): Int? = synchronized(this) {
         when (command) {
             HomeKitCommand.BRIGHTNESS -> {
-                val backlight = backlightNode()
-                if (backlight != null) {
-                    val current = rootOutput("cat ${backlight.first}")?.trim()?.toIntOrNull()
-                    if (current != null && current > 0) return@synchronized (current * 100 / backlight.second).coerceIn(0, 100)
+                // HomeKit's percentage is the Android user brightness level,
+                // not the panel driver's raw PWM value. MIUI applies a
+                // device-specific gamma curve between the two, so reading the
+                // backlight node linearly makes a requested 40% come back as
+                // roughly 80% (or 100%).
+                val raw = try {
+                    Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+                } catch (_: Throwable) {
+                    rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull()
                 }
-                val raw = try { Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS) } catch (_: Throwable) {
-                    rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull() ?: return@synchronized null
-                }
-                (raw * 100 / 255).coerceIn(0, 100)
+                raw?.let { return@synchronized (((it - 1).coerceAtLeast(0) * 100) / 254).coerceIn(0, 100) }
+                val backlight = backlightNode() ?: return@synchronized null
+                val current = rootOutput("cat ${backlight.first}")?.trim()?.toIntOrNull() ?: return@synchronized null
+                val normalMax = normalBacklightMax(backlight.second)
+                return@synchronized ((current.coerceAtLeast(0) * 100) / normalMax).coerceIn(0, 100)
             }
             HomeKitCommand.VOLUME -> {
                 val volumeState = mediaVolumeState()
@@ -108,6 +118,7 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             HomeKitCommand.GPS -> isGpsActive()
             HomeKitCommand.LOW_POWER_MODE -> isLowPowerModeActive()
             HomeKitCommand.DO_NOT_DISTURB -> isDoNotDisturbActive()
+            HomeKitCommand.MOBILE_DATA -> isMobileDataEnabled()
             HomeKitCommand.VOLUME -> (currentValueInt(command) ?: 0) > 0
         }
     }
@@ -224,29 +235,68 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
 
     private fun setScreenBrightness(percent: Int): CommandResult {
         val pct = percent.coerceIn(0, 100)
-        // Write the hardware backlight through sysfs first: on MIUI this is the
-        // only path that is both immediate and unclamped. The Settings write is a
-        // best-effort fallback for devices without a backlight node.
-        val backlight = backlightNode()
-        if (backlight != null) {
-            val hw = ((maxOf(pct, 1).toLong() * backlight.second) / 100).toInt().coerceIn(0, backlight.second)
-            if (runRoot("echo $hw > ${backlight.first}")) {
-                return CommandResult(true, "screen-brightness=$pct (sysfs)")
-            }
-        }
-        val level = pct * 255 / 100
+        // Android exposes a documented 1..255 settings range, but on MIUI a
+        // successful settings write can leave the actual panel unchanged.
+        // The Android user setting is the canonical HomeKit percentage. MIUI
+        // maps it to the panel using its own calibration/gamma curve; writing
+        // a linear raw panel value makes the slider and readback disagree.
+        val level = 1 + (pct * 254 + 50) / 100
         return try {
-            val wrote = Settings.System.canWrite(context) &&
-                Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, level)
-            if (wrote || runRoot("settings put system screen_brightness $level")) {
-                CommandResult(true, "screen-brightness=$pct")
-            } else {
-                CommandResult(false, "screen brightness requires WRITE_SETTINGS permission (or root)")
+            val backlight = backlightNode()
+
+            // canWrite()/putInt() may throw when WRITE_SETTINGS is not declared
+            // or its AppOp is denied. That is only a failed optional route; it
+            // must never prevent the rooted route from running.
+            val settingsApiUpdated = try {
+                Settings.System.canWrite(context) &&
+                    Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL) &&
+                    Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, level)
+            } catch (_: SecurityException) {
+                false
+            } catch (_: Throwable) {
+                false
+            }
+            val settingUpdated = settingsApiUpdated || runRoot(
+                "settings put system screen_brightness_mode 0; settings put system screen_brightness $level"
+            )
+
+            val settingActual = try {
+                Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+            } catch (_: Throwable) {
+                rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull()
+            }
+            if (settingUpdated) {
+                val panelActual = backlight?.let { rootOutput("cat ${it.first}")?.trim()?.toIntOrNull() }
+                return CommandResult(
+                    true,
+                    "screen-brightness=$pct (settings level=$level readback=$settingActual panel=$panelActual)"
+                )
+            }
+
+            // Only use a raw panel write when the Android setting route is not
+            // available at all. This is a fallback for unusual rooted ROMs;
+            // it is deliberately not used together with MIUI's setting path.
+            val hardwareTarget = backlight?.let {
+                val normalMax = normalBacklightMax(it.second)
+                if (pct == 0) 0 else 1 + ((normalMax - 1).toLong() * pct / 100L).toInt()
+            }
+            val hardwareCommandOk = if (backlight != null && hardwareTarget != null) {
+                runRoot("echo $hardwareTarget > ${backlight.first}")
+            } else false
+            val hardwareActual = backlight?.let { rootOutput("cat ${it.first}")?.trim()?.toIntOrNull() }
+            val hardwareUpdated = hardwareCommandOk && hardwareActual != null
+
+            when {
+                hardwareUpdated -> CommandResult(true, "screen-brightness=$pct (panel fallback target=$hardwareTarget actual=$hardwareActual)")
+                else -> CommandResult(false, "screen brightness requires WRITE_SETTINGS permission (or root)")
             }
         } catch (t: Throwable) {
             CommandResult(false, "screen brightness failed: ${t.message}")
         }
     }
+
+    /** Keep normal HomeKit 0..100 brightness below Xiaomi's HBM range. */
+    private fun normalBacklightMax(maxBrightness: Int): Int = (maxBrightness / 2).coerceAtLeast(1)
 
     private fun backlightNode(): Pair<String, Int>? {
         cachedBacklight?.let { return it }
@@ -286,48 +336,37 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
 
     private fun setHotspot(enabled: Boolean): CommandResult {
         if (Build.VERSION.SDK_INT < 26) return CommandResult(false, "hotspot API unavailable")
-        // On rooted devices prefer the platform shell SoftAP control. This is
-        // the closest public equivalent to the Settings hotspot toggle; OEMs
-        // may still restrict internet tethering separately.
-        if (enabled && !rootHotspotActive && runRoot("cmd wifi start-softap MiHotspot wpa2 MiHotspot1234")) {
-            rootHotspotActive = true
-            return CommandResult(true, "hotspot=on (root SoftAP)")
-        }
-        if (!enabled && rootHotspotActive) {
+        // There must be one owner. The old LocalOnlyHotspot fallback created a
+        // second, isolated AP beside the system tethered hotspot. Always stop
+        // any existing SoftAP first, then start exactly one configured AP.
+        if (!enabled) {
             val stopped = runRoot("cmd wifi stop-softap")
             rootHotspotActive = false
-            if (stopped) return CommandResult(true, "hotspot=off (root SoftAP)")
+            return if (stopped) CommandResult(true, "hotspot=off (single SoftAP owner)")
+            else CommandResult(false, "hotspot stop requires root")
         }
-        val wifi = context.getSystemService(WifiManager::class.java)
-            ?: return CommandResult(false, "WifiManager unavailable")
-        return try {
-            if (enabled) {
-                if (hotspotReservation != null) return CommandResult(true, "hotspot=on")
-                wifi.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
-                    override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation) {
-                        synchronized(this@AndroidCommandExecutor) { hotspotReservation = reservation }
-                    }
-                    override fun onStopped() {
-                        synchronized(this@AndroidCommandExecutor) { hotspotReservation = null }
-                    }
-                    override fun onFailed(reason: Int) {
-                        synchronized(this@AndroidCommandExecutor) { hotspotReservation = null }
-                    }
-                }, null)
-                CommandResult(true, "hotspot=start-requested")
-            } else {
-                hotspotReservation?.close()
-                hotspotReservation = null
-                CommandResult(true, "hotspot=off")
-            }
-        } catch (security: SecurityException) {
-            CommandResult(false, "hotspot permission denied: ${security.message}")
+        val configuration = hotspotSettings.configuration()
+        if (configuration.ssid.isBlank() || configuration.ssid.toByteArray().size > 32) {
+            return CommandResult(false, "hotspot SSID must be 1..32 bytes")
         }
+        if (configuration.password.toByteArray().size !in 8..63) {
+            return CommandResult(false, "hotspot password must be 8..63 bytes")
+        }
+        if (!runRoot("cmd wifi stop-softap")) {
+            return CommandResult(false, "hotspot cleanup requires root")
+        }
+        val band = configuration.band.takeIf { it in setOf("2", "5", "any", "bridged") } ?: "2"
+        val command = "cmd wifi start-softap ${shellQuote(configuration.ssid)} wpa2 ${shellQuote(configuration.password)} -b $band"
+        if (runRoot(command)) {
+            rootHotspotActive = true
+            return CommandResult(true, "hotspot=on ssid=${configuration.ssid} band=$band")
+        }
+        rootHotspotActive = false
+        return CommandResult(false, "hotspot start failed; check system Wi-Fi tethering restrictions")
     }
 
     /** Returns actual SoftAP state when root can query it, otherwise the API reservation state. */
     private fun isHotspotActive(): Boolean {
-        if (hotspotReservation != null) return true
         // Xiaomi's `cmd wifi status` only describes client mode, even while a
         // SoftAP is up. dumpsys wifi exposes the SoftApManager instead, and is
         // also available after the process has been restarted (when our local
@@ -338,6 +377,50 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         val dump = rootOutput("dumpsys wifi | grep curState=") ?: return rootHotspotActive
         return dump.lineSequence().any { it.trim().startsWith("curState=StartedState") }
     }
+
+    /**
+     * Mobile-data writes are privileged on Android. On this rooted device the
+     * platform-supported shell path is the reliable route: update the global
+     * setting and ask telephony to apply it through svc data.
+     */
+    private fun setMobileData(enabled: Boolean): CommandResult {
+        val value = if (enabled) 1 else 0
+        val settingUpdated = runRoot("settings put global mobile_data $value")
+        val serviceUpdated = runRoot("svc data ${if (enabled) "enable" else "disable"}")
+        val actual = isMobileDataEnabled()
+        return if (settingUpdated && serviceUpdated && actual == enabled) {
+            CommandResult(true, "mobile-data=${if (enabled) "on" else "off"} (root)")
+        } else if (serviceUpdated && actual == enabled) {
+            CommandResult(true, "mobile-data=${if (enabled) "on" else "off"} (svc data)")
+        } else {
+            CommandResult(false, "mobile data requires root or MODIFY_PHONE_STATE (requested=$enabled actual=$actual)")
+        }
+    }
+
+    /** Reads the user mobile-data setting, not merely whether a network is currently connected. */
+    private fun isMobileDataEnabled(): Boolean {
+        if (context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_DATA)) {
+            try {
+                context.getSystemService(TelephonyManager::class.java)?.let { return it.isDataEnabled }
+            } catch (_: SecurityException) {
+                // Fall through to the rooted settings read below.
+            } catch (_: UnsupportedOperationException) {
+                // Fall through on devices that expose no usable data modem.
+            }
+        }
+        return rootOutput("settings get global mobile_data")
+            ?.trim()
+            ?.let {
+                when {
+                    it == "1" || it.equals("true", ignoreCase = true) -> true
+                    it == "0" || it.equals("false", ignoreCase = true) -> false
+                    else -> null
+                }
+            }
+            ?: (values[HomeKitCommand.MOBILE_DATA] == true)
+    }
+
+    private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
     private fun setMediaMuted(enabled: Boolean): CommandResult {
         // AudioManager.setStreamMute is deprecated and ignored by MIUI for

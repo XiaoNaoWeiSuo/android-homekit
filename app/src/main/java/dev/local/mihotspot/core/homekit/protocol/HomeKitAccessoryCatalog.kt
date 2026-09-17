@@ -1,6 +1,7 @@
 package dev.local.mihotspot.core.homekit.protocol
 
-import dev.local.mihotspot.homekit.commands.HomeKitCommand
+import dev.local.mihotspot.homekit.controls.HomeKitControlModel
+import dev.local.mihotspot.homekit.controls.HomeKitControlModels
 
 /**
  * Immutable HomeKit accessory database.
@@ -27,57 +28,66 @@ object HomeKitAccessoryCatalog {
         HapServiceDefinition(HapType.PAIRING, 0x0020, characteristics = listOf(
             characteristic(HapType.PAIR_SETUP, 0x0022, 0x0003, HapFormat.TLV8),
             characteristic(HapType.PAIR_VERIFY, 0x0023, 0x0003, HapFormat.TLV8),
-            characteristic(HapType.PAIRING_FEATURES, 0x0024, 0x0001, HapFormat.UINT32),
+            characteristic(HapType.PAIRING_FEATURES, 0x0024, HapProperties.READ_WITHOUT_SECURITY, HapFormat.UINT8),
             characteristic(HapType.PAIRINGS, 0x0025, HapProperties.READ_WRITE, HapFormat.TLV8)
         )),
         functionalService(
             serviceType = HapType.LIGHTBULB,
             serviceIid = 0x0030,
-            defaultName = "屏幕电源",
+            defaultName = HomeKitControlModels.SCREEN.title,
             signatureIid = 0x0031,
             nameIid = 0x0032,
             configuredNameIid = 0x0034,
             primary = true,
-            values = listOf(booleanControl(0x0033, HomeKitCommand.SCREEN))
+            values = listOf(booleanControl(0x0033, HomeKitControlModels.SCREEN))
         ),
         functionalService(
             serviceType = HapType.LIGHTBULB,
             serviceIid = 0x0080,
-            defaultName = "屏幕亮度",
+            defaultName = HomeKitControlModels.BRIGHTNESS.title,
             signatureIid = 0x0081,
             nameIid = 0x0082,
             configuredNameIid = 0x0085,
             values = listOf(
-                booleanControl(0x0083, HomeKitCommand.BRIGHTNESS),
-                uint32Control(HapType.BRIGHTNESS, 0x0084, HomeKitCommand.BRIGHTNESS)
+                booleanControl(0x0083, HomeKitControlModels.BRIGHTNESS),
+                int32Control(HapType.BRIGHTNESS, 0x0084, HomeKitControlModels.BRIGHTNESS)
             )
         ),
         functionalService(
             serviceType = HapType.LIGHTBULB,
             serviceIid = 0x0070,
-            defaultName = "手机手电筒",
+            defaultName = HomeKitControlModels.FLASHLIGHT.title,
             signatureIid = 0x0071,
             nameIid = 0x0072,
             configuredNameIid = 0x0074,
-            values = listOf(booleanControl(0x0073, HomeKitCommand.FLASHLIGHT))
+            values = listOf(booleanControl(0x0073, HomeKitControlModels.FLASHLIGHT))
         ),
         functionalService(
             serviceType = HapType.SWITCH,
             serviceIid = 0x0040,
-            defaultName = "手机热点",
+            defaultName = HomeKitControlModels.HOTSPOT.title,
             signatureIid = 0x0041,
             nameIid = 0x0042,
             configuredNameIid = 0x0044,
-            values = listOf(booleanControl(0x0043, HomeKitCommand.HOTSPOT))
+            values = listOf(booleanControl(0x0043, HomeKitControlModels.HOTSPOT))
+        ),
+        functionalService(
+            serviceType = HapType.SWITCH,
+            serviceIid = 0x00D0,
+            defaultName = HomeKitControlModels.MOBILE_DATA.title,
+            signatureIid = 0x00D1,
+            nameIid = 0x00D2,
+            configuredNameIid = 0x00D4,
+            values = listOf(booleanControl(0x00D3, HomeKitControlModels.MOBILE_DATA))
         ),
         functionalService(
             serviceType = HapType.SWITCH,
             serviceIid = 0x0050,
-            defaultName = "媒体静音",
+            defaultName = HomeKitControlModels.MUTE.title,
             signatureIid = 0x0051,
             nameIid = 0x0052,
             configuredNameIid = 0x0054,
-            values = listOf(booleanControl(0x0053, HomeKitCommand.MUTE))
+            values = listOf(booleanControl(0x0053, HomeKitControlModels.MUTE))
         ),
         functionalService(
             serviceType = HapType.BATTERY,
@@ -95,40 +105,40 @@ object HomeKitAccessoryCatalog {
         functionalService(
             serviceType = HapType.SWITCH,
             serviceIid = 0x0090,
-            defaultName = "GPS定位",
+            defaultName = HomeKitControlModels.GPS.title,
             signatureIid = 0x0091,
             nameIid = 0x0092,
             configuredNameIid = 0x0094,
-            values = listOf(booleanControl(0x0093, HomeKitCommand.GPS))
+            values = listOf(booleanControl(0x0093, HomeKitControlModels.GPS))
         ),
         functionalService(
             serviceType = HapType.SWITCH,
             serviceIid = 0x00A0,
-            defaultName = "低电量模式",
+            defaultName = HomeKitControlModels.LOW_POWER_MODE.title,
             signatureIid = 0x00A1,
             nameIid = 0x00A2,
             configuredNameIid = 0x00A4,
-            values = listOf(booleanControl(0x00A3, HomeKitCommand.LOW_POWER_MODE))
+            values = listOf(booleanControl(0x00A3, HomeKitControlModels.LOW_POWER_MODE))
         ),
         functionalService(
             serviceType = HapType.SWITCH,
             serviceIid = 0x00B0,
-            defaultName = "免打扰模式",
+            defaultName = HomeKitControlModels.DO_NOT_DISTURB.title,
             signatureIid = 0x00B1,
             nameIid = 0x00B2,
             configuredNameIid = 0x00B4,
-            values = listOf(booleanControl(0x00B3, HomeKitCommand.DO_NOT_DISTURB))
+            values = listOf(booleanControl(0x00B3, HomeKitControlModels.DO_NOT_DISTURB))
         ),
         functionalService(
             serviceType = HapType.LIGHTBULB,
             serviceIid = 0x00C0,
-            defaultName = "音量控制",
+            defaultName = HomeKitControlModels.VOLUME.title,
             signatureIid = 0x00C1,
             nameIid = 0x00C2,
             configuredNameIid = 0x00C5,
             values = listOf(
-                booleanControl(0x00C3, HomeKitCommand.VOLUME),
-                uint32Control(HapType.BRIGHTNESS, 0x00C4, HomeKitCommand.VOLUME)
+                booleanControl(0x00C3, HomeKitControlModels.VOLUME),
+                int32Control(HapType.BRIGHTNESS, 0x00C4, HomeKitControlModels.VOLUME)
             )
         )
     ).also(::validate)
@@ -161,24 +171,23 @@ object HomeKitAccessoryCatalog {
         )
     }
 
-    private fun booleanControl(iid: Int, command: HomeKitCommand) = characteristic(
+    private fun booleanControl(iid: Int, control: HomeKitControlModel) = characteristic(
         HapType.ON, iid, HapProperties.CONTROL, HapFormat.BOOL,
-        control = HapControlBinding(command, HapValueKind.BOOLEAN)
+        control = HapControlBinding(control, HapValueKind.BOOLEAN)
     )
 
-    private fun uint32Control(type: Int, iid: Int, command: HomeKitCommand) = characteristic(
-        type, iid, HapProperties.CONTROL, HapFormat.UINT32,
-        control = HapControlBinding(command, HapValueKind.UINT32)
+    private fun int32Control(type: Int, iid: Int, control: HomeKitControlModel) = characteristic(
+        type, iid, HapProperties.CONTROL, HapFormat.INT32,
+        control = HapControlBinding(control, HapValueKind.INT32)
     )
 
     /**
-     * Current iOS/HAP-over-BLE interoperability baseline. The standard IP HAP
-     * battery signature is UInt8 + Notify, but advertising it here makes the
-     * controller remove the pairing immediately after M6. Keep this isolated
-     * until the BLE event path is implemented and verified end-to-end.
+     * Battery Level and the two battery state characteristics are standard
+     * UInt8 values. Their values are intentionally kept read-only because
+     * Android does not accept writes to phone battery state.
      */
     private fun legacyBatteryState(type: Int, iid: Int, state: HapReadOnlyState) = characteristic(
-        type, iid, HapProperties.READ, HapFormat.UINT32, readOnlyState = state
+        type, iid, HapProperties.READ, HapFormat.UINT8, readOnlyState = state
     )
 
     private fun characteristic(
@@ -214,8 +223,8 @@ object HomeKitAccessoryCatalog {
                 require(characteristic.format == control.valueKind.format) { "Control IID 0x%04X has wrong value format".format(characteristic.iid) }
             }
             characteristic.readOnlyState?.let {
-                require(characteristic.properties == HapProperties.READ) { "Battery IID 0x%04X must use the verified BLE read profile".format(characteristic.iid) }
-                require(characteristic.format == HapFormat.UINT32) { "Battery IID 0x%04X must use the verified BLE value profile".format(characteristic.iid) }
+                require(characteristic.properties == HapProperties.READ) { "Battery IID 0x%04X must be read-only".format(characteristic.iid) }
+                require(characteristic.format == HapFormat.UINT8) { "Battery IID 0x%04X must use the standard UInt8 format".format(characteristic.iid) }
             }
         }
     }
@@ -248,23 +257,39 @@ object HapType {
 }
 
 object HapProperties {
+    const val READ_WITHOUT_SECURITY = 0x0001
     const val READ = 0x0010
     const val WRITE = 0x0020
     const val READ_WRITE = READ or WRITE
-    const val CONTROL = 0x00B0
-    const val CONFIGURED_NAME = CONTROL
+    /** PR + PW + EV + disconnected-event support, matching the ADK EV profile. */
+    const val CONTROL = READ_WRITE or 0x0080 or 0x0100
+    /** ConfiguredName is a connected, editable metadata characteristic. */
+    const val CONFIGURED_NAME = READ_WRITE or 0x0080
 }
 
 object HapFormat {
     const val BOOL: Byte = 0x01
-    const val UINT32: Byte = 0x04
+    /** Bluetooth SIG presentation format for a HAP UInt8. */
+    const val UINT8: Byte = 0x04
+    /** Bluetooth SIG presentation format for a HAP UInt32. */
+    const val UINT32: Byte = 0x08
+    /** Bluetooth SIG presentation format for a HAP signed Int32. */
+    const val INT32: Byte = 0x10
     const val STRING: Byte = 0x19
     const val TLV8: Byte = 0x1B
 }
 
-enum class HapValueKind(val format: Byte) { BOOLEAN(HapFormat.BOOL), UINT32(HapFormat.UINT32) }
+enum class HapValueKind(val format: Byte) {
+    BOOLEAN(HapFormat.BOOL),
+    INT32(HapFormat.INT32)
+}
 enum class HapReadOnlyState { BATTERY_LEVEL, BATTERY_LOW, BATTERY_CHARGING }
-data class HapControlBinding(val command: HomeKitCommand, val valueKind: HapValueKind)
+data class HapControlBinding(
+    val model: HomeKitControlModel,
+    val valueKind: HapValueKind
+) {
+    val command get() = model.command
+}
 
 class HapServiceDefinition(
     val type: Int,
