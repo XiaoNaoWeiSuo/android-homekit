@@ -56,3 +56,35 @@ vendor/
 # Signing
 *.jks
 *.keystore
+
+# Build artifacts
+*.zip
+
+# Debug / sniffing tools (not part of core project)
+frida-observe.sh
+frida-tls-observe.js
+capture-device.sh
+observe-process.sh
+
+# Checkline toolchain (separate project)
+checkline-android.sh
+deploy-checkline.sh
+install-checkline-android.sh
+simulate-checkline.sh
+test-checkline-android.sh
+CHECKLINE-ANDROID-COMPLETE.md
+CHECKLINE-ANDROID-SUMMARY.md
+QUICKSTART-checkline-android.md
+README-checkline-android.md
+
+# Termux scripts
+termux-keepalive.sh
+termux-sshd-boot.sh
+
+# MITM proxy module
+mitmproxy-ksu-module/
+
+# Other
+phone_audit_backup/
+server-mode
+.bashrc-fix

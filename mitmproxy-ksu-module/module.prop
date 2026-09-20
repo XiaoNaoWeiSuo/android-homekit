@@ -1,6 +1,0 @@
-id=mitmproxy-ca
-name=mitmproxy CA certificate
-version=1.0
-versionCode=1
-author=Codex
-description=Trust the local mitmproxy CA as a system certificate
