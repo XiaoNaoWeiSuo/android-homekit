@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/screenshots/home-app-overview.png" width="280" alt="iPhone Home App controlling Xiaomi 13">
-</p>
-
 <h1 align="center">Marionette</h1>
 
 <p align="center">
