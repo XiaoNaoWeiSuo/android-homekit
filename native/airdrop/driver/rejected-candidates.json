@@ -1,0 +1,103 @@
+{
+  "candidates": [
+    {
+      "sha256": "3f9155a7df922b0bc7e31c59fc4f1e940b74d8552a0ae746fa7c109996e2714f",
+      "device": "fuxi / 510af65c",
+      "test": "volatile module load, RAW TX disabled, then svc wifi enable",
+      "result": "module loaded, device rebooted before normal Wi-Fi association could be verified",
+      "time_local": "2026-10-14 18:57 Asia/Shanghai",
+      "stock_restored_after_boot": "g939d76a86982; con_mode=0; Wi-Fi connected",
+      "failure_cause": "unproven; pstore empty and no SYSTEM_LAST_KMSG entry after reboot",
+      "action": "quarantined; no repeated experimental load without a diagnosis and a revised candidate",
+      "subsequent_static_finding": "WLAN_CTRL_NAME=wlan omitted: no state-control callback/device in candidate, despite stock /dev/wlan and Android.mk integration. Revised build includes it; causal relationship to reboot not yet proven."
+    },
+    {
+      "sha256": "fd515fdd8cb40a8dbb2100aad82e878d34a201055cc0d97e54bb41d1d4fcf74d",
+      "device": "fuxi / 510af65c",
+      "test": "WLAN_CTRL_NAME=wlan built; state control confirmed; RAW TX disabled; then Wi-Fi enable",
+      "result": "device rebooted during firmware initialization; normal association unverified",
+      "time_local": "2026-10-14 19:24 Asia/Shanghai",
+      "stock_restored_after_boot": "g939d76a86982; con_mode=0; Wi-Fi connected; resident services running",
+      "failure_cause": "not identified; last captured pre-reboot kernel stage was CNSS ini sync request",
+      "capture": "build/airdrop/driver/state-control/capture",
+      "action": "quarantined; no repeat load; compare platform integration and improve unbuffered capture"
+    },
+    {
+      "sha256": "c9a7fb7a286a8fae8bcef0e6f9d2f510b1874fc75cf797c8081902a01f68cb52",
+      "device": "fuxi / 510af65c",
+      "test": "State control and runtime PM enabled; PCIe tables match stock; RAW TX disabled; Wi-Fi enable",
+      "result": "device rebooted before association; raw native kmsg stream ends at CNSS ini sync request",
+      "time_local": "2026-10-14 19:41 Asia/Shanghai",
+      "stock_restored_after_boot": "g939d76a86982; con_mode=0; Wi-Fi connected",
+      "failure_cause": "unproven; backend logging does not preserve this panic",
+      "capture": "build/airdrop/driver/runtime-pm/capture",
+      "action": "quarantined; no repeat experimental driver load until exception diagnostics yield a cause",
+      "diagnostic_reproduction": {
+        "capture": "build/airdrop/driver/runtime-pm/diagnostic-repro-capture",
+        "observed": "panic entry from HIF PCIe initialization; corrupted unwind value 0x3d0000495254535f",
+        "confirmed_boundary_issue": "stock cnss_get_soc_info copies 129 bytes to output+0x98; candidate output buffer is 152 bytes and stack canary follows it",
+        "followup": "0005 restores the missing field in CNSS and PLD headers with compile-time offset and size checks"
+      }
+    },
+    {
+      "sha256": "e0c27d4beef8a1e57534979043a2176e8e0d6e0f0202aa71525c003d5227fa22",
+      "device": "fuxi / 510af65c",
+      "time_local": "2026-10-16 15:18 Asia/Shanghai",
+      "test": "Associated STA + same-channel monitor experiment requested; ordinary Wi-Fi startup prerequisite",
+      "result": "PE session-array allocation failed before ordinary association or monitor creation; device did not reboot",
+      "failure_cause": "Captured page allocation failure order:5 at pe_open+0xb8 (__qdf_mem_malloc); no order-5 or larger free pages, despite ~323MiB total free. Does not prove a monitor-concurrency failure.",
+      "capture": "build/airdrop/driver/sta-monitor/capture",
+      "recovery": "guardian eventually restored stock after ~85 seconds, including CNSS 80000ms power-up wait. Test shell initially reported restore_pending. Afterwards wifi HAL + wificond restarted and normal stock association/ping confirmed.",
+      "action": "quarantined; next candidate uses qdf_mem_valloc/vfree for CPU-only PE table, including both frees; no repeated unchanged load"
+    },
+    {
+      "sha256": "ef8ce23399e5504b81a6dc51cdfce58075c07d0a63d69fa6d62af5ff4e1c5c68",
+      "device": "fuxi / 510af65c",
+      "time_local": "2026-10-16 18:08 Asia/Shanghai",
+      "test": "0022 RAW firmware resource RX format plus standard per-STA Ethernet overrides; mission mode",
+      "result": "Associated, but ordinary gateway prerequisite failed; iw RX/TX stayed zero; monitor/capture not started",
+      "device_rebooted": false,
+      "stock_restored": true,
+      "capture": "build/airdrop/driver/raw-resources/",
+      "action": "Do not repeat an ordinary run with RAW resource flag enabled. Subsequent descriptor-observation candidate keeps that flag disabled."
+    },
+    {
+      "sha256": "920f555cb45bd84441575f47cf5a743acbcf456c8de3536dfe7017024f464e3c",
+      "device": "fuxi / 510af65c",
+      "time_local": "2026-10-16 19:26 Asia/Shanghai",
+      "test": "0028 deferred monitor WMA detach; strict AWDL TLV observation",
+      "result": "17 AWDL received, 14 strict complete TLV chains; monitor delete timed out, recovery followed by dp_mon_vdev_timer null-pointer panic and reboot",
+      "capture": "build/airdrop/driver/monitor-lifecycle/",
+      "action": "quarantined; do not load unchanged candidate; original modules restored automatically on boot",
+      "failure_cause": "STOP completion did not reach deferred cleanup before HDD delete timeout. Deferring DP detach also left a polling timer live during recovery; exact missing callback boundary remains unproven."
+    },
+    {
+      "device": "fuxi / 510af65c",
+      "sha256": "398179abeddf085c7f56de450d1a91c154d0f64c48d91bff1bff3e78591c10b8",
+      "time_local": "2026-10-16 19:40 Asia/Shanghai",
+      "test": "0028 + 0029 timer stop before datapath detach",
+      "result": "17? AWDL receive succeeded, but monitor deletion timed out and dp_mon_vdev_timer still faulted; reboot",
+      "failure_cause": "Stopping at datapath detach was later than logical deletion; timer callback retained stale context",
+      "action": "quarantined; no repeat"
+    },
+    {
+      "device": "fuxi / 510af65c",
+      "sha256": "84b495eca0cac529d6a73a47379d8f5639638e2f2c02524a69cc937e34bfd2a6",
+      "time_local": "2026-10-16 19:47 Asia/Shanghai",
+      "test": "0028 + 0029 + 0030 timer rearm guard",
+      "result": "AWDL receive succeeded; monitor deletion timed out; dp_mon_vdev_timer still faulted/rebooted",
+      "failure_cause": "Rearm guard alone could not protect cleanup ordering",
+      "action": "quarantined; no repeat"
+    },
+    {
+      "device": "fuxi / 510af65c",
+      "sha256": "4c6793de90cdd5741d6473b8f00255a5d70cd315b91259ad982ca1119e965f95",
+      "time_local": "2026-10-16 19:53 Asia/Shanghai",
+      "test": "0028 + 0029 + 0030 + 0031 stop timer before reset",
+      "result": "AWDL receive succeeded (6 frames); monitor deletion timed out; CNSS recovery hit target_if_deinit_dbr_ring+0x1f4 and rebooted",
+      "failure_cause": "Direct-buffer-ring teardown ownership/order remains invalid after asynchronous monitor delete; not a timer-only issue",
+      "capture": "build/airdrop/driver/monitor-timer-reset/",
+      "action": "quarantined; no repeat load until static direct-buffer teardown audit"
+    }
+  ]
+}

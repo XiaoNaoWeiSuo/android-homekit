@@ -53,6 +53,16 @@ import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
 import android.app.PendingIntent
+import android.content.res.ColorStateList
+import android.graphics.drawable.GradientDrawable
+import dev.local.mihotspot.ui.UiTheme
+import dev.local.mihotspot.ui.createHelpBubble
+import dev.local.mihotspot.ui.createSectionHeader
+import dev.local.mihotspot.ui.createCard
+import dev.local.mihotspot.ui.createCardDivider
+import dev.local.mihotspot.ui.createStatusBadge
+import dev.local.mihotspot.ui.createPageHeader
+import dev.local.mihotspot.ui.onHapticClick
 
 private class SliderWriteState {
     val lock = Any()
@@ -65,6 +75,8 @@ private class SliderWriteState {
 
 class MainActivity : Activity() {
     private lateinit var titleView: TextView
+    private lateinit var statusBadge: TextView
+    private lateinit var rootBadge: TextView
     private lateinit var statusInfo: TextView
     private lateinit var serviceSwitch: Switch
     private var brightnessSeek: SeekBar? = null
@@ -102,6 +114,8 @@ class MainActivity : Activity() {
     private var strategySummary: TextView? = null
     private var strategyRadioGroup: RadioGroup? = null
     private var pairingPayloadText: TextView? = null
+    private var airDropStatusBadge: TextView? = null
+    private var airDropSummaryText: TextView? = null
     private var mainPage: View? = null
     private var settingsPage: View? = null
     private var eventsRegistered = false
@@ -161,6 +175,7 @@ class MainActivity : Activity() {
         disableNfcForegroundDispatch()
         unregisterUiEvents()
         super.onDestroy()
+        viewModel.close()
     }
 
     @Suppress("DEPRECATION")
@@ -172,122 +187,177 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun dp(v: Float): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+    private fun dp(v: Float): Int = UiTheme.dp(this, v)
     private fun dp(v: Int): Int = dp(v.toFloat())
-
-    private fun divider(): View = View(this).apply {
-        setBackgroundColor(0xFFE0E0E0.toInt())
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 1)
-    }
-
-    private fun sectionHeader(text: String): TextView = TextView(this).apply {
-        this.text = text
-        textSize = 12f
-        typeface = Typeface.DEFAULT_BOLD
-        setTextColor(0xFF888888.toInt())
-        setPadding(0, dp(12), 0, dp(4))
-    }
 
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setBackgroundColor(UiTheme.COLOR_BG)
+            setPadding(0, dp(12), 0, dp(24))
         }
 
-        // === Top header: clickable status title + service switch ===
-        val headerRow = LinearLayout(this).apply {
+        // === Header Card: Title, Status Pills, Service Switch, Settings Button ===
+        val headerCard = createCard(this, verticalPaddingDp = 14f, horizontalPaddingDp = 16f)
+        val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(4))
         }
+
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
         titleView = TextView(this).apply {
-            textSize = 17f
+            text = "Marionette"
+            textSize = 20f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(4), dp(8), dp(4))
-            setOnClickListener { showSettingsPage() }
-            contentDescription = "打开设备设置"
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
         }
-        headerRow.addView(titleView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        titleCol.addView(titleView)
+
+        val badgeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, 0)
+        }
+        statusBadge = createStatusBadge(this, "● 等待连接", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        badgeRow.addView(statusBadge)
+
+        val badgeSpacer = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(6), 1)
+        }
+        badgeRow.addView(badgeSpacer)
+
+        rootBadge = createStatusBadge(this, "Root检测中", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        badgeRow.addView(rootBadge)
+
+        titleCol.addView(badgeRow)
+        topRow.addView(titleCol)
 
         serviceSwitch = Switch(this).apply {
             text = "服务"
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
             isChecked = ServiceControl.isEnabled(this@MainActivity)
-            setTextColor(if (isChecked) 0xFF00AA00.toInt() else 0xFF333333.toInt())
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
             setOnCheckedChangeListener { _, checked ->
                 if (checked) {
-                    setTextColor(0xFF00AA00.toInt())
                     ensurePermissionsAndStart()
                 } else {
-                    setTextColor(0xFF333333.toInt())
                     stopHomeKitService()
                 }
             }
         }
-        headerRow.addView(serviceSwitch)
-        root.addView(headerRow)
+        topRow.addView(serviceSwitch)
 
-        // Status + accessory info
+        val settingsBtn = Button(this).apply {
+            text = "设置"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(dp(64), dp(38)).apply {
+                setMargins(dp(10), 0, 0, 0)
+            }
+            layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 19f)
+            onHapticClick { showSettingsPage() }
+            contentDescription = "打开设备设置"
+        }
+        topRow.addView(settingsBtn)
+
+        headerCard.addView(topRow)
+
         statusInfo = TextView(this).apply {
             textSize = 12f
-            setTextColor(0xFF666666.toInt())
+            typeface = Typeface.MONOSPACE
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(0, dp(10), 0, 0)
         }
-        root.addView(statusInfo)
+        headerCard.addView(statusInfo)
+        root.addView(headerCard)
 
         pairingCard = buildPairingCard()
         root.addView(pairingCard)
-        root.addView(divider())
 
-        // === Device name row ===
-        root.addView(sectionHeader("设备配置"))
+        // === Device name card ===
+        val nameCard = createCard(this, verticalPaddingDp = 10f, horizontalPaddingDp = 16f)
         val nameRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(4))
         }
+        val nameLabel = TextView(this).apply {
+            text = "设备名称"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        }
+        nameRow.addView(nameLabel)
+
+        val nameHelp = createHelpBubble(
+            this,
+            "设备名称说明",
+            "此名称将作为 BLE 广播名称和 HomeKit 配件在家庭 App 中显示的设备名称。保存后服务将自动重启广播以应用新名称。"
+        )
+        nameRow.addView(nameHelp)
+
         val nameEdit = EditText(this).apply {
-            hint = "设备名称"
+            hint = "设置设备名称"
             setText(viewModel.deviceName)
             setSingleLine(true)
-            textSize = 13f
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            setBackgroundColor(0xFFF5F5F5.toInt())
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            textSize = 14f
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(UiTheme.COLOR_INPUT_BG)
+            }
+            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(8), 0, dp(8), 0)
+            }
+            layoutParams = lp
         }
+        nameRow.addView(nameEdit)
+
         val nameSaveBtn = Button(this).apply {
             text = "保存"
-            textSize = 11f
-            isAllCaps = false
-            setBackgroundColor(0xFF333333.toInt())
-            setTextColor(Color.WHITE)
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.setMargins(dp(6), 0, 0, 0)
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(dp(64), dp(38))
             layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 12f)
             onHapticClick {
                 val name = nameEdit.text.toString().trim()
                 if (name.isNotEmpty()) {
                     viewModel.saveDeviceName(name)
                     log("DEVICE_NAME_UPDATED name=$name")
                     restartHomeKitService()
+                    Toast.makeText(this@MainActivity, "设备名称已保存", Toast.LENGTH_SHORT).show()
                 }
             }
         }
-        nameRow.addView(nameEdit)
         nameRow.addView(nameSaveBtn)
-        root.addView(nameRow)
-        root.addView(divider())
+        nameCard.addView(nameRow)
+        root.addView(nameCard)
 
-        // === Feature list: each feature = [toggle | label | test button] ===
-        root.addView(sectionHeader("功能控制"))
-        for (feature in HomeKitFeature.tileFeatures) {
-            root.addView(buildFeatureRow(feature))
-            root.addView(divider())
+        // === Feature Controls ===
+        val featuresHelp = "• 左侧开关：设置是否允许 HomeKit 远程读取与控制该功能。\n• 右侧按钮：当前设备真实状态（ON/OFF），点击可立即在本地切换并测试该功能。"
+        root.addView(createSectionHeader(this, "功能控制", "功能控制说明", featuresHelp))
+
+        val featuresCard = createCard(this, verticalPaddingDp = 4f, horizontalPaddingDp = 16f)
+        HomeKitFeature.tileFeatures.forEachIndexed { index, feature ->
+            if (index > 0) {
+                featuresCard.addView(createCardDivider(this))
+            }
+            featuresCard.addView(buildFeatureRow(feature))
         }
+        root.addView(featuresCard)
 
-        // === Sliders ===
-        root.addView(sectionHeader("连续调节"))
+        // === Continuous Adjustments ===
+        val slidersHelp = "支持屏幕亮度和媒体音量的平滑调节。\n• 亮度档位已映射为 Android 系统真值。\n• 滑块操作自带防抖与延迟平抑，避免与 HomeKit 定时轮询互相冲突。"
+        root.addView(createSectionHeader(this, "连续调节", "连续调节说明", slidersHelp))
+
+        val slidersCard = createCard(this, verticalPaddingDp = 14f, horizontalPaddingDp = 16f)
 
         // Brightness
         val bHeader = LinearLayout(this).apply {
@@ -296,24 +366,26 @@ class MainActivity : Activity() {
         }
         val bLabel = TextView(this).apply {
             text = "屏幕亮度"
-            textSize = 13f
-            setTextColor(0xFF333333.toInt())
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         brightnessValueText = TextView(this).apply {
             text = "0%"
-            textSize = 13f
+            textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF111111.toInt())
+            setTextColor(UiTheme.COLOR_ACCENT)
         }
         bHeader.addView(bLabel)
         bHeader.addView(brightnessValueText)
-        root.addView(bHeader)
+        slidersCard.addView(bHeader)
 
         brightnessSeek = SeekBar(this).apply {
             max = 100
-            val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            p.setMargins(0, dp(4), 0, dp(12))
+            val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(8), 0, dp(12))
+            }
             layoutParams = p
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
@@ -336,33 +408,38 @@ class MainActivity : Activity() {
                 }
             })
         }
-        root.addView(brightnessSeek)
+        slidersCard.addView(brightnessSeek)
 
-        // Media volume remains available as a continuous local control.
+        slidersCard.addView(createCardDivider(this))
+
+        // Volume
         val vHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
         }
         val vLabel = TextView(this).apply {
             text = "媒体音量"
-            textSize = 13f
-            setTextColor(0xFF333333.toInt())
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         volumeValueText = TextView(this).apply {
             text = "0%"
-            textSize = 13f
+            textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF111111.toInt())
+            setTextColor(UiTheme.COLOR_ACCENT)
         }
         vHeader.addView(vLabel)
         vHeader.addView(volumeValueText)
-        root.addView(vHeader)
+        slidersCard.addView(vHeader)
 
         volumeSeek = SeekBar(this).apply {
             max = 100
-            val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            p.setMargins(0, dp(4), 0, dp(12))
+            val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(8), 0, dp(4))
+            }
             layoutParams = p
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
@@ -385,78 +462,160 @@ class MainActivity : Activity() {
                 }
             })
         }
-        root.addView(volumeSeek)
+        slidersCard.addView(volumeSeek)
+
+        root.addView(slidersCard)
+
+        // === AirDrop Feature Entry ===
+        val airDropHelp = "• 原生实验扩展：基于点对点 AWDL 协议，面向苹果设备的「所有人」模式。\n• 常驻待机：开机自启并保持正常 Wi-Fi 联网，兼容驱动就绪后可实现无缝后台互传。\n• 独占实验：10 分钟临时会话，用于当前硬件的收发协议与功能验证。"
+        root.addView(createSectionHeader(this, "AirDrop 互传", "AirDrop 说明", airDropHelp))
+
+        val airDropCard = createCard(this, verticalPaddingDp = 14f, horizontalPaddingDp = 16f).apply {
+            background = UiTheme.createButtonRipple(
+                this@MainActivity,
+                UiTheme.COLOR_CARD_BG,
+                UiTheme.adjustAlpha(Color.BLACK, 0.05f),
+                radiusDp = 16f,
+                strokeColor = UiTheme.COLOR_CARD_BORDER,
+                strokeWidthDp = 0.8f
+            )
+            isClickable = true
+            isFocusable = true
+            onHapticClick {
+                startActivity(Intent(this@MainActivity, dev.local.mihotspot.airdrop.AirDropActivity::class.java))
+            }
+        }
+
+        val airDropRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val airDropTextCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val airDropTitleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val airDropTitle = TextView(this).apply {
+            text = "AirDrop 文件收发"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        }
+        airDropTitleRow.addView(airDropTitle)
+
+        val airDropTag = createStatusBadge(this, "实验版", UiTheme.COLOR_ACCENT, UiTheme.COLOR_ACCENT_LIGHT).apply {
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(6)
+            }
+            layoutParams = lp
+        }
+        airDropTitleRow.addView(airDropTag)
+        airDropTextCol.addView(airDropTitleRow)
+
+        airDropSummaryText = TextView(this).apply {
+            text = "面向苹果设备 · 点击进入配置与收发"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(0, dp(4), 0, 0)
+        }
+        airDropTextCol.addView(airDropSummaryText)
+        airDropRow.addView(airDropTextCol)
+
+        airDropStatusBadge = createStatusBadge(this, "○ 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        airDropRow.addView(airDropStatusBadge)
+
+        val chevron = ImageView(this).apply {
+            setImageResource(R.drawable.ic_chevron_right)
+            val lp = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                marginStart = dp(6)
+            }
+            layoutParams = lp
+        }
+        airDropRow.addView(chevron)
+
+        airDropCard.addView(airDropRow)
+        root.addView(airDropCard)
 
         val mainScroll = ScrollView(this).apply {
             isFillViewport = true
+            setBackgroundColor(UiTheme.COLOR_BG)
             addView(root)
         }
         mainPage = mainScroll
 
-        val settingsRoot = LinearLayout(this).apply {
+        // === Settings Page Layout ===
+        val settingsScrollContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setBackgroundColor(UiTheme.COLOR_BG)
+            setPadding(0, 0, 0, dp(24))
         }
-        settingsRoot.addView(buildSettingsHeader())
-        settingsRoot.addView(buildBroadcastStrategySettings())
-        settingsRoot.addView(buildPairingSettings())
-        settingsRoot.addView(buildHotspotSettings())
-        settingsRoot.addView(buildNfcSettings())
-        settingsRoot.addView(buildDeviceManagement())
+        settingsScrollContent.addView(buildBroadcastStrategySettings())
+        settingsScrollContent.addView(buildPairingSettings())
+        settingsScrollContent.addView(buildHotspotSettings())
+        settingsScrollContent.addView(buildNfcSettings())
+        settingsScrollContent.addView(buildDeviceManagement())
         val settingsScroll = ScrollView(this).apply {
             isFillViewport = true
-            addView(settingsRoot)
+            setBackgroundColor(UiTheme.COLOR_BG)
+            addView(settingsScrollContent)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+        val settingsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(UiTheme.COLOR_BG)
+            addView(buildSettingsHeader())
+            addView(settingsScroll)
             visibility = View.GONE
         }
-        settingsPage = settingsScroll
+        settingsPage = settingsContainer
 
         return FrameLayout(this).apply {
             addView(mainScroll, FrameLayout.LayoutParams(-1, -1))
-            addView(settingsScroll, FrameLayout.LayoutParams(-1, -1))
+            addView(settingsContainer, FrameLayout.LayoutParams(-1, -1))
         }
     }
 
-    private fun buildSettingsHeader(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        val back = Button(this@MainActivity).apply {
-            text = "‹"
-            textSize = 28f
-            isAllCaps = false
-            setBackgroundColor(Color.TRANSPARENT)
-            setTextColor(0xFF333333.toInt())
-            onHapticClick { showMainPage() }
-        }
-        addView(back, LinearLayout.LayoutParams(dp(48), dp(48)))
-        addView(TextView(this@MainActivity).apply {
-            text = "设备设置"
-            textSize = 19f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF222222.toInt())
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-    }
+    private fun buildSettingsHeader(): View = createPageHeader(
+        context = this,
+        titleText = "设备设置",
+        onBackClick = { showMainPage() }
+    )
 
     private fun buildBroadcastStrategySettings(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        addView(sectionHeader("广播与响应策略"))
-        addView(TextView(this@MainActivity).apply {
-            text = "控制 BLE 广播间隔与重连优先级；档位互斥，修改后立即重启广播应用。"
-            textSize = 12f
-            setTextColor(0xFF666666.toInt())
-            setPadding(0, 0, 0, dp(4))
-        })
+        val help = "控制 BLE 广播间隔与重连优先级：\n\n• 自动：白天低延迟响应，夜间（23:00~07:00）自动切入低功耗静默。\n• 低延迟：保持高频广播，优先保证从家庭 App 打开时的秒级响应。\n• 均衡：响应速度与待机功耗兼顾。\n• 低功耗：增大广播间隔，最大程度减少电量消耗。\n\n各档位互斥，修改后立即重启广播生效。"
+        addView(createSectionHeader(this@MainActivity, "广播与响应策略", "广播策略说明", help))
+
+        val card = createCard(this@MainActivity)
         strategySummary = TextView(this@MainActivity).apply {
             textSize = 12f
-            setTextColor(0xFF245AA8.toInt())
-            setPadding(0, 0, 0, dp(4))
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_ACCENT)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            background = UiTheme.createPillDrawable(this@MainActivity, UiTheme.COLOR_ACCENT_LIGHT)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(8)
+            }
+            layoutParams = lp
         }
-        addView(strategySummary)
+        card.addView(strategySummary)
 
         val group = RadioGroup(this@MainActivity).apply {
             orientation = RadioGroup.VERTICAL
         }
-        BroadcastStrategy.entries.forEach { strategy ->
+        BroadcastStrategy.entries.forEachIndexed { index, strategy ->
+            if (index > 0) {
+                group.addView(createCardDivider(this@MainActivity))
+            }
             group.addView(RadioButton(this@MainActivity).apply {
                 id = View.generateViewId()
                 tag = strategy.storageValue
@@ -466,9 +625,10 @@ class MainActivity : Activity() {
                     BroadcastStrategy.BALANCED -> "均衡 · 响应与功耗折中"
                     BroadcastStrategy.LOW_POWER -> "低功耗 · 优先降低待机耗电"
                 }
-                textSize = 13f
+                textSize = 14f
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
                 isChecked = ServiceControl.broadcastStrategy(this@MainActivity) == strategy
-                setPadding(0, dp(2), 0, dp(2))
+                setPadding(dp(8), dp(8), 0, dp(8))
             })
         }
         strategyRadioGroup = group
@@ -482,7 +642,8 @@ class MainActivity : Activity() {
             if (ServiceControl.isEnabled(this@MainActivity)) restartHomeKitService()
             else Toast.makeText(this@MainActivity, "已保存，启动服务后生效", Toast.LENGTH_SHORT).show()
         }
-        addView(group)
+        card.addView(group)
+        addView(card)
         updateBroadcastStrategySummary()
     }
 
@@ -500,26 +661,25 @@ class MainActivity : Activity() {
 
     private fun buildPairingSettings(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        addView(sectionHeader("配对方式"))
-        addView(TextView(this@MainActivity).apply {
-            text = "二维码：4 位 Setup ID，扫码配对\n8 位：输入配对码；切换只重启广播，不清除配对"
-            textSize = 12f
-            setTextColor(0xFF666666.toInt())
-            setPadding(0, 0, 0, dp(8))
-        })
+        val help = "• 二维码：4 位 Setup ID，使用家庭 App 扫码即连。\n• 配对码：8 位数字配对码，在家庭 App「更多选项」中手动输入。\n\n切换广播模式仅重启广播，不会破坏已有的配对关系。"
+        addView(createSectionHeader(this@MainActivity, "配对方式", "配对方式说明", help))
+
+        val card = createCard(this@MainActivity)
         val tabs = RadioGroup(this@MainActivity).apply {
             orientation = RadioGroup.HORIZONTAL
             val qr = RadioButton(this@MainActivity).apply {
                 id = View.generateViewId()
                 text = "二维码 · 4位"
-                textSize = 13f
+                textSize = 14f
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
                 isChecked = viewModel.pairingBroadcastMode == PairingBroadcastMode.QR_SETUP_PAYLOAD
                 layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
             }
             val code = RadioButton(this@MainActivity).apply {
                 id = View.generateViewId()
                 text = "配对码 · 8位"
-                textSize = 13f
+                textSize = 14f
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
                 isChecked = viewModel.pairingBroadcastMode == PairingBroadcastMode.LEGACY_SETUP_CODE
                 layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
             }
@@ -539,105 +699,141 @@ class MainActivity : Activity() {
                 Toast.makeText(this@MainActivity, "已切换配对广播：${pairingModeLabel(selected)}", Toast.LENGTH_SHORT).show()
             }
         }
-        addView(tabs)
+        card.addView(tabs)
+
         pairingModeSummary = TextView(this@MainActivity).apply {
             textSize = 12f
-            setTextColor(0xFF555555.toInt())
-            setPadding(0, dp(8), 0, dp(4))
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(0, dp(6), 0, dp(6))
         }
-        addView(pairingModeSummary)
-        addView(Button(this@MainActivity).apply {
-            text = "修改 8 位配对码"
-            textSize = 12f
-            isAllCaps = false
-            onHapticClick { showSetupCodeDialog() }
-        })
+        card.addView(pairingModeSummary)
+
         pairingPayloadText = TextView(this@MainActivity).apply {
             text = "Setup ID：${viewModel.setupId}\nPayload：${viewModel.setupPayload}"
             textSize = 11f
             typeface = Typeface.MONOSPACE
-            setTextColor(0xFF777777.toInt())
-            setPadding(0, dp(8), 0, dp(12))
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(UiTheme.COLOR_INPUT_BG)
+            }
+            val lp = LinearLayout.LayoutParams(-1, -2).apply {
+                topMargin = dp(4)
+                bottomMargin = dp(10)
+            }
+            layoutParams = lp
         }
-        addView(pairingPayloadText)
+        card.addView(pairingPayloadText)
+
+        val editCodeBtn = Button(this@MainActivity).apply {
+            text = "修改 8 位配对码"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(-1, dp(46))
+            layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
+            onHapticClick { showSetupCodeDialog() }
+        }
+        card.addView(editCodeBtn)
+
+        addView(card)
     }
 
     private fun buildHotspotSettings(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         val current = viewModel.hotspotConfiguration()
-        addView(sectionHeader("热点设置（唯一 SoftAP）"))
-        addView(TextView(this@MainActivity).apply {
-            text = "HomeKit 与系统共用这一套热点配置；启动前会先停止已有 SoftAP，避免出现两个个人热点。"
-            textSize = 12f
-            setTextColor(0xFF666666.toInt())
-            setPadding(0, 0, 0, dp(6))
-        })
+        val help = "Marionette 与系统共用这一套热点配置；启动前会自动停用已有 SoftAP，避免出现两个个人热点冲突。\n\n• 功耗策略说明：\n  - 省电：优先 2.4 GHz 频段\n  - 平衡：保持选定频段\n  - 性能：优先双频加速\n\n• SSID、密码和频段由本页直接应用；Wi-Fi 6、自动关闭时长等由 MIUI 系统热点页最终落地。"
+        addView(createSectionHeader(this@MainActivity, "热点设置", "热点设置说明", help))
+
+        val card = createCard(this@MainActivity)
 
         fun field(label: String, value: String, password: Boolean = false): EditText {
             val row = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, dp(6))
             }
             row.addView(TextView(this@MainActivity).apply {
                 text = label
-                textSize = 13f
-                setTextColor(0xFF444444.toInt())
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
             }, LinearLayout.LayoutParams(dp(76), -2))
             val editor = EditText(this@MainActivity).apply {
                 setText(value)
-                textSize = 13f
+                textSize = 14f
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
                 setSingleLine(true)
                 if (password) inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
-                setPadding(dp(8), dp(4), dp(8), dp(4))
-                setBackgroundColor(0xFFF5F5F5.toInt())
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(8).toFloat()
+                    setColor(UiTheme.COLOR_INPUT_BG)
+                }
             }
             row.addView(editor, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
+            card.addView(row)
             return editor
         }
 
         val ssid = field("名称", current.ssid)
+        card.addView(createCardDivider(this@MainActivity))
         val password = field("密码", current.password, password = true)
+        card.addView(createCardDivider(this@MainActivity))
 
-        addView(TextView(this@MainActivity).apply {
-            text = "频段"
-            textSize = 13f
-            setTextColor(0xFF444444.toInt())
-            setPadding(0, dp(4), 0, 0)
-        })
+        val bandRow = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            addView(TextView(this@MainActivity).apply {
+                text = "频段"
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            }, LinearLayout.LayoutParams(dp(76), -2))
+        }
         val band = RadioGroup(this@MainActivity).apply {
             orientation = RadioGroup.HORIZONTAL
-            val options = listOf("2" to "2.4 GHz", "5" to "5 GHz", "bridged" to "双频")
+            val options = listOf("2" to "2.4G", "5" to "5G", "bridged" to "双频")
             options.forEach { (value, label) ->
                 addView(RadioButton(this@MainActivity).apply {
                     id = View.generateViewId()
                     tag = value
                     text = label
-                    textSize = 12f
+                    textSize = 13f
+                    setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
                     isChecked = current.band == value
                     layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
                 })
             }
         }
-        addView(band)
+        bandRow.addView(band, LinearLayout.LayoutParams(0, -2, 1f))
+        card.addView(bandRow)
+        card.addView(createCardDivider(this@MainActivity))
 
         fun option(text: String, checked: Boolean): Switch = Switch(this@MainActivity).apply {
             this.text = text
-            textSize = 13f
+            textSize = 14f
             isChecked = checked
-            setTextColor(0xFF444444.toInt())
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            setPadding(0, dp(8), 0, dp(8))
         }
         val wifi6 = option("启用 Wi-Fi 6（802.11ax）", current.wifi6Enabled)
+        card.addView(wifi6)
+        card.addView(createCardDivider(this@MainActivity))
+
         val autoShutdown = option("无设备连接时自动关闭", current.autoShutdownEnabled)
-        addView(wifi6)
-        addView(autoShutdown)
+        card.addView(autoShutdown)
+        card.addView(createCardDivider(this@MainActivity))
 
         val timeoutLabel = TextView(this@MainActivity).apply {
-            textSize = 12f
-            setTextColor(0xFF666666.toInt())
+            textSize = 13f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
             text = "自动关闭等待：${(current.shutdownTimeoutMinutes / 5).coerceIn(1, 24) * 5} 分钟"
+            setPadding(0, dp(8), 0, dp(2))
         }
-        addView(timeoutLabel)
+        card.addView(timeoutLabel)
         val timeout = SeekBar(this@MainActivity).apply {
             max = 23
             progress = ((current.shutdownTimeoutMinutes / 5).coerceIn(1, 24) - 1)
@@ -649,13 +845,20 @@ class MainActivity : Activity() {
                 override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
             })
         }
-        addView(timeout)
+        card.addView(timeout)
+        card.addView(createCardDivider(this@MainActivity))
 
-        addView(TextView(this@MainActivity).apply {
-            text = "功耗策略"
-            textSize = 13f
-            setTextColor(0xFF444444.toInt())
-        })
+        val powerRow = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            addView(TextView(this@MainActivity).apply {
+                text = "功耗策略"
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            }, LinearLayout.LayoutParams(dp(76), -2))
+        }
         val power = RadioGroup(this@MainActivity).apply {
             orientation = RadioGroup.HORIZONTAL
             listOf("省电" to "省电", "balanced" to "平衡", "性能" to "性能").forEach { (value, label) ->
@@ -663,23 +866,25 @@ class MainActivity : Activity() {
                     id = View.generateViewId()
                     tag = value
                     text = label
-                    textSize = 12f
+                    textSize = 13f
+                    setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
                     isChecked = current.powerMode == value
                     layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
                 })
             }
         }
-        addView(power)
-        addView(TextView(this@MainActivity).apply {
-            text = "省电：优先 2.4 GHz；性能：优先双频。SSID、密码和频段可由本页直接应用；Wi-Fi 6、自动关闭时长等由 MIUI 系统热点页最终落地。"
-            textSize = 11f
-            setTextColor(0xFF777777.toInt())
-            setPadding(0, dp(2), 0, dp(6))
-        })
-        addView(Button(this@MainActivity).apply {
+        powerRow.addView(power, LinearLayout.LayoutParams(0, -2, 1f))
+        card.addView(powerRow)
+
+        val saveBtn = Button(this@MainActivity).apply {
             text = "保存并应用热点配置"
-            textSize = 12f
-            isAllCaps = false
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(-1, dp(48)).apply {
+                topMargin = dp(14)
+            }
+            layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 12f)
             onHapticClick {
                 val ssidText = ssid.text.toString().trim()
                 val passwordText = password.text.toString()
@@ -719,11 +924,18 @@ class MainActivity : Activity() {
                     }
                 }.start()
             }
-        })
-        addView(Button(this@MainActivity).apply {
+        }
+        card.addView(saveBtn)
+
+        val sysBtn = Button(this@MainActivity).apply {
             text = "打开系统热点设置"
-            textSize = 12f
-            isAllCaps = false
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(-1, dp(46)).apply {
+                topMargin = dp(8)
+            }
+            layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
             onHapticClick {
                 try {
                     startActivity(Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"))
@@ -731,24 +943,36 @@ class MainActivity : Activity() {
                     startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
                 }
             }
-        })
+        }
+        card.addView(sysBtn)
+
+        addView(card)
     }
 
     private fun buildNfcSettings(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        addView(sectionHeader("NFC 配对（外置标签）"))
+        val help = "可将 HomeKit 配对 Payload 写入到外置 NFC Forum Type 2 标签中。靠近支持 NFC 的 iPhone 即可直接唤起家庭 App 配对流程。\n\n注意：仅在未配对且为二维码广播模式时可用。"
+        addView(createSectionHeader(this@MainActivity, "NFC 配对", "NFC 配对说明", help))
+
+        val card = createCard(this@MainActivity)
         nfcStatusText = TextView(this@MainActivity).apply {
-            textSize = 12f
-            setTextColor(0xFF666666.toInt())
-            setPadding(0, 0, 0, dp(4))
+            textSize = 13f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, 0, 0, dp(10))
         }
-        addView(nfcStatusText)
-        addView(Button(this@MainActivity).apply {
+        card.addView(nfcStatusText)
+
+        val nfcBtn = Button(this@MainActivity).apply {
             text = "写入 HomeKit 二维码到 NFC 标签"
-            textSize = 12f
-            isAllCaps = false
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(-1, dp(46))
+            layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
             onHapticClick { armNfcWriter() }
-        })
+        }
+        card.addView(nfcBtn)
+        addView(card)
         updateNfcStatus()
     }
 
@@ -844,93 +1068,136 @@ class MainActivity : Activity() {
 
     private fun buildDeviceManagement(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        addView(divider())
-        addView(sectionHeader("设备管理"))
+        val help = "• 重置配件 ID：生成全新的配件身份与密钥，清除旧配对，用于彻底模拟新设备。\n• 清除配对：保留现有配件 ID，仅清除绑定的家庭 App 控制器密钥。\n• 一键修复：如果家庭 App 出现无法连接、旧卡片残留或服务名称混乱，使用此功能可重建配件身份并重新发布服务。"
+        addView(createSectionHeader(this@MainActivity, "设备管理", "设备管理说明", help))
+
+        val card = createCard(this@MainActivity)
         val dangerRow = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
         }
-        dangerRow.addView(Button(this@MainActivity).apply {
+        val resetBtn = Button(this@MainActivity).apply {
             text = "重置配件ID"
-            textSize = 11f
-            isAllCaps = false
-            setBackgroundColor(0xFFCC0000.toInt())
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(0, 0, dp(4), 0) }
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(0, 0, dp(4), 0) }
+            UiTheme.styleButton(this, UiTheme.COLOR_DANGER_LIGHT, UiTheme.COLOR_DANGER, radiusDp = 12f)
             onHapticClick { resetAccessoryId() }
-        })
-        dangerRow.addView(Button(this@MainActivity).apply {
+        }
+        dangerRow.addView(resetBtn)
+
+        val clearBtn = Button(this@MainActivity).apply {
             text = "清除配对"
-            textSize = 11f
-            isAllCaps = false
-            setBackgroundColor(0xFFCC6600.toInt())
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), 0, 0, 0) }
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(4), 0, 0, 0) }
+            UiTheme.styleButton(this, UiTheme.COLOR_WARNING_LIGHT, UiTheme.COLOR_WARNING, radiusDp = 12f)
             onHapticClick { clearPairingState() }
-        })
-        addView(dangerRow)
-        addView(Button(this@MainActivity).apply {
+        }
+        dangerRow.addView(clearBtn)
+        card.addView(dangerRow)
+
+        val repairBtn = Button(this@MainActivity).apply {
             text = "一键修复 HomeKit 配对/命名"
-            textSize = 12f
-            isAllCaps = false
-            setBackgroundColor(0xFF8B1E3F.toInt())
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(10) }
+            UiTheme.styleButton(this, UiTheme.COLOR_DANGER, Color.WHITE, radiusDp = 12f)
             onHapticClick { confirmHomeKitRecovery() }
-        })
+        }
+        card.addView(repairBtn)
+        addView(card)
     }
 
-    private fun buildPairingCard(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(0, dp(8), 0, dp(8))
-        setBackgroundColor(Color.WHITE)
-        addView(LinearLayout(this@MainActivity).apply {
+    private fun buildPairingCard(): LinearLayout = createCard(this, verticalPaddingDp = 16f, horizontalPaddingDp = 16f).apply {
+        tag = "pairing_card_root"
+
+        val header = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(12))
+        }
+        val cardTitle = TextView(this@MainActivity).apply {
+            tag = "pairing_card_title"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        }
+        header.addView(cardTitle)
+
+        val help = createHelpBubble(
+            this@MainActivity,
+            "配对说明",
+            "打开 iPhone 原生「家庭」App：\n• 若为二维码模式：点击右上角「+」→「添加配件」，扫描二维码即可。\n• 若为配对码模式：在家庭 App 选择「更多选项」，点击配件并输入 8 位配对码。\n• 配对成功后，此卡片将自动隐藏。"
+        )
+        header.addView(help)
+
+        val spacer = View(this@MainActivity).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) }
+        header.addView(spacer)
+        addView(header)
+        addView(createCardDivider(this@MainActivity))
+
+        val contentRow = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, 0)
+        }
+
+        val qrCol = FrameLayout(this@MainActivity).apply {
             tag = "pairing_qr_column"
-            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.WHITE)
+                setStroke(dp(1), UiTheme.COLOR_CARD_BORDER)
+            }
+            setPadding(dp(8), dp(8), dp(8), dp(8))
             pairingQrView = ImageView(this@MainActivity).apply {
                 adjustViewBounds = true
                 scaleType = ImageView.ScaleType.CENTER_INSIDE
-                layoutParams = LinearLayout.LayoutParams(dp(174), dp(174))
+                layoutParams = FrameLayout.LayoutParams(dp(130), dp(130))
             }
             addView(pairingQrView)
-        }, LinearLayout.LayoutParams(dp(198), dp(198)))
-        addView(View(this@MainActivity).apply {
+        }
+        contentRow.addView(qrCol, LinearLayout.LayoutParams(dp(146), dp(146)))
+
+        val dividerView = View(this@MainActivity).apply {
             tag = "pairing_divider"
-            setBackgroundColor(0xFFE2E2E2.toInt())
-        }, LinearLayout.LayoutParams(dp(1), dp(150)))
-        addView(LinearLayout(this@MainActivity).apply {
+            setBackgroundColor(UiTheme.COLOR_DIVIDER)
+            val lp = LinearLayout.LayoutParams(dp(1), dp(120)).apply {
+                setMargins(dp(16), 0, dp(16), 0)
+            }
+            layoutParams = lp
+        }
+        contentRow.addView(dividerView)
+
+        val infoCol = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), 0, dp(8), 0)
-            pairingCardTitle = TextView(this@MainActivity).apply {
-                tag = "pairing_card_title"
-                textSize = 17f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(0xFF222222.toInt())
-            }
-            addView(pairingCardTitle)
-            pairingCardHint = TextView(this@MainActivity).apply {
-                tag = "pairing_card_hint"
-                textSize = 13f
-                setTextColor(0xFF666666.toInt())
-                setPadding(0, dp(6), 0, dp(12))
-            }
-            addView(pairingCardHint)
             pairingCardKeyLabel = TextView(this@MainActivity).apply {
                 tag = "pairing_card_key_label"
                 textSize = 12f
-                setTextColor(0xFF888888.toInt())
+                setTextColor(UiTheme.COLOR_TEXT_MUTED)
             }
             addView(pairingCardKeyLabel)
+
             pairingCardKey = TextView(this@MainActivity).apply {
                 tag = "pairing_card_key"
-                textSize = 21f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(0xFF245AA8.toInt())
-                setPadding(0, dp(2), 0, 0)
+                textSize = 22f
+                typeface = Typeface.MONOSPACE
+                setTextColor(UiTheme.COLOR_ACCENT)
+                setPadding(0, dp(2), 0, dp(6))
             }
             addView(pairingCardKey)
-        }, LinearLayout.LayoutParams(0, -2, 1f))
+
+            pairingCardHint = TextView(this@MainActivity).apply {
+                tag = "pairing_card_hint"
+                textSize = 12f
+                setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            }
+            addView(pairingCardHint)
+        }
+        contentRow.addView(infoCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        addView(contentRow)
         updatePairingCard()
     }
 
@@ -961,13 +1228,13 @@ class MainActivity : Activity() {
             pairingCardHint?.text = "打开 iPhone 家庭 App\n扫描左侧二维码"
             pairingCardKeyLabel?.text = "Setup ID"
             pairingCardKey?.text = viewModel.setupId
-            pairingCardKey?.setTextColor(0xFF245AA8.toInt())
+            pairingCardKey?.setTextColor(UiTheme.COLOR_ACCENT)
         } else {
             pairingCardTitle?.text = "输入配对码"
             pairingCardHint?.text = "在 iPhone 家庭 App 选择“更多选项”输入"
             pairingCardKeyLabel?.text = "配对码"
             pairingCardKey?.text = viewModel.formatSetupCode(viewModel.setupCodeDigits)
-            pairingCardKey?.setTextColor(0xFF245AA8.toInt())
+            pairingCardKey?.setTextColor(UiTheme.COLOR_ACCENT)
         }
     }
 
@@ -1002,12 +1269,31 @@ class MainActivity : Activity() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(8), 0, dp(8))
         }
 
-        // Command enable switch. This is configuration, not the live Android state.
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val label = TextView(this).apply {
+            text = getFeatureTitle(feature)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        }
+        textCol.addView(label)
+
+        val toggleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(2), 0, 0)
+        }
+
         val toggle = CheckBox(this).apply {
             isChecked = viewModel.isFeatureEnabled(feature)
+            buttonTintList = ColorStateList.valueOf(UiTheme.COLOR_ACCENT)
             setOnCheckedChangeListener { _, checked ->
                 performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                 viewModel.setFeatureEnabled(feature, checked)
@@ -1015,25 +1301,27 @@ class MainActivity : Activity() {
             }
         }
         commandEnableToggles[feature] = toggle
-        row.addView(toggle)
+        toggleRow.addView(toggle)
 
-        // Label
-        val label = TextView(this).apply {
-            text = getFeatureTitle(feature)
-            textSize = 14f
-            setTextColor(0xFF333333.toInt())
-            setPadding(dp(4), 0, 0, 0)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        val toggleLabel = TextView(this).apply {
+            text = "允许 HomeKit 控制"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setOnClickListener { toggle.toggle() }
         }
-        row.addView(label)
+        toggleRow.addView(toggleLabel)
 
-        // Test button (tap to execute)
+        textCol.addView(toggleRow)
+        row.addView(textCol)
+
+        // Live state toggle button (tap to execute)
         val testBtn = Button(this).apply {
-            text = "测试"
-            textSize = 11f
-            isAllCaps = false
-            setBackgroundColor(0xFFEEEEEE.toInt())
-            setTextColor(0xFF333333.toInt())
+            text = "OFF"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(dp(72), dp(36))
+            layoutParams = lp
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_SECONDARY, radiusDp = 18f)
             onHapticClick { runCommandFromUi(feature) }
         }
         featureButtons[feature] = testBtn
@@ -1048,7 +1336,7 @@ class MainActivity : Activity() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(dp(4), dp(8), dp(4), dp(8))
+            setPadding(dp(12), dp(16), dp(12), dp(16))
         }
 
         val inputViews = mutableListOf<EditText>()
@@ -1058,26 +1346,30 @@ class MainActivity : Activity() {
             if (i == 4) {
                 val dash = TextView(this).apply {
                     text = "-"
-                    textSize = 17f
-                    typeface = Typeface.MONOSPACE
-                    setTextColor(0xFF333333.toInt())
+                    textSize = 18f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(UiTheme.COLOR_TEXT_MUTED)
                     gravity = Gravity.CENTER
-                    setPadding(dp(3), 0, dp(3), 0)
+                    setPadding(dp(4), 0, dp(4), 0)
                 }
                 container.addView(dash)
             }
 
             val et = EditText(this).apply {
-                textSize = 17f
+                textSize = 18f
                 typeface = Typeface.MONOSPACE
                 inputType = numInputType
-                setTextColor(0xFF111111.toInt())
-                setPadding(dp(2), dp(4), dp(2), dp(4))
-                setBackgroundColor(0xFFF0F0F0.toInt())
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+                setPadding(dp(2), dp(6), dp(2), dp(6))
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(8).toFloat()
+                    setColor(UiTheme.COLOR_INPUT_BG)
+                    setStroke(dp(1), UiTheme.COLOR_CARD_BORDER)
+                }
                 gravity = Gravity.CENTER
                 filters = arrayOf(android.text.InputFilter.LengthFilter(1))
-                val lp = LinearLayout.LayoutParams(dp(26), dp(36))
-                lp.setMargins(dp(1), 0, dp(1), 0)
+                val lp = LinearLayout.LayoutParams(dp(30), dp(42))
+                lp.setMargins(dp(2), 0, dp(2), 0)
                 layoutParams = lp
                 setText(if (i < digits.length) digits[i].toString() else "")
                 setSelection(text.length)
@@ -1185,18 +1477,63 @@ class MainActivity : Activity() {
             val paired = viewModel.isPaired
             val connected = viewModel.isConnected
             if (refreshRoot) rootStatus = if (rootAvailable()) "Root可用" else "无Root"
-            titleView.text = when {
-                connected -> "Marionette · 已连接"
-                paired -> "Marionette · 已配对"
-                else -> "Marionette"
+
+            titleView.text = "Marionette"
+
+            if (connected) {
+                statusBadge.text = "● 已连接"
+                statusBadge.setTextColor(UiTheme.COLOR_SUCCESS)
+                statusBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_SUCCESS_LIGHT)
+            } else if (paired) {
+                statusBadge.text = "● 已配对"
+                statusBadge.setTextColor(UiTheme.COLOR_ACCENT)
+                statusBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_ACCENT_LIGHT)
+            } else {
+                statusBadge.text = "● 等待连接"
+                statusBadge.setTextColor(UiTheme.COLOR_TEXT_MUTED)
+                statusBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_INPUT_BG)
             }
-            titleView.setTextColor(when {
-                connected -> 0xFF168447.toInt()
-                paired -> 0xFF245AA8.toInt()
-                else -> 0xFF333333.toInt()
-            })
-            statusInfo.text = "配对：${if (paired) "已配对" else "未配对"}  |  连接：${if (connected) "HomeKit已连接" else "等待连接"}  |  $rootStatus\nID：${viewModel.accessoryId()}"
+
+            rootBadge.text = rootStatus
+            if (rootStatus == "Root可用") {
+                rootBadge.setTextColor(0xFF6B46C1.toInt())
+                rootBadge.background = UiTheme.createPillDrawable(this, 0xFFF3E8FD.toInt())
+            } else {
+                rootBadge.setTextColor(UiTheme.COLOR_TEXT_MUTED)
+                rootBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_INPUT_BG)
+            }
+
+            statusInfo.text = "配件 ID：${viewModel.accessoryId()}"
             updatePairingCard()
+            updateAirDropCardStatus()
+        }
+    }
+
+    private fun updateAirDropCardStatus() {
+        val badge = airDropStatusBadge ?: return
+        val summary = airDropSummaryText ?: return
+        val isSessionActive = java.io.File(dev.local.mihotspot.airdrop.AirDropStore.radio(this), "active").exists()
+        val isResident = dev.local.mihotspot.airdrop.AirDropResidentService.isEnabled(this)
+
+        when {
+            isSessionActive -> {
+                badge.text = "● 实验中"
+                badge.setTextColor(UiTheme.COLOR_SUCCESS)
+                badge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_SUCCESS_LIGHT)
+                summary.text = "独占无线传输正在运行 · 点此进入收发"
+            }
+            isResident -> {
+                badge.text = "● 待机中"
+                badge.setTextColor(UiTheme.COLOR_ACCENT)
+                badge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_ACCENT_LIGHT)
+                summary.text = "常驻服务已开启 · Wi-Fi 正常"
+            }
+            else -> {
+                badge.text = "○ 未开启"
+                badge.setTextColor(UiTheme.COLOR_TEXT_MUTED)
+                badge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_INPUT_BG)
+                summary.text = "面向苹果设备 · 点击进入配置与收发"
+            }
         }
     }
 
@@ -1230,7 +1567,8 @@ class MainActivity : Activity() {
         val btn = featureButtons[feature] ?: return
         if (!featureLoading.add(feature)) return
         btn.isEnabled = false
-        btn.text = "处理中…"
+        btn.text = "…"
+        UiTheme.styleButton(btn, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_MUTED, radiusDp = 18f)
         Thread {
             try {
                 val current = viewModel.currentValue(feature)
@@ -1253,13 +1591,6 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
-    }
-
-    private fun Button.onHapticClick(action: () -> Unit) {
-        setOnClickListener {
-            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-            action()
-        }
     }
 
     private fun scheduleSliderWrite(
@@ -1335,8 +1666,11 @@ class MainActivity : Activity() {
     private fun applyFeatureState(feature: HomeKitFeature, value: Boolean) {
         val btn = featureButtons[feature] ?: return
         btn.text = if (value) "ON" else "OFF"
-        btn.setBackgroundColor(if (value) 0xFF333333.toInt() else 0xFFEEEEEE.toInt())
-        btn.setTextColor(if (value) Color.WHITE else 0xFF333333.toInt())
+        if (value) {
+            UiTheme.styleButton(btn, UiTheme.COLOR_TEXT_PRIMARY, Color.WHITE, radiusDp = 18f)
+        } else {
+            UiTheme.styleButton(btn, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_SECONDARY, radiusDp = 18f)
+        }
     }
 
     private fun applyStateEvent(intent: Intent) {
@@ -1361,6 +1695,7 @@ class MainActivity : Activity() {
         }
     }
 
+    @android.annotation.SuppressLint("UnspecifiedRegisterReceiverFlag") // API 33+ supplies NOT_EXPORTED; older API uses its legacy overload.
     private fun registerUiEvents() {
         if (eventsRegistered) return
         val filter = IntentFilter().apply {

@@ -1,0 +1,115 @@
+Marionette AirDrop driver candidate 0039 -- transmit parameters for the
+tx-sniffer exception contract.
+
+Applies on top of 0038 (native/airdrop/driver/0038-monitor-exception-frame-contract.patch).
+File: qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c
+
+Why
+---
+0038 took the tx_sniffer contract exactly as OCB and the mcopy tx-sniffer
+path use it -- SEND_AS_STANDALONE plus a host opaque cookie and nothing
+else -- and the firmware answered with the very same assert it had already
+given the plain vdev-based frame in 0037:
+
+    mhi mhi_1107_00.01.00: [E][mhi_process_sfr] cmnos_thread_patch.c:1170:0x8
+    Asserted in:0x18dc754:0x1801164, line#2834
+
+The same SFR string twice in a row from two different host paths says the
+target is not objecting to which host path the frame takes, it is objecting
+to the frame itself.  A frame that reaches the target as a TQM-bypass MSDU
+still has to become a PPDU, and on a monitor vdev there is no rate control,
+no peer and no tx-spec to fall back on, so an all-zero ext2 header leaves
+the firmware with nothing to transmit.
+
+What
+----
+Fill the HTT MSDU extension header the way the mesh exception path does
+(dp_tx_extract_mesh_meta_data()), which is the only in-tree producer of
+host-built exception frames carrying their own transmit parameters:
+
+    host_tx_desc_pool  1   mandatory: the header states that whenever
+                          firmware uses TQM-BYPASS for a data TID the host
+                          must set it, and dp_tx_prepare_desc_single()
+                          routes every exception frame through that WAR.
+    update_peer_cache   1   keep these values for the following packets.
+    learning_frame     0    NOT set on purpose: it tells firmware to drop
+                          the frame instead of enqueueing it to TQM, which
+                          is the opposite of injection.  Mesh clears it for
+                          unencrypted frames too.
+
+    valid_pwr / valid_mcs_mask / valid_nss_mask / valid_preamble_type /
+    valid_retries / valid_bw_info / valid_encrypt_type   1
+
+    pream_type  OFDM, mcs 0 (6 Mb/s), nss 1, 20 MHz, 10 dBm, 3 retries,
+    encrypt_type 0 (NO_ENCRYPT).
+
+A fixed 20 MHz OFDM 6 Mb/s is deliberate: it is the most robust rate the
+radio offers on both AWDL social channels (6 and 44/149) and does not
+depend on the peer supporting the monitor vdev phy mode.  10 dBm is enough
+for a peer a metre away and keeps the frame inside the power limits of
+those channels.  chanfreq stays 0, which means "use the vdev home channel",
+i.e. the channel the monitor vdev was started on.
+
+Result on device
+----------------
+See native/airdrop/driver/ROADMAP.md section 6 and build.json.
+
+@@ -2794,6 +2794,58 @@
+ 
+ 	qdf_mem_zero(meta_data, sizeof(struct htt_tx_msdu_desc_ext2_t));
+ 
++	/* Marionette (0039): specify the transmit parameters, do not leave them
++	 * to the vdev.  Candidate 0038 took the tx_sniffer contract exactly as
++	 * OCB and the mcopy tx-sniffer path use it -- SEND_AS_STANDALONE plus a
++	 * host opaque cookie and nothing else -- and the firmware answered with
++	 * the same assert it gave the plain vdev-based frame in 0037
++	 * (mhi_process_sfr: cmnos_thread_patch.c:1170 ... line#2834, i.e. an
++	 * identical RDDM twice in a row).  A frame that reaches the target as a
++	 * TQM-bypass MSDU still has to become a PPDU, and on a monitor vdev
++	 * there is no rate control, no peer and no tx-spec to fall back on, so
++	 * an empty ext2 header gives the firmware nothing to transmit.
++	 * dp_tx_prepare_htt_metadata() already prepends this header when
++	 * is_tx_sniffer is set; what follows fills it in the way the mesh
++	 * exception path does (dp_tx_extract_mesh_meta_data()), which is the
++	 * only in-tree producer of host-built exception frames that carry their
++	 * own rate, power, bandwidth and retry information.
++	 *
++	 * host_tx_desc_pool is not optional here: the header states that
++	 * whenever firmware uses TQM-BYPASS for a data TID, the host must set
++	 * it, and dp_tx_prepare_desc_single() routes every exception frame
++	 * through the bypass WAR out of this same call.
++	 *
++	 * update_peer_cache asks the firmware to remember these values for the
++	 * following packets.  learning_frame is deliberately NOT set: it tells
++	 * firmware to drop the frame instead of enqueueing it to TQM, which is
++	 * the opposite of injection (mesh clears it for unencrypted frames).
++	 *
++	 * A fixed 20 MHz OFDM 6 Mb/s (mcs 0, one NSS, OFDM preamble) is used on
++	 * purpose: it is the most robust rate the radio offers on both the
++	 * 2.4 GHz and the 5 GHz AWDL social channels, and a low rate never
++	 * depends on the receiver supporting the vdev phy mode.  10 dBm is
++	 * enough for a peer a metre away and keeps the frame well inside the
++	 * power limits of the AWDL channels. */
++	meta_data->host_tx_desc_pool = 1;
++	meta_data->update_peer_cache = 1;
++
++	meta_data->valid_pwr = 1;
++	meta_data->valid_mcs_mask = 1;
++	meta_data->valid_nss_mask = 1;
++	meta_data->valid_preamble_type = 1;
++	meta_data->valid_retries = 1;
++	meta_data->valid_bw_info = 1;
++	meta_data->valid_encrypt_type = 1;
++
++	meta_data->pream_type = HTT_TX_MSDU_EXT2_DESC_PREAM_OFDM;
++	meta_data->mcs_mask = 1 << 0;
++	meta_data->nss_mask = 1;
++	meta_data->power = 20;
++	meta_data->retry_limit = 3;
++	meta_data->encrypt_type = 0;
++	meta_data->dyn_bw = 0;
++	meta_data->bw_mask = HTT_TX_MSDU_EXT2_DESC_BW_20MHZ_M;
++
+ 	HTT_TX_MSDU_EXT2_DESC_FLAG_SEND_AS_STANDALONE_SET
+ 				(msdu_info->meta_data[5], 1);
+ 	HTT_TX_MSDU_EXT2_DESC_FLAG_HOST_OPAQUE_VALID_SET

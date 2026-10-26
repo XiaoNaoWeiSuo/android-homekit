@@ -1,0 +1,45 @@
+From: Marionette AirDrop driver research
+Subject: [fuxi runtime] virtually allocate host HAL context on fragmented memory
+
+0025 failed before ordinary data or monitor creation: captured hal_attach+0x3c
+kmalloc order:5 failure. The HAL context stores host bookkeeping and virtual
+register/ring handles; its read/write shadow pointers are separate coherent
+DMA allocations. Use the existing zeroing qdf_mem_valloc/vfree pair only for
+the host HAL object, matching both attach-failure and normal-detach frees.
+Keep operations allocation, DMA shadow buffers, register windows and hardware
+addresses unchanged. Existing minidump uses the active VA backend and normal
+removal remains before free. No reclaim or retry settings are modified.
+Revalidate ordinary Wi-Fi and monitor-header observation after this repair.
+
+diff --git a/qca-wifi-host-cmn/hal/wifi3.0/hal_srng.c b/qca-wifi-host-cmn/hal/wifi3.0/hal_srng.c
+--- a/qca-wifi-host-cmn/hal/wifi3.0/hal_srng.c
++++ b/qca-wifi-host-cmn/hal/wifi3.0/hal_srng.c
+@@ -1089,7 +1089,9 @@
+ 	struct hal_soc *hal;
+ 	int i;
+ 
+-	hal = qdf_mem_malloc(sizeof(*hal));
++	/* Host register/ring bookkeeping only. Shadow pointer DMA storage
++	 * below remains separately coherent-allocated. */
++	hal = qdf_mem_valloc(sizeof(*hal));
+ 
+ 	if (!hal) {
+ 		QDF_TRACE(QDF_MODULE_ID_TXRX, QDF_TRACE_LEVEL_ERROR,
+@@ -1167,7 +1169,7 @@
+ 		sizeof(*(hal->shadow_rdptr_mem_vaddr)) * HAL_SRNG_ID_MAX,
+ 		hal->shadow_rdptr_mem_vaddr, hal->shadow_rdptr_mem_paddr, 0);
+ fail1:
+-	qdf_mem_free(hal);
++	qdf_mem_vfree(hal);
+ fail0:
+ 	return NULL;
+ }
+@@ -1222,7 +1224,7 @@
+ 		hal->shadow_wrptr_mem_vaddr, hal->shadow_wrptr_mem_paddr, 0);
+ 	qdf_minidump_remove(hal, sizeof(*hal), "hal_soc");
+ 
+-	qdf_mem_free(hal);
++	qdf_mem_vfree(hal);
+ 
+ 	return;
+ }

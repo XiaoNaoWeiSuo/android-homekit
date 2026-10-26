@@ -1,0 +1,94 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] cfg80211: opt-in AWDL data-frame submission
+
+cfg80211_mlme_mgmt_tx() rejects every frame that is not a management frame:
+
+	if (!ieee80211_is_mgmt(mgmt->frame_control))
+		return -EINVAL;
+
+That line is the last thing standing between an AWDL data frame (three
+address 802.11 data carrying LLC/SNAP 00:17:f2/08/00) and the only
+transmit path the firmware accepts.  The exception path that candidates
+0034-0042 explored is refused by the firmware itself with an unchanging
+SFR assert (cmnos_thread_patch.c:1170 ... line#2834), and the STA-vdev
+carrier additionally trips a host assertion in dp_tx_hw_enqueue_be()
+because tx_exc_metadata->tx_encap_type must be CDP_INVALID_TX_ENCAP_TYPE
+or the vdev's own type.
+
+wlan_hdd_mgmt_tx() does not validate the frame type: it only special-cases
+authentication frames and otherwise forwards the caller's bytes to
+wlan_cfg80211_mgmt_tx() -> WMI MGMT_TX, the native command every P2P
+action frame already uses.  So relaxing this one check lets the firmware
+transmit arbitrary AWDL bytes without touching the exception path.
+
+Default off, and even when compiled in it needs the root-only
+marionette_awdl_mgmt_tx=1 runtime parameter.  The gate is narrow: station
+interface, data frame, and the exact Apple AWDL LLC/SNAP prefix.
+
+Depends on 0002 (CONFIG_CFG80211_MARIONETTE_AWDL and the action-frame gate).
+
+Verified on fuxi with driver patch 0044: an AWDL data frame sent during a
+remain-on-channel to 2412 was ACKed by an AP that exists only on that
+channel, which proves over-the-air delivery rather than host acceptance.
+
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -644,6 +644,48 @@
+                 "Experimental AWDL vendor action TX; default off");
+ #endif
+ 
++/* Marionette (0043): AWDL data frames through the management path.
++ *
++ * cfg80211_mlme_mgmt_tx() refuses anything that is not a management frame:
++ *
++ *     if (!ieee80211_is_mgmt(mgmt->frame_control))
++ *             return -EINVAL;
++ *
++ * That single line is what keeps an AWDL *data* frame (three-address 802.11
++ * data carrying LLC/SNAP 00:17:f2/08/00) out of the only transmit path the
++ * firmware accepts.  The exception path that this project spent candidates
++ * 0034-0042 on is refused by the firmware itself with an unchanging SFR
++ * assert, and the STA-vdev carrier additionally trips a host assertion in
++ * dp_tx_hw_enqueue_be() because tx_encap_type must be
++ * CDP_INVALID_TX_ENCAP_TYPE or the type of the vdev carrying it.
++ *
++ * wlan_hdd_mgmt_tx() does NOT validate the frame type: it only special-cases
++ * authentication frames and otherwise hands the caller's bytes to
++ * wlan_cfg80211_mgmt_tx() -> WMI MGMT_TX.  So if cfg80211 lets the frame
++ * through, the firmware receives a native, supported "transmit these bytes"
++ * command instead of a TQM-bypass exception frame.
++ *
++ * The gate is deliberately narrow: station interface, root-only runtime
++ * parameter, data frame, and the exact Apple AWDL LLC/SNAP prefix.
++ */
++static bool cfg80211_marionette_awdl_data(struct wireless_dev *wdev,
++					  struct cfg80211_mgmt_tx_params *params)
++{
++#ifdef CONFIG_CFG80211_MARIONETTE_AWDL
++	static const u8 awdl_snap[8] = { 0xaa, 0xaa, 0x03, 0x00,
++					 0x17, 0xf2, 0x08, 0x00 };
++	const struct ieee80211_mgmt *mgmt = (const void *)params->buf;
++
++	return READ_ONCE(marionette_awdl_mgmt_tx) &&
++		wdev->iftype == NL80211_IFTYPE_STATION &&
++		params->len >= 24 + 16 &&
++		ieee80211_is_data(mgmt->frame_control) &&
++		!memcmp(params->buf + 24, awdl_snap, sizeof(awdl_snap));
++#else
++	return false;
++#endif
++}
++
+ static bool cfg80211_marionette_awdl_action(struct wireless_dev *wdev,
+ 					 struct cfg80211_mgmt_tx_params *params)
+ {
+@@ -682,7 +724,8 @@
+ 
+ 	mgmt = (const struct ieee80211_mgmt *)params->buf;
+ 
+-	if (!ieee80211_is_mgmt(mgmt->frame_control))
++	if (!ieee80211_is_mgmt(mgmt->frame_control) &&
++	    !cfg80211_marionette_awdl_data(wdev, params))
+ 		return -EINVAL;
+ 
+ 	stype = le16_to_cpu(mgmt->frame_control) & IEEE80211_FCTL_STYPE;

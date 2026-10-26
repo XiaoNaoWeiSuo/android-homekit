@@ -1,0 +1,1 @@
+cmd_/Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/marionette_die_logger.mod := echo   marionette_die_logger.o | awk -v RS='( |\n)' '!x[$$0]++ { print("/Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/"$$0) }' > /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/marionette_die_logger.mod

@@ -41,6 +41,8 @@ mkdir -p "$STAGE_DIR/system/priv-app/Marionette"
 cp "$APK_PATH" "$STAGE_DIR/system/priv-app/Marionette/Marionette.apk"
 chmod 0755 "$STAGE_DIR/service.sh"
 chmod 0755 "$STAGE_DIR/boot-completed.sh" "$STAGE_DIR/start.sh" "$STAGE_DIR/customize.sh"
+chmod 0755 "$STAGE_DIR/homekit-watchdog.sh"
+chmod 0755 "$STAGE_DIR/airdrop-watchdog.sh"
 chmod 0755 "$STAGE_DIR/termux-keepalive.sh" 2>/dev/null || true
 
 rm -f "$OUTPUT_PATH"

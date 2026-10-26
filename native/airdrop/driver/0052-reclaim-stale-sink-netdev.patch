@@ -1,0 +1,180 @@
+From: Marionette <marionette@localhost>
+Subject: [EXPERIMENTAL] stop the AWDL sink netdev from outliving its module
+
+Patch 0047 creates `awdlsink` lazily, on the first AWDL frame it tries to
+deliver, and destroys it only in marionette_awdl_sink_exit(), which is called
+at the very end of hdd_wlan_shutdown().  rmmod does not always run that path,
+so a reloaded driver finds the old netdev still registered and
+
+	register_netdevice() -> -EEXIST
+
+on every attempt.  The sink pointer then stays NULL for the life of that module
+instance and every frame is counted in marionette_awdl_sink_drop instead of
+being delivered.
+
+Measured 2026-10-23, after a few reloads during the resident-vdev work:
+
+	marionette_mon_post_awdl    = 288
+	marionette_awdl_sink_rx     = 0
+	marionette_awdl_sink_drop   = 288
+
+	dmesg: MARIONETTE_AWDL_SINK_UP_FAILED ret=-17   (repeated)
+	ip -d link show awdlsink -> ifindex 34, UP, mtu 2304, radiotap
+
+At the filin level that is indistinguishable from "no AWDL peer is
+transmitting": tcpdump binds the stale interface successfully and captures
+nothing.
+
+Two parts.
+
+1. hdd_module_exit() calls marionette_awdl_sink_exit() as well, so the netdev
+   is gone before the code is.  The function returns immediately when there is
+   no sink, so the cost is one pointer check.
+
+2. sink_create() reclaims an orphan if one is already there, and retries
+   registration a few times.
+
+   The reclaim cannot use the obvious helpers: this kernel does not export
+   dev_change_name(), dev_get_by_name() or unregister_netdevice() to modules
+   (modpost: `"dev_change_name" undefined`).  unregister_netdevice() is also
+   wrong on its own terms -- it waits for the refcount to reach zero, so any
+   lookup reference held while calling it wedges the workqueue in D state
+   (measured: kworker/6:61 D, MARIONETTE_AWDL_SINK_RECLAIM logged once and
+   then silence, awdlsink gone from /sys/class/net and never recreated).
+
+   So take no reference at all: walk the list under rtnl and hand the device to
+   unregister_netdevice_queue()/unregister_netdevice_many(), which are
+   exported and are the kernel's own idiom.  The orphan is never reused, since
+   its netdev_ops point into the previous module image.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+@@ -165,26 +165,72 @@
+ 	dev->flags |= IFF_NOARP;
+ }
+ 
++/*
++ * Reclaim a netdev that a previous module instance left behind.
++ *
++ * The sink is created lazily and destroyed in marionette_awdl_sink_exit(),
++ * which used to be reachable only from hdd_wlan_shutdown().  When the module
++ * was replaced without that path running, the old netdev stayed registered and
++ * register_netdevice() returned -EEXIST for ever: the sink pointer stayed
++ * NULL, every frame was counted in marionette_awdl_sink_drop, and the result
++ * was indistinguishable from "no peer nearby" (measured 2026-10-23:
++ * post_awdl=288, sink_rx=0, sink_drop=288).
++ *
++ * The orphan cannot be reused -- its netdev_ops point into the previous module
++ * image -- and it must be unregistered without holding a reference, because
++ * unregister waits for the refcount to reach zero.  Take no reference at all:
++ * walk the list under rtnl and hand the devices to unregister_netdevice_many,
++ * which is the kernel's own idiom.  dev_get_by_name()/dev_change_name() are
++ * not exported to modules on this kernel, so they are not an option.
++ */
++static void marionette_sink_reclaim(void)
++{
++	struct net_device *dev, *tmp;
++	LIST_HEAD(gone);
++
++	rtnl_lock();
++	for_each_netdev_safe(&init_net, dev, tmp) {
++		if (strcmp(dev->name, MARIONETTE_SINK_NAME))
++			continue;
++		pr_info("MARIONETTE_AWDL_SINK_RECLAIM ifindex=%d\n",
++			dev->ifindex);
++		unregister_netdevice_queue(dev, &gone);
++	}
++	if (!list_empty(&gone))
++		unregister_netdevice_many(&gone);
++	rtnl_unlock();
++}
++
+ static void marionette_sink_create(struct work_struct *work)
+ {
+ 	struct net_device *dev;
+-	int ret;
++	int ret = -ENODEV;
++	int attempt;
+ 
+ 	if (READ_ONCE(marionette_sink_dev))
+ 		return;
+-	dev = alloc_netdev(0, MARIONETTE_SINK_NAME, NET_NAME_UNKNOWN,
+-			   marionette_sink_setup);
+-	if (!dev)
+-		return;
+-	dev->netdev_ops = &marionette_sink_ops;
+-	rtnl_lock();
+-	ret = register_netdevice(dev);
+-	if (!ret)
+-		ret = dev_open(dev, NULL);
+-	rtnl_unlock();
+-	if (ret) {
++	for (attempt = 0; attempt < 10; attempt++) {
++		dev = alloc_netdev(0, MARIONETTE_SINK_NAME, NET_NAME_UNKNOWN,
++				   marionette_sink_setup);
++		if (!dev)
++			return;
++		dev->netdev_ops = &marionette_sink_ops;
++		rtnl_lock();
++		ret = register_netdevice(dev);
++		if (!ret)
++			ret = dev_open(dev, NULL);
++		rtnl_unlock();
++		if (!ret)
++			break;
+ 		free_netdev(dev);
+-		pr_info("MARIONETTE_AWDL_SINK_UP_FAILED ret=%d\n", ret);
++		pr_info("MARIONETTE_AWDL_SINK_UP_FAILED ret=%d attempt=%d\n",
++			ret, attempt);
++		if (ret == -EEXIST)
++			marionette_sink_reclaim();
++		msleep(20);
++	}
++	if (ret) {
++		pr_info("MARIONETTE_AWDL_SINK_GAVE_UP ret=%d\n", ret);
+ 		return;
+ 	}
+ 	WRITE_ONCE(marionette_sink_dev, dev);
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -29,6 +29,7 @@
+ #include "wlan_vdev_mgr_utils_api.h"
+ #include "marionette_wmi_rx_filter.h"
+ #include "marionette_sta_monitor.h"
++#include "marionette_monitor_rx_observe.h"
+ #include <wbuff.h>
+ #include "cfg_ucfg_api.h"
+ #include <wlan_hdd_includes.h>
+@@ -18436,14 +18437,24 @@
+  *
+  * Return: None
+  */
++/*
++ * The host-only AWDL sink netdev lives inside this module, so it must be
++ * unregistered before the code goes away.  hdd_wlan_shutdown() does it too,
++ * but rmmod does not always run that path -- when it does not, the netdev
++ * survives into the next module instance and every AWDL frame is dropped on
++ * the floor (patch 0052).  Doing it here as well is cheap: the function
++ * returns immediately when no sink exists.
++ */
+ #ifdef FEATURE_WLAN_RESIDENT_DRIVER
+ static void __exit hdd_module_exit(void)
+ {
++	marionette_awdl_sink_exit();
+ }
+ #else
+ static void __exit hdd_module_exit(void)
+ {
+ 	hdd_driver_unload();
++	marionette_awdl_sink_exit();
+ }
+ #endif
+ #else
+@@ -18451,6 +18462,7 @@
+ {
+ 	hdd_driver_unload();
+ 	wlan_deinit_sysfs();
++	marionette_awdl_sink_exit();
+ }
+ #endif
+ 

@@ -61,6 +61,11 @@ import org.bouncycastle.crypto.engines.ChaCha7539Engine
 import org.bouncycastle.crypto.modes.ChaCha20Poly1305
 import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.KeyParameter
+import dev.local.mihotspot.homekit.commands.SnapshotCommandExecutor
+import dev.local.mihotspot.homekit.commands.ControlUnavailable
+import dev.local.mihotspot.core.homekit.protocol.SerialGattQueue
+import dev.local.mihotspot.core.homekit.protocol.HapResponse
+import dev.local.mihotspot.core.homekit.protocol.HapReplayCache
 import dev.local.mihotspot.ServiceControl
 import dev.local.mihotspot.HomeKitUiEvents
 import dev.local.mihotspot.BroadcastStrategy
@@ -89,10 +94,18 @@ import android.os.IBinder
 /** Stable BLE, GATT and HAP runtime. Android entry points subclass this type. */
 open class HomeKitRuntime : Service() {
     private lateinit var manager: BluetoothManager
-    private var server: BluetoothGattServer? = null
+    @Volatile private var server: BluetoothGattServer? = null
     private var advertising = false
     private var activeAdvertiseMode: Int? = null
     @Volatile private var starting = false
+    @Volatile private var probeGeneration = 0
+    @Volatile private var destroyed = false
+    private var runtimeInitialized = false
+    private var restartRuntime = false
+    private var gattOpenThread: Thread? = null
+    private var advertiseCallback: AdvertiseCallback? = null
+    private var pendingService: BluetoothGattService? = null
+    private var startupTimeout: Runnable? = null
     @Volatile private var gattTrafficSinceConnection = false
     private var protocollessDisconnectStreak = 0
     private val pendingServices = ArrayDeque<BluetoothGattService>()
@@ -123,7 +136,7 @@ open class HomeKitRuntime : Service() {
     @Volatile private var recoveryPending = false
     private val recoveryRunnable = Runnable {
         recoveryPending = false
-        if (ServiceControl.isEnabled(this) && checkBluetoothPermissions()) {
+        if (canRunProbe() && connectedDevices.isEmpty()) {
             stopProbe()
             startProbe()
         }
@@ -136,7 +149,7 @@ open class HomeKitRuntime : Service() {
                 BluetoothAdapter.STATE_ON -> {
                     log("BLUETOOTH_ON_RECOVERY")
                     mainHandler.postDelayed({
-                        if (ServiceControl.isEnabled(this@HomeKitRuntime) && checkBluetoothPermissions()) {
+                        if (canRunProbe()) {
                             startProbe()
                         }
                     }, BLUETOOTH_RECOVERY_DELAY_MS)
@@ -146,7 +159,123 @@ open class HomeKitRuntime : Service() {
             }
         }
     }
-    private val commandExecutor by lazy { AndroidCommandExecutor(this) }
+    private val androidExecutor = lazy { AndroidCommandExecutor(this) }
+    private val commandExecutor by lazy { SnapshotCommandExecutor(androidExecutor.value) }
+    @Volatile private var protocolQueue: SerialGattQueue? = null
+    private val replayCache = HapReplayCache()
+    private val connectionEpochs = ConcurrentHashMap<String, Long>()
+    private val connectionStartedAt = ConcurrentHashMap<String, Long>()
+    private val connectionSequence = java.util.concurrent.atomic.AtomicLong()
+    private val indicationStartedAt = ConcurrentHashMap<String, Long>()
+    private data class GattTask(val generation: Int, val address: String, val epoch: Long, val server: BluetoothGattServer?)
+    private val gattTask = ThreadLocal<GattTask>()
+    private val healthCheck = object : Runnable {
+        override fun run() {
+            if (!canRunProbe()) {
+                if (!destroyed && runtimeInitialized) mainHandler.postDelayed(this, HEALTH_CHECK_INTERVAL_MS)
+                return
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (androidExecutor.isInitialized() && androidExecutor.value.stalled) {
+                log("CONTROL_BACKEND_STALLED restarting_service=true")
+                restartRuntime = true
+                stopSelf()
+                return
+            }
+            if (protocolQueue?.stalled == true) {
+                log("GATT_WORKER_STALLED restarting=true")
+                failProbe("protocol_worker_timeout")
+            } else {
+                connectionStartedAt.forEach { (address, since) ->
+                    if (pairVerifySessions[address]?.active != true && !pairSetupSessions.containsKey(address) && now - since > HANDSHAKE_TIMEOUT_MS) {
+                        disconnectPeer(address, "handshake_timeout")
+                    }
+                }
+                indicationStartedAt.forEach { (address, since) ->
+                    if (eventInFlight.containsKey(address) && now - since > INDICATION_TIMEOUT_MS) {
+                        disconnectPeer(address, "indication_timeout")
+                    }
+                }
+                val desired = desiredAdvertiseMode(this@HomeKitRuntime, commandPrefs.contains("controller_key"))
+                if (!starting && connectedDevices.isEmpty() &&
+                    (!advertising || server == null || activeAdvertiseMode != desired)) {
+                    reconcileBleState("runtime_health")
+                }
+            }
+            commandPrefs.edit().putLong("runtime_heartbeat_elapsed", now).apply()
+            mainHandler.postDelayed(this, HEALTH_CHECK_INTERVAL_MS)
+        }
+    }
+
+    private fun isGattTaskCurrent(): Boolean {
+        val task = gattTask.get() ?: return false
+        return !destroyed && task.generation == probeGeneration && connectionEpochs[task.address] == task.epoch
+    }
+
+    @SuppressLint("MissingPermission", "WakelockTimeout")
+    private fun dispatchGatt(generation: Int, device: BluetoothDevice, action: () -> Unit) {
+        val epoch = connectionEpochs[device.address] ?: return
+        val requestServer = server
+        val lock = getSystemService(android.os.PowerManager::class.java)
+            .newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "MiHotspotHap:Transaction")
+        lock.acquire(8000L)
+        fun release() { if (lock.isHeld) runCatching { lock.release() } }
+        val queue = protocolQueue
+        if (queue == null) { release(); return }
+        queue.submit(expired = {
+            release()
+            mainHandler.post {
+                if (generation == probeGeneration && connectionEpochs[device.address] == epoch && !destroyed) {
+                    disconnectPeer(device.address, "protocol_queue_expired")
+                }
+            }
+        }) {
+            gattTask.set(GattTask(generation, device.address, epoch, requestServer))
+            try {
+                if (isGattTaskCurrent()) action()
+            } catch (error: Exception) {
+                log("GATT_TASK_FAILED ${error.javaClass.simpleName}:${error.message}")
+                recoverTaskPeer("protocol_exception")
+            } finally { gattTask.remove(); release() }
+        }
+    }
+
+    private fun recoverTaskPeer(reason: String) {
+        val task = gattTask.get() ?: return
+        mainHandler.post {
+            if (!destroyed && task.generation == probeGeneration && connectionEpochs[task.address] == task.epoch) {
+                disconnectPeer(task.address, reason)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun replyGatt(device: BluetoothDevice, requestId: Int, status: Int, offset: Int, value: ByteArray?) {
+        if (!isGattTaskCurrent()) return
+        if (gattTask.get()?.server?.sendResponse(device, requestId, status, offset, value) != true) {
+            recoverTaskPeer("gatt_response_rejected")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun disconnectPeer(address: String, reason: String) {
+        if (!canRunProbe()) return
+        val device = connectedDeviceRefs[address] ?: return
+        log("BLE_SESSION_RECOVERY address=$address reason=$reason")
+        // Invalidate queued work before asking the stack to close the link.
+        connectionEpochs[address] = connectionSequence.incrementAndGet()
+        connectionStartedAt.remove(address)
+        indicationStartedAt.remove(address)
+        pairVerifySessions.remove(address)
+        replayCache.clear(address)
+        runCatching { server?.cancelConnection(device) }
+        val generation = probeGeneration
+        mainHandler.postDelayed({
+            if (generation == probeGeneration && connectedDeviceRefs[address] === device && canRunProbe()) {
+                failProbe("disconnect_callback_missing")
+            }
+        }, 2000L)
+    }
     /**
      * One lifecycle per product control. HAP characteristics only adapt the
      * wire shape; all real reads and writes go through this registry.
@@ -173,17 +302,20 @@ open class HomeKitRuntime : Service() {
             stopSelf()
             return
         }
+        runtimeInitialized = true
         registerReceiver(bluetoothStateReceiver, android.content.IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
         bluetoothReceiverRegistered = true
         publishRuntimeStatus()
         createNotificationChannel()
         startForeground(FOREGROUND_NOTIFICATION_ID, foregroundNotification("驱动常驻 · 正在启动 HomeKit BLE"))
         log("SERVICE_CREATED")
+        commandPrefs.edit().putLong("runtime_heartbeat_elapsed", SystemClock.elapsedRealtime()).apply()
         // HAP disconnected events are driven by real Android state changes,
         // including changes made while Home is not connected. Keep the
         // observer alive for the service lifetime, not only for a GATT link.
         startStatePolling()
         ServiceControl.scheduleWatchdog(this)
+        mainHandler.postDelayed(healthCheck, HEALTH_CHECK_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -200,24 +332,43 @@ open class HomeKitRuntime : Service() {
         ServiceControl.scheduleWatchdog(this)
         ServiceControl.scheduleBroadcastModeBoundary(this)
         if (intent?.action == ACTION_STOP) { stopProbe(); stopSelf(); return START_NOT_STICKY }
+        if (intent?.action == ServiceControl.ACTION_RELIABILITY_PROFILE) {
+            ServiceControl.setBroadcastStrategy(this, BroadcastStrategy.LOW_LATENCY)
+            log("RELIABILITY_PROFILE_APPLIED broadcast=low_latency")
+            reconcileBleState(intent.action)
+            return START_STICKY
+        }
         if (intent?.action == ServiceControl.ACTION_WATCHDOG ||
             intent?.action == ServiceControl.ACTION_BROADCAST_MODE_BOUNDARY) {
             reconcileBleState(intent.action)
             return START_STICKY
         }
+        log("SERVICE_START_REQUEST action=${intent?.action} startId=$startId")
         if (checkBluetoothPermissions()) startProbe() else log("SERVICE_WAITING_FOR_BLUETOOTH_PERMISSION")
         return START_STICKY
     }
 
     override fun onDestroy() {
+        destroyed = true
+        // A queued GATT-open result must still run so it can close its stale
+        // server. Delayed work checks canRunProbe() before touching the runtime.
         mainHandler.removeCallbacks(recoveryRunnable)
+        mainHandler.removeCallbacks(healthCheck)
         recoveryPending = false
-        stopProbe()
+        if (runtimeInitialized) stopProbe()
         if (bluetoothReceiverRegistered) {
             try { unregisterReceiver(bluetoothStateReceiver) } catch (_: IllegalArgumentException) { }
             bluetoothReceiverRegistered = false
         }
         statePoller.shutdownNow()
+        if (androidExecutor.isInitialized()) androidExecutor.value.close()
+        if (restartRuntime) {
+            val app = applicationContext
+            mainHandler.postDelayed({
+                runCatching { ServiceControl.ensureRunning(app, ServiceControl.ACTION_WATCHDOG) }
+                    .onFailure { android.util.Log.e(TAG, "SERVICE_RESTART_FAILED", it) }
+            }, 1000L)
+        }
         log("SERVICE_DESTROYED")
         super.onDestroy()
     }
@@ -227,6 +378,9 @@ open class HomeKitRuntime : Service() {
     private fun isUserUnlocked(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.N ||
             getSystemService(UserManager::class.java)?.isUserUnlocked != false
+
+    private fun canRunProbe(): Boolean = !destroyed && runtimeInitialized &&
+        isUserUnlocked() && ServiceControl.isEnabled(this) && checkBluetoothPermissions()
 
     private fun loadOrCreateAccessoryPrivateKey(): Ed25519PrivateKeyParameters {
         val preferences = getSharedPreferences("homekit", MODE_PRIVATE)
@@ -325,7 +479,7 @@ open class HomeKitRuntime : Service() {
 
     private fun publishRuntimeStatus() {
         val paired = commandPrefs.contains("controller_key")
-        val connected = connectedDevices.isNotEmpty()
+        val connected = connectedDevices.any { pairVerifySessions[it]?.active == true }
         commandPrefs.edit()
             .putBoolean("runtime_connected", connected)
             .putBoolean("runtime_advertising", advertising)
@@ -353,7 +507,8 @@ open class HomeKitRuntime : Service() {
         val paired = commandPrefs.contains("controller_key")
         val qrMode = pairingBroadcastMode() == PairingBroadcastMode.QR_SETUP_PAYLOAD
         val status = when {
-            paired && advertising && connectedDevices.isNotEmpty() -> "已配对 · HomeKit 已连接 · ${connectedDevices.size} 个设备"
+            paired && advertising && connectedDevices.any { pairVerifySessions[it]?.active == true } -> "已配对 · HomeKit 控制会话已就绪"
+            paired && advertising && connectedDevices.isNotEmpty() -> "已配对 · 正在验证 HomeKit 会话"
             paired && advertising -> "已配对 · HomeKit 广播中"
             paired -> "已配对 · HomeKit 服务待机"
             advertising && connectedDevices.isNotEmpty() -> if (qrMode) "二维码配对 · 已连接 · ${connectedDevices.size} 个设备" else "配对码 ${setupCodeForNotification()} · 已连接"
@@ -377,65 +532,115 @@ open class HomeKitRuntime : Service() {
 
     @SuppressLint("MissingPermission")
     private fun startProbe() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { startProbe() }
+            return
+        }
+        if (!canRunProbe()) return
         if (advertising || starting) {
             log("PROBE_ALREADY_RUNNING")
             return
         }
+        cancelProbeRecovery()
+        val generation = ++probeGeneration
+        protocolQueue?.close()
+        protocolQueue = SerialGattQueue()
         starting = true
-        val adapter = manager.adapter
-        if (adapter == null) {
-            log("BLE_ERROR adapter=null")
-            starting = false
-            return
-        }
-        log("BLE_CAPABILITY enabled=${adapter.isEnabled} multiAdv=${adapter.isMultipleAdvertisementSupported} " +
-            "2mPhy=${adapter.isLe2MPhySupported} codedPhy=${adapter.isLeCodedPhySupported}")
-        if (!adapter.isEnabled) {
-            log("BLE_ERROR bluetooth_disabled")
-            starting = false
-            return
-        }
-        val advertiser = adapter.bluetoothLeAdvertiser
-        if (advertiser == null) {
-            log("BLE_ERROR advertiser=null")
-            starting = false
-            return
-        }
-
-        // Open the GATT server off the main thread. Immediately after `install -r`
-        // restarts the process, MIUI's Bluetooth stack can still be tearing down the
-        // previous instance's server; on the main thread openGattServer() can then
-        // block for several seconds and still return null. A background retry loop
-        // keeps the Activity responsive and recovers once the stack is ready.
-        Thread({
-            openGattServerWithRetry()
-        }, "MiHotspotHap-GattOpen").apply { isDaemon = true; start() }
-    }
-
-    private fun openGattServerWithRetry() {
-        for (attempt in 1..GATT_OPEN_MAX_ATTEMPTS) {
-            server = manager.openGattServer(this, gattCallback)
-            if (server != null) {
-                log("GATT_SERVER_OPENED attempt=$attempt")
-                queueGattDatabase()
-                addNextService()
+        armStartupTimeout(generation)
+        try {
+            val adapter = manager.adapter
+            if (adapter == null) {
+                failProbe("adapter_unavailable")
                 return
             }
-            log("BLE_RETRY gatt_server=null attempt=$attempt")
+            if (!adapter.isEnabled) {
+                log("SERVICE_WAITING_FOR_BLUETOOTH state=${adapter.state}")
+                stopProbe()
+                // STATE_ON normally wakes us. Also retry while the stack is
+                // turning on, in case its broadcast raced service creation.
+                if (adapter.state == BluetoothAdapter.STATE_TURNING_ON) {
+                    scheduleProbeRecovery("bluetooth_turning_on")
+                }
+                return
+            }
+            if (adapter.bluetoothLeAdvertiser == null) {
+                failProbe("advertiser_unavailable")
+                return
+            }
+            log("BLE_CAPABILITY enabled=true multiAdv=${adapter.isMultipleAdvertisementSupported} " +
+                "2mPhy=${adapter.isLe2MPhySupported} codedPhy=${adapter.isLeCodedPhySupported}")
+            // Never publish from the worker: a stopped/replaced attempt must
+            // close its late result instead of overwriting the current server.
+            gattOpenThread = Thread({
+                openGattServerWithRetry(generation)
+            }, "MiHotspotHap-GattOpen").apply { isDaemon = true; start() }
+        } catch (error: Exception) {
+            log("BLE_START_EXCEPTION ${error.javaClass.simpleName}:${error.message}")
+            failProbe("start_exception")
+        }
+    }
+
+    @SuppressLint("MissingPermission") // Checked before dispatch; failures/revocation are caught below.
+    private fun openGattServerWithRetry(generation: Int) {
+        for (attempt in 1..GATT_OPEN_MAX_ATTEMPTS) {
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
             try {
+                val opened = manager.openGattServer(this, createGattCallback(generation))
+                if (opened != null) {
+                    mainHandler.post {
+                        if (generation != probeGeneration || !canRunProbe()) {
+                            runCatching { opened.close() }
+                            return@post
+                        }
+                        server = opened
+                        log("GATT_SERVER_OPENED attempt=$attempt generation=$generation")
+                        queueGattDatabase()
+                        addNextService()
+                    }
+                    return
+                }
+                log("BLE_RETRY gatt_server=null attempt=$attempt")
                 Thread.sleep(GATT_OPEN_RETRY_DELAY_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
+                return
+            } catch (error: Exception) {
+                log("GATT_OPEN_EXCEPTION ${error.javaClass.simpleName}:${error.message}")
                 break
             }
         }
-        log("BLE_ERROR gatt_server=null attempts=$GATT_OPEN_MAX_ATTEMPTS")
-        starting = false
-        scheduleProbeRecovery("gatt_server_unavailable")
+        mainHandler.post {
+            if (generation == probeGeneration && canRunProbe()) failProbe("gatt_server_unavailable")
+        }
+    }
+
+    private fun armStartupTimeout(generation: Int) {
+        startupTimeout?.let(mainHandler::removeCallbacks)
+        startupTimeout = Runnable {
+            if (generation == probeGeneration && starting && canRunProbe()) {
+                log("BLE_STARTUP_TIMEOUT generation=$generation pendingService=${pendingService?.uuid}")
+                failProbe("startup_timeout")
+            }
+        }.also { mainHandler.postDelayed(it, PROBE_STARTUP_TIMEOUT_MS) }
+    }
+
+    private fun cancelProbeRecovery() {
+        mainHandler.removeCallbacks(recoveryRunnable)
+        recoveryPending = false
+    }
+
+    private fun failProbe(reason: String) {
+        log("BLE_STARTUP_FAILED reason=$reason")
+        stopProbe()
+        scheduleProbeRecovery(reason)
     }
 
     private fun scheduleProbeRecovery(reason: String) {
-        if (recoveryPending || !ServiceControl.isEnabled(this)) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { scheduleProbeRecovery(reason) }
+            return
+        }
+        if (recoveryPending || !canRunProbe()) return
         recoveryPending = true
         log("BLE_RECOVERY_SCHEDULED reason=$reason delayMs=$PROBE_RECOVERY_DELAY_MS")
         mainHandler.postDelayed(recoveryRunnable, PROBE_RECOVERY_DELAY_MS)
@@ -443,12 +648,13 @@ open class HomeKitRuntime : Service() {
 
     private fun reconcileBleState(reason: String?) {
         mainHandler.post {
-            if (!ServiceControl.isEnabled(this) || !checkBluetoothPermissions()) return@post
+            if (!canRunProbe()) return@post
             val paired = getSharedPreferences("homekit", MODE_PRIVATE).contains("controller_key")
             val desiredMode = desiredAdvertiseMode(this, paired)
             val modeChanged = advertising && activeAdvertiseMode != desiredMode
             log("BLE_HEALTH_CHECK reason=$reason advertising=$advertising server=${server != null} activeMode=$activeAdvertiseMode desiredMode=$desiredMode")
             val safeToRestart = connectedDevices.isEmpty()
+            if (starting) return@post // The startup deadline owns recovery until publication completes.
             if (safeToRestart && (!advertising || server == null || modeChanged)) {
                 stopProbe()
                 startProbe()
@@ -460,8 +666,11 @@ open class HomeKitRuntime : Service() {
 
     @SuppressLint("MissingPermission")
     private fun startAdvertisingAfterGattPublished() {
-        val adapter = manager.adapter ?: run { starting = false; return }
-        val advertiser = adapter.bluetoothLeAdvertiser ?: run { starting = false; return }
+        if (!canRunProbe() || server == null) return
+        val adapter = manager.adapter ?: run { failProbe("advertising_adapter_unavailable"); return }
+        val advertiser = adapter.bluetoothLeAdvertiser ?: run { failProbe("advertising_unavailable"); return }
+        starting = true
+        armStartupTimeout(probeGeneration)
         // HAP regular advertisement. QR mode appends the official Setup Hash so
         // Home can match a scanned setup payload to this BLE accessory.
         // Android addManufacturerData supplies Company ID and AD framing.
@@ -505,12 +714,14 @@ open class HomeKitRuntime : Service() {
             .build()
         try {
             adapter.name = commandPrefs.getString("device_name", "Marionette") ?: "Marionette"
-            advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback)
+            val callback = createAdvertiseCallback(probeGeneration)
+            advertiseCallback = callback
+            advertiser.startAdvertising(settings, data, scanResponse, callback)
             activeAdvertiseMode = advertiseMode
             log("BLE_ADVERTISING_REQUESTED paired=$isPaired advertiseMode=$advertiseMode mode=${pairingBroadcastMode()} payload=${hapData.hex()}")
         } catch (t: Throwable) {
             log("BLE_ADVERTISING_EXCEPTION ${t.stackTraceToString()}")
-            stopProbe()
+            failProbe("advertising_exception")
         }
     }
 
@@ -522,14 +733,15 @@ open class HomeKitRuntime : Service() {
     @SuppressLint("MissingPermission")
     private fun refreshAdvertisementWithCurrentState() {
         mainHandler.post {
-            if (!advertising || connectedDevices.isNotEmpty() || !ServiceControl.isEnabled(this)) return@post
+            if (!canRunProbe() || !advertising || connectedDevices.isNotEmpty()) return@post
             val advertiser = manager.adapter?.bluetoothLeAdvertiser ?: return@post
-            advertiser.stopAdvertising(advertiseCallback)
+            advertiseCallback?.let { advertiser.stopAdvertising(it) }
+            advertiseCallback = null
             advertising = false
             log("BLE_ADVERTISING_REFRESH gsn=${currentStateNumber()}")
             mainHandler.postDelayed({
                 if (!advertising && !starting && connectedDevices.isEmpty() &&
-                    ServiceControl.isEnabled(this) && checkBluetoothPermissions()
+                    canRunProbe()
                 ) {
                     startAdvertisingAfterGattPublished()
                 }
@@ -552,10 +764,33 @@ open class HomeKitRuntime : Service() {
 
     @SuppressLint("MissingPermission")
     private fun stopProbe() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { stopProbe() }
+            return
+        }
+        ++probeGeneration
+        protocolQueue?.close()
+        protocolQueue = null
+        connectionEpochs.clear()
+        connectionStartedAt.clear()
+        indicationStartedAt.clear()
+        replayCache.clear()
+        startupTimeout?.let(mainHandler::removeCallbacks)
+        startupTimeout = null
+        cancelProbeRecovery()
+        gattOpenThread?.interrupt()
+        gattOpenThread = null
         log("PROBE_STOPPED_TRACE ${Throwable().stackTraceToString().lines().drop(1).take(5).joinToString(" <- ")}")
-        manager.adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
-        server?.close()
+        val callback = advertiseCallback
+        advertiseCallback = null
+        try {
+            callback?.let { manager.adapter?.bluetoothLeAdvertiser?.stopAdvertising(it) }
+        } catch (error: Exception) {
+            log("BLE_STOP_EXCEPTION ${error.javaClass.simpleName}:${error.message}")
+        }
+        runCatching { server?.close() }
         server = null
+        pendingService = null
         pendingServices.clear()
         pduResponses.clear()
         pduRequests.clear()
@@ -594,11 +829,17 @@ open class HomeKitRuntime : Service() {
             startAdvertisingAfterGattPublished()
             return
         }
-        val accepted = server?.addService(next) == true
+        pendingService = next
+        val accepted = try {
+            server?.addService(next) == true
+        } catch (error: Exception) {
+            log("GATT_SERVICE_ADD_EXCEPTION ${error.javaClass.simpleName}:${error.message}")
+            false
+        }
         log("GATT_SERVICE_ADD uuid=${next.uuid} accepted=$accepted")
         if (!accepted) {
             log("GATT_DATABASE_FAILED uuid=${next.uuid}")
-            stopProbe()
+            failProbe("gatt_service_rejected")
         }
     }
 
@@ -685,37 +926,59 @@ open class HomeKitRuntime : Service() {
         }.toByte()
     }
 
-    private val advertiseCallback = object : AdvertiseCallback() {
+    private fun createAdvertiseCallback(generation: Int) = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            advertising = true
-            activeAdvertiseMode = settingsInEffect.mode
-            starting = false
-            log("BLE_ADVERTISING_STARTED mode=${settingsInEffect.mode} connectable=${settingsInEffect.isConnectable}")
-            publishRuntimeStatus()
-            updateServiceNotification()
+            mainHandler.post {
+                if (generation != probeGeneration || advertiseCallback !== this || !canRunProbe()) return@post
+                startupTimeout?.let(mainHandler::removeCallbacks)
+                startupTimeout = null
+                cancelProbeRecovery()
+                advertising = true
+                activeAdvertiseMode = settingsInEffect.mode
+                starting = false
+                log("BLE_ADVERTISING_STARTED mode=${settingsInEffect.mode} connectable=${settingsInEffect.isConnectable}")
+                publishRuntimeStatus()
+                updateServiceNotification()
+            }
         }
 
         override fun onStartFailure(errorCode: Int) {
-            advertising = false
-            starting = false
-            log("BLE_ADVERTISING_FAILED code=$errorCode")
-            publishRuntimeStatus()
-            updateServiceNotification()
-            scheduleProbeRecovery("advertising_failed_$errorCode")
+            mainHandler.post {
+                if (generation != probeGeneration || advertiseCallback !== this || !canRunProbe()) return@post
+                log("BLE_ADVERTISING_FAILED code=$errorCode")
+                failProbe("advertising_failed_$errorCode")
+            }
         }
     }
 
-    private val gattCallback = object : BluetoothGattServerCallback() {
+    @SuppressLint("MissingPermission") // Every callback checks the current permission and generation.
+    private fun createGattCallback(generation: Int) = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
             log("BLE_CONNECTION address=${device.address} status=$status state=${stateName(newState)}")
+            connectionEpochs[device.address] = connectionSequence.incrementAndGet()
+            replayCache.clear(device.address)
             var gsnChanged = false
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                // A missed disconnect must not carry an old key/nonce into a
+                // new connection to the same controller address.
+                pairVerifySessions.remove(device.address)
+                pairSetupSessions.remove(device.address)
+                pduResponses.keys.removeIf { it.startsWith("${device.address}|") }
+                pduRequests.keys.removeIf { it.startsWith("${device.address}|") }
+                eventSubscriptions.removeIf { it.startsWith("${device.address}|") }
+                pendingEventNotifications.removeIf { it.startsWith("${device.address}|") }
+                eventInFlight.remove(device.address)
+                indicationStartedAt.remove(device.address)
+                connectionStartedAt[device.address] = SystemClock.elapsedRealtime()
                 connectedDevices += device.address
                 connectedDeviceRefs[device.address] = device
                 stateNumberIncrementedForConnection = false
                 gattTrafficSinceConnection = false
                 startStatePolling()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                connectionStartedAt.remove(device.address)
+                indicationStartedAt.remove(device.address)
                 val hadGattTraffic = gattTrafficSinceConnection
                 gsnChanged = stateNumberIncrementedForConnection
                 connectedDevices -= device.address
@@ -756,11 +1019,14 @@ open class HomeKitRuntime : Service() {
         }
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
             peerMtu[device.address] = mtu
             log("BLE_MTU address=${device.address} mtu=$mtu")
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
+            indicationStartedAt.remove(device.address)
             val completed = eventInFlight.remove(device.address)
             log("HAP_EVENT_INDICATION_SENT address=${device.address} status=$status key=$completed")
             if (completed != null && status != BluetoothGatt.GATT_SUCCESS) {
@@ -772,76 +1038,90 @@ open class HomeKitRuntime : Service() {
         }
 
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
-            log("GATT_SERVICE_ADDED status=$status uuid=${service.uuid}")
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                addNextService()
-            } else {
-                stopProbe()
-                scheduleProbeRecovery("gatt_service_add_$status")
+            mainHandler.post {
+                if (generation != probeGeneration || !canRunProbe() || service !== pendingService) return@post
+                pendingService = null
+                log("GATT_SERVICE_ADDED status=$status uuid=${service.uuid}")
+                if (status == BluetoothGatt.GATT_SUCCESS) addNextService()
+                else failProbe("gatt_service_add_$status")
             }
         }
 
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
-            gattTrafficSinceConnection = true
-            val key = responseKey(device, characteristic)
-            val response = pduResponses[key]
-            if (response != null && offset == 0) {
-                var pdu = response.nextFragment((peerMtu[device.address] ?: DEFAULT_ATT_MTU) - 1)
-                val secure = pairVerifySessions[device.address]
-                // Pair Verify M4 itself is the final plaintext response. Every
-                // later HAP procedure uses the accessory-to-controller key.
-                if (secure?.active == true) {
-                    pdu = controlEncrypt(secure.readKey, secure.readNonce++, pdu)
-                    log("CONTROL_ENCRYPT direction=read plain=${pdu.size - 16}")
-                }
-                log("HAP_PDU_RESPONSE uuid=${characteristic.uuid} value=${pdu.hex()} final=${response.isFinal}")
-                server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, pdu)
-                if (response.isFinal && gattDefinition(characteristic)?.type == PAIR_VERIFY_TYPE) {
-                    val verify = pairVerifySessions[device.address]
-                    if (verify?.activateAfterResponse == true) {
-                        verify.active = true
-                        verify.activateAfterResponse = false
-                        log("CONTROL_SESSION_ACTIVE")
-                        // An EV subscription may have been written before Pair
-                        // Verify completed. Indications are only legal after the
-                        // encrypted session is active, so drain now as well.
-                        drainPendingEventNotifications(device.address)
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
+            dispatchGatt(generation, device) {
+                gattTrafficSinceConnection = true
+                val key = responseKey(device, characteristic)
+                val response = pduResponses[key]
+                if (response != null && offset == 0) {
+                    val secure = pairVerifySessions[device.address]
+                    var pdu = response.nextFragmentForMtu(
+                        peerMtu[device.address] ?: DEFAULT_ATT_MTU, secure?.active == true
+                    )
+                    // Pair Verify M4 itself is the final plaintext response. Every
+                    // later HAP procedure uses the accessory-to-controller key.
+                    if (secure?.active == true) {
+                        pdu = controlEncrypt(secure.readKey, secure.readNonce++, pdu)
+                        log("CONTROL_ENCRYPT direction=read plain=${pdu.size - 16}")
                     }
+                    log("HAP_PDU_RESPONSE uuid=${characteristic.uuid} value=${pdu.hex()} final=${response.isFinal}")
+                    replyGatt(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, pdu)
+                    if (response.isFinal && gattDefinition(characteristic)?.type == PAIR_VERIFY_TYPE) {
+                        val verify = pairVerifySessions[device.address]
+                        if (verify?.activateAfterResponse == true) {
+                            verify.active = true
+                            verify.activateAfterResponse = false
+                            log("CONTROL_SESSION_ACTIVE")
+                            publishRuntimeStatus()
+                            mainHandler.post { if (canRunProbe()) updateServiceNotification() }
+                            // An EV subscription may have been written before Pair
+                            // Verify completed. Indications are only legal after the
+                            // encrypted session is active, so drain now as well.
+                            drainPendingEventNotifications(device.address)
+                        }
+                    }
+                    if (response.isFinal &&
+                        gattDefinition(characteristic)?.type == PAIRINGS_TYPE &&
+                        restartAfterPairingsResponse.remove(device.address)
+                    ) {
+                        log("PAIRINGS_REMOVE_RESPONSE_SENT restart_scheduled=true")
+                        mainHandler.postDelayed({
+                            if (generation != probeGeneration || !canRunProbe()) return@postDelayed
+                            log("PAIRINGS_REMOVE_RESTART advertising_with_sf_unpaired=true")
+                            stopProbe()
+                            if (checkBluetoothPermissions()) startProbe()
+                        }, PAIRING_REMOVAL_RESTART_DELAY_MS)
+                    }
+                    if (response.isFinal) {
+                        pduResponses.remove(key, response)
+                        gattDefinition(characteristic)?.let { replayCache.complete(device.address, it.iid, response.tid) }
+                    }
+                    return@dispatchGatt
                 }
-                if (response.isFinal &&
-                    gattDefinition(characteristic)?.type == PAIRINGS_TYPE &&
-                    restartAfterPairingsResponse.remove(device.address)
-                ) {
-                    log("PAIRINGS_REMOVE_RESPONSE_SENT restart_scheduled=true")
-                    mainHandler.postDelayed({
-                        log("PAIRINGS_REMOVE_RESTART advertising_with_sf_unpaired=true")
-                        stopProbe()
-                        if (checkBluetoothPermissions()) startProbe()
-                    }, PAIRING_REMOVAL_RESTART_DELAY_MS)
-                }
-                if (response.isFinal) pduResponses.remove(key)
-                return
+                val value = characteristic.value ?: byteArrayOf()
+                log("GATT_READ uuid=${characteristic.uuid} offset=$offset value=${value.hex()}")
+                replyGatt(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.drop(offset).toByteArray())
             }
-            val value = characteristic.value ?: byteArrayOf()
-            log("GATT_READ uuid=${characteristic.uuid} offset=$offset value=${value.hex()}")
-            server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.drop(offset).toByteArray())
         }
 
         override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, descriptor: BluetoothGattDescriptor) {
-            gattTrafficSinceConnection = true
-            val value = if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
-                val definition = gattDefinition(descriptor.characteristic)
-                if (definition?.let {
-                    it.properties and HAP_PROPERTY_EVENT != 0 &&
-                        eventSubscriptions.contains(eventKey(device.address, it.iid))
-                } == true) {
-                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                } else {
-                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-                }
-            } else descriptor.value ?: byteArrayOf()
-            log("GATT_DESCRIPTOR_READ uuid=${descriptor.uuid} offset=$offset value=${value.hex()}")
-            server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.drop(offset).toByteArray())
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
+            dispatchGatt(generation, device) {
+                gattTrafficSinceConnection = true
+                val value = if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
+                    val definition = gattDefinition(descriptor.characteristic)
+                    if (definition?.let {
+                        it.properties and HAP_PROPERTY_EVENT != 0 &&
+                            eventSubscriptions.contains(eventKey(device.address, it.iid))
+                    } == true) {
+                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                    } else {
+                        BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                    }
+                } else descriptor.value ?: byteArrayOf()
+                log("GATT_DESCRIPTOR_READ uuid=${descriptor.uuid} offset=$offset value=${value.hex()}")
+                replyGatt(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.drop(offset).toByteArray())
+            }
         }
 
         override fun onDescriptorWriteRequest(
@@ -853,39 +1133,58 @@ open class HomeKitRuntime : Service() {
             offset: Int,
             value: ByteArray
         ) {
-            gattTrafficSinceConnection = true
-            if (!preparedWrite && offset == 0 && descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
-                val definition = gattDefinition(descriptor.characteristic)
-                val iid = definition?.iid
-                val subscriptionKey = iid?.let { eventKey(device.address, it) }
-                val validValue = value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) ||
-                    value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
-                if (definition == null || definition.properties and HAP_PROPERTY_EVENT == 0 || !validValue) {
-                    log("GATT_CCCD_REJECT characteristic=${descriptor.characteristic.uuid} iid=$iid value=${value.hex()}")
-                    if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
-                    return
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
+            val requestValue = value.copyOf()
+            dispatchGatt(generation, device) {
+                val value = requestValue
+                gattTrafficSinceConnection = true
+                if (preparedWrite || offset != 0) {
+                    if (responseNeeded) replyGatt(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
+                    return@dispatchGatt
                 }
-                descriptor.value = value.copyOf()
-                if (value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)) {
-                    eventSubscriptions += subscriptionKey!!
-                    log("HAP_EVENT_SUBSCRIBED address=${device.address} iid=0x%04X".format(iid))
-                } else {
-                    eventSubscriptions -= subscriptionKey!!
-                    pendingEventNotifications -= subscriptionKey
-                    log("HAP_EVENT_UNSUBSCRIBED address=${device.address} iid=0x%04X".format(iid))
+                if (!preparedWrite && offset == 0 && descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIGURATION_UUID) {
+                    val definition = gattDefinition(descriptor.characteristic)
+                    val iid = definition?.iid
+                    val subscriptionKey = iid?.let { eventKey(device.address, it) }
+                    val validValue = value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) ||
+                        value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
+                    if (definition == null || definition.properties and HAP_PROPERTY_EVENT == 0 || !validValue) {
+                        log("GATT_CCCD_REJECT characteristic=${descriptor.characteristic.uuid} iid=$iid value=${value.hex()}")
+                        if (responseNeeded) replyGatt(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
+                        return@dispatchGatt
+                    }
+                    descriptor.value = value.copyOf()
+                    if (value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)) {
+                        eventSubscriptions += subscriptionKey!!
+                        log("HAP_EVENT_SUBSCRIBED address=${device.address} iid=0x%04X".format(iid))
+                    } else {
+                        eventSubscriptions -= subscriptionKey!!
+                        pendingEventNotifications -= subscriptionKey
+                        log("HAP_EVENT_UNSUBSCRIBED address=${device.address} iid=0x%04X".format(iid))
+                    }
+                    drainPendingEventNotifications(device.address)
                 }
-                drainPendingEventNotifications(device.address)
+                if (responseNeeded) replyGatt(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             }
-            if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
         }
 
         override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
-            gattTrafficSinceConnection = true
-            log("GATT_WRITE uuid=${characteristic.uuid} prepared=$preparedWrite offset=$offset value=${value.hex()}")
-            if (!preparedWrite && offset == 0) {
-                handleHapPduWrite(device, characteristic, value)
+            if (destroyed || generation != probeGeneration || !checkBluetoothPermissions()) return
+            val requestValue = value.copyOf()
+            dispatchGatt(generation, device) {
+                val value = requestValue
+                gattTrafficSinceConnection = true
+                if (preparedWrite || offset != 0) {
+                    log("GATT_WRITE_REJECT prepared=$preparedWrite offset=$offset")
+                    if (responseNeeded) replyGatt(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
+                    return@dispatchGatt
+                }
+                log("GATT_WRITE uuid=${characteristic.uuid} prepared=$preparedWrite offset=$offset value=${value.hex()}")
+                if (!preparedWrite && offset == 0) {
+                    handleHapPduWrite(device, characteristic, value)
+                }
+                if (responseNeeded) replyGatt(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             }
-            if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
         }
 
         private fun stateName(state: Int) = when (state) {
@@ -904,9 +1203,10 @@ open class HomeKitRuntime : Service() {
         if (secure?.active == true) {
             request = try {
                 log("CONTROL_DECRYPT_START keyBytes=${secure.writeKey.size} nonce=${secure.writeNonce}")
-                controlDecrypt(secure.writeKey, secure.writeNonce++, value)
+                controlDecrypt(secure.writeKey, secure.writeNonce, value).also { secure.writeNonce++ }
             } catch (t: Exception) {
                 log("CONTROL_DECRYPT_FAILED bytes=${value.size} ${t.javaClass.simpleName}:${t.message}")
+                recoverTaskPeer("control_authentication_failed")
                 return
             }
             log("CONTROL_DECRYPT direction=write plain=${request.size} value=${request.hex()}")
@@ -942,7 +1242,19 @@ open class HomeKitRuntime : Service() {
 
     private fun processHapPdu(device: BluetoothDevice, characteristic: BluetoothGattCharacteristic, opcode: Int, tid: Int, iid: Int, requestBody: ByteArray) {
         val definition = gattDefinition(characteristic)
-        val response = when (opcode) {
+        if (definition?.control != null && pairVerifySessions[device.address]?.active != true) {
+            pduResponses[responseKey(device, characteristic)] = HapResponse(tid, HAP_STATUS_INSUFFICIENT_AUTHENTICATION)
+            return
+        }
+        val replayable = definition?.control != null && iid == definition.iid && opcode == HAP_OPCODE_CHARACTERISTIC_WRITE
+        // TIDs may be reused after completion. Only an outstanding transaction
+        // can be a replay; a new identical button press must still execute.
+        if (replayable && pduResponses[responseKey(device, characteristic)]?.tid == tid) replayCache.find(device.address, iid, opcode, tid, requestBody)?.let {
+            log("HAP_WRITE_REPLAY iid=$iid tid=$tid")
+            pduResponses[responseKey(device, characteristic)] = it
+            return
+        }
+        val response = try { when (opcode) {
             HAP_OPCODE_SERVICE_SIGNATURE_READ -> {
                 val service = definition?.service
                 if (definition?.type != SERVICE_SIGNATURE_TYPE || service == null) {
@@ -1053,11 +1365,13 @@ open class HomeKitRuntime : Service() {
                             notifyCommand(command, enabled, false, "已在应用中禁用")
                             HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
                         } else {
+                            if (!isGattTaskCurrent()) return
                             val result = if (control?.valueKind == HapValueKind.INT32) {
                                 lifecycle.executePercentage(numericValue)
                             } else {
                                 lifecycle.executeBoolean(enabled)
                             }
+                            if (!isGattTaskCurrent()) return
                             val elapsedMs = SystemClock.elapsedRealtime() - commandStartedAt
                             log("COMMAND_EXECUTE command=$command value=$numericValue success=${result.success} elapsedMs=$elapsedMs message=${result.message}")
                             // Keep the GATT callback thread focused on completing the
@@ -1072,10 +1386,7 @@ open class HomeKitRuntime : Service() {
                                 // characteristic is being written. The state
                                 // poller observes the committed Android state and
                                 // raises the event after the HAP write completes.
-                                mainHandler.post {
-                                    refreshObservedControlState(definition)
-                                    publishControlState(command)
-                                }
+                                requestControlRefresh(command)
                             }
                             HapResponse(tid, if (result.success) HAP_STATUS_SUCCESS else HAP_STATUS_INVALID_REQUEST)
                         }
@@ -1099,7 +1410,12 @@ open class HomeKitRuntime : Service() {
                 log("HAP_PDU_UNIMPLEMENTED opcode=0x%02X tid=$tid iid=0x%04X uuid=${characteristic.uuid}".format(opcode, iid))
                 HapResponse(tid, HAP_STATUS_UNSUPPORTED_PDU)
             }
+        } } catch (error: ControlUnavailable) {
+            log("CONTROL_STATE_UNAVAILABLE iid=$iid reason=${error.message}")
+            HapResponse(tid, HAP_STATUS_INSUFFICIENT_RESOURCES)
         }
+        if (!isGattTaskCurrent()) return
+        if (replayable) replayCache.remember(device.address, iid, opcode, tid, requestBody, response)
         pduResponses[responseKey(device, characteristic)] = response
         log("HAP_PDU_REQUEST opcode=0x%02X tid=$tid iid=0x%04X status=0x%02X responseBody=${response.body.hex()}".format(opcode, iid, response.status))
     }
@@ -1413,6 +1729,7 @@ open class HomeKitRuntime : Service() {
     }
 
     private fun pairVerifyM2(device: BluetoothDevice, tlvs: Map<Int, List<ByteArray>>, tid: Int): HapResponse {
+        replayCache.clear(device.address)
         val controllerPublic = tlvs[PAIRING_TLV_PUBLIC_KEY]?.fold(byteArrayOf()) { acc, part -> acc + part } ?: return HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
         if (controllerPublic.size != 32) return HapResponse(tid, HAP_STATUS_INVALID_REQUEST)
         val privateKey = X25519PrivateKeyParameters(secureRandom)
@@ -1552,8 +1869,10 @@ open class HomeKitRuntime : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission") // Checked before sending; revocation is caught by the send path.
     private fun drainPendingEventNotifications(address: String) {
         mainHandler.post {
+            if (!canRunProbe()) return@post
             if (!connectedDevices.contains(address) || eventInFlight.containsKey(address)) return@post
             // Apple ADK defers Handle Value Indications until Pair Verify has
             // established the encrypted control session.
@@ -1573,6 +1892,7 @@ open class HomeKitRuntime : Service() {
             }
             pendingEventNotifications.remove(key)
             eventInFlight[address] = key
+            indicationStartedAt[address] = SystemClock.elapsedRealtime()
             val status = try {
                 if (Build.VERSION.SDK_INT >= 33) {
                     server?.notifyCharacteristicChanged(
@@ -1593,6 +1913,7 @@ open class HomeKitRuntime : Service() {
                 BluetoothGatt.GATT_FAILURE
             }
             if (status != BluetoothGatt.GATT_SUCCESS && status != BluetoothStatusCodes.SUCCESS) {
+                indicationStartedAt.remove(address)
                 eventInFlight.remove(address)
                 pendingEventNotifications += key
                 log("HAP_EVENT_INDICATION_RETRY address=$address iid=$iid status=$status")
@@ -1603,17 +1924,46 @@ open class HomeKitRuntime : Service() {
         }
     }
 
+    private fun refreshControl(command: HomeKitCommand) {
+        commandExecutor.refresh(command)
+        HomeKitAccessoryCatalog.services.asSequence().flatMap { it.characteristics.asSequence() }
+            .filter { it.control?.command == command }.forEach(::refreshObservedControlState)
+    }
+
+    private fun requestControlRefresh(command: HomeKitCommand) {
+        if (destroyed) return
+        try {
+            statePoller.execute {
+                val related = if (command == HomeKitCommand.MUTE || command == HomeKitCommand.VOLUME) {
+                    listOf(HomeKitCommand.MUTE, HomeKitCommand.VOLUME)
+                } else listOf(command)
+                related.forEach {
+                    try { refreshControl(it); publishControlState(it) }
+                    catch (error: Exception) { log("CONTROL_REFRESH_DEFERRED command=$it reason=${error.message}") }
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
     private fun pollControlStates() {
-        HomeKitAccessoryCatalog.services.asSequence()
-            .flatMap { it.characteristics.asSequence() }
-            .filter { it.control != null }
-            .forEach(::refreshObservedControlState)
+        HomeKitControlModels.all.forEach { model ->
+            try { refreshControl(model.command) }
+            catch (error: Exception) { log("CONTROL_REFRESH_DEFERRED command=${model.command} reason=${error.message}") }
+        }
     }
 
     private fun startStatePolling() {
         if (statePollFuture?.isCancelled == false && statePollFuture?.isDone == false) return
         statePollFuture = statePoller.scheduleWithFixedDelay(
-            ::pollControlStates,
+            {
+                try {
+                    pollControlStates()
+                } catch (error: Exception) {
+                    // ScheduledExecutor suppresses every subsequent run after
+                    // one uncaught boot-time Binder/read error.
+                    log("STATE_POLL_FAILED ${error.javaClass.simpleName}:${error.message}")
+                }
+            },
             STATE_POLL_INITIAL_DELAY_SECONDS,
             STATE_POLL_INTERVAL_SECONDS,
             TimeUnit.SECONDS
@@ -1649,12 +1999,12 @@ open class HomeKitRuntime : Service() {
         definition.control?.let { controlLifecycles[it.model.command] }
 
     private fun incrementStateNumberForConnection() {
-        if (stateNumberIncrementedForConnection) return
         synchronized(this) {
-            if (stateNumberIncrementedForConnection) return
+            val connected = connectedDevices.isNotEmpty()
+            if (connected && stateNumberIncrementedForConnection) return
             val next = if (currentStateNumber() >= 0xFFFF) 1 else currentStateNumber() + 1
             commandPrefs.edit().putInt("homekit_gsn", next).apply()
-            stateNumberIncrementedForConnection = true
+            stateNumberIncrementedForConnection = connected
             log("HAP_GSN_INCREMENTED gsn=$next")
             refreshAdvertisementWithCurrentState()
         }
@@ -1752,8 +2102,11 @@ open class HomeKitRuntime : Service() {
         private const val APPLE_COMPANY_ID = 0x004C
         private const val DEFAULT_ATT_MTU = 23
         private const val DEFAULT_GSN = 15
-        private const val STATE_POLL_INITIAL_DELAY_SECONDS = 2L
-        private const val STATE_POLL_INTERVAL_SECONDS = 10L
+        private const val STATE_POLL_INITIAL_DELAY_SECONDS = 0L
+        private const val STATE_POLL_INTERVAL_SECONDS = 2L
+        private const val HEALTH_CHECK_INTERVAL_MS = 5000L
+        private const val HANDSHAKE_TIMEOUT_MS = 15000L
+        private const val INDICATION_TIMEOUT_MS = 3000L
         private const val BLUETOOTH_RECOVERY_DELAY_MS = 1500L
         private fun desiredAdvertiseMode(context: android.content.Context, paired: Boolean): Int = when (
             ServiceControl.effectiveBroadcastStrategy(context, paired)
@@ -1764,6 +2117,7 @@ open class HomeKitRuntime : Service() {
             BroadcastStrategy.AUTO -> AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
         }
         private const val PROBE_RECOVERY_DELAY_MS = 5000L
+        private const val PROBE_STARTUP_TIMEOUT_MS = 30000L
         private const val EVENT_RETRY_DELAY_MS = 100L
         private const val GATT_OPEN_MAX_ATTEMPTS = 5
         private const val GATT_OPEN_RETRY_DELAY_MS = 1500L
@@ -1778,6 +2132,8 @@ open class HomeKitRuntime : Service() {
         private const val HAP_OPCODE_SERVICE_SIGNATURE_READ = 0x06
         private const val HAP_OPCODE_CHARACTERISTIC_CONFIGURATION = 0x07
         private const val HAP_OPCODE_PROTOCOL_CONFIGURATION = 0x08
+        private const val HAP_STATUS_INSUFFICIENT_AUTHENTICATION = 0x03
+        private const val HAP_STATUS_INSUFFICIENT_RESOURCES = 0x07
         private const val HAP_STATUS_SUCCESS = 0x00
         private const val HAP_STATUS_UNSUPPORTED_PDU = 0x01
         private const val HAP_STATUS_INVALID_INSTANCE_ID = 0x04
@@ -1866,31 +2222,9 @@ open class HomeKitRuntime : Service() {
             var writeKey: ByteArray = byteArrayOf(),
             var readNonce: Long = 0,
             var writeNonce: Long = 0,
-            var active: Boolean = false,
+            @Volatile var active: Boolean = false,
             var activateAfterResponse: Boolean = false
         )
-
-        private class HapResponse(val tid: Int, val status: Int, val body: ByteArray = byteArrayOf()) {
-            private var offset = 0
-            private var first = true
-            val isFinal get() = !first && offset == body.size
-
-            fun nextFragment(maxBytes: Int): ByteArray {
-                val header = if (first && body.isNotEmpty()) 5 else if (first) 3 else 2
-                val count = minOf(body.size - offset, maxBytes - header)
-                require(count >= 0) { "ATT MTU too small for HAP response" }
-                val fragment = if (first) {
-                    if (body.isEmpty()) byteArrayOf(0x02, tid.toByte(), status.toByte())
-                    else byteArrayOf(0x02, tid.toByte(), status.toByte(), body.size.toByte(), (body.size ushr 8).toByte()) +
-                        body.copyOfRange(offset, offset + count)
-                } else {
-                    byteArrayOf(0x82.toByte(), tid.toByte()) + body.copyOfRange(offset, offset + count)
-                }
-                offset += count
-                first = false
-                return fragment
-            }
-        }
 
         private val characteristicsByIid: Map<Int, HapCharacteristicDefinition> =
             HomeKitAccessoryCatalog.services.flatMap { it.characteristics }.associateBy { it.iid }

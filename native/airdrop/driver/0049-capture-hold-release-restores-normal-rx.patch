@@ -1,0 +1,118 @@
+From: Marionette <marionette@localhost>
+Subject: [EXPERIMENTAL] make capture_hold=0 actually release the monitor filters
+
+marionette_monitor_refresh_filters() installed the monitor filters
+unconditionally:
+
+	dp_mon_filter_setup_mon_mode_1_0(pdev);
+	return dp_mon_filter_update_1_0(pdev);
+
+so writing marionette_awdl_capture_hold=0 re-armed exactly what it was supposed
+to release.  Normal RX never came back while the monitor vdev existed, the
+station missed beacons, and policy manager dropped the link after a run of them:
+
+	lim_ps_offload_handle_missed_beacon_ind: Received Heart Beat Failure
+	wlan0(vdevid-0): ... QCA_DISCONNECT_REASON_BEACON_MISS_FAILURE
+
+Measured 2026-10-23, all with the station associated to channel 52:
+
+| shape                                   | station | AWDL frames |
+|-----------------------------------------|---------|-------------|
+| vdev resident, filters never held        | alive   | 0 (expected)|
+| vdev resident, filters toggled 2s/3s     | dead 10s| stops       |
+| vdev resident, filters held + ROC rearm  | dead 15s| stops       |
+| vdev churned (2 s window, delete after)  | alive   | flowing     |
+
+Only deleting the vdev restored normal RX, which forced the service to churn
+vdevs.  Every vdev delete costs exactly one
+
+	target_if_vdev_mgr_rsp_timer_start: DELETE requested, waiting for STOP response
+	QDF ASSERT in target_if_vdev_mgr_assert_mgmt
+
+one assert per window regardless of a 3 s or 12 s gap, because the firmware's
+STOP response is never accounted for.  Over ~10 minutes that accumulation took
+the whole device down twice.
+
+This patch makes the release path do what the detach path does: reset the
+monitor mode before updating, so the shared RXDMA ring returns to its normal
+interpretation and beacons keep arriving.  The capture phase is now passed
+explicitly instead of being ignored.
+
+If this works, the resident design needs no vdev churn at all: one vdev opened
+once, filters toggled, no asserts, no reboots.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+@@ -1047,7 +1047,7 @@ QDF_STATUS dp_mon_filter_update_1_0(struct dp_pdev *pdev)
+ 
+ /* Called only with the monitor vdev operation guard held by the bounded
+  * experiment. Never cache the SoC or queue work across teardown. */
+-int marionette_monitor_refresh_filters(void *soc_handle)
++int marionette_monitor_refresh_filters(void *soc_handle, bool hold)
+ {
+ 	struct dp_soc *soc = soc_handle;
+ 	struct dp_pdev *pdev;
+@@ -1059,7 +1059,24 @@ int marionette_monitor_refresh_filters(void *soc_handle)
+ 	    !pdev->monitor_pdev->monitor_configured ||
+ 	    !pdev->monitor_pdev->mvdev)
+ 		return QDF_STATUS_E_INVAL;
+-	dp_mon_filter_setup_mon_mode_1_0(pdev);
++	/* Releasing must actually release.
++	 *
++	 * This used to install the monitor filters unconditionally, so writing
++	 * capture_hold=0 re-armed them and normal RX never came back: the
++	 * station missed beacons and policy manager dropped the link after a
++	 * run of them (QCA_DISCONNECT_REASON_BEACON_MISS_FAILURE, ~10 s).
++	 * Only deleting the monitor vdev restored normal RX, which is why the
++	 * service had to churn vdevs -- and every vdev delete costs one
++	 * target_if_vdev_mgr assertion because the firmware's STOP response is
++	 * never accounted for.
++	 *
++	 * Resetting the monitor mode puts the shared RXDMA ring back to its
++	 * normal interpretation, which is what the detach path does.
++	 */
++	if (!hold)
++		dp_mon_filter_reset_mon_mode_1_0(pdev);
++	else
++		dp_mon_filter_setup_mon_mode_1_0(pdev);
+ 	return dp_mon_filter_update_1_0(pdev);
+ }
+ 
+--- a/platform/inc/marionette_sta_monitor.h
++++ b/platform/inc/marionette_sta_monitor.h
+@@ -4,5 +4,5 @@
+ #include <linux/types.h>
+ bool marionette_sta_monitor_enabled(void);
+ bool marionette_sta_monitor_capture_enabled(void);
+-int marionette_monitor_refresh_filters(void *soc_handle);
++int marionette_monitor_refresh_filters(void *soc_handle, bool hold);
+ #endif
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -20053,7 +20053,7 @@ static int marionette_capture_once_set(const char *value,
+ 	if (!target_freq)
+ 		target_freq = home_freq;
+ 	WRITE_ONCE(marionette_capture_phase, true);
+-	capture_status = marionette_monitor_refresh_filters(soc);
++	capture_status = marionette_monitor_refresh_filters(soc, true);
+ 	if (QDF_IS_STATUS_SUCCESS(capture_status)) {
+ 		if (target_freq != home_freq)
+ 			tune_status = wlan_hdd_set_mon_chan(adapter, target_freq,
+@@ -20065,7 +20065,7 @@ static int marionette_capture_once_set(const char *value,
+ 	if (target_freq != home_freq)
+ 		home_status = wlan_hdd_set_mon_chan(adapter, home_freq, home_width);
+ 	WRITE_ONCE(marionette_capture_phase, false);
+-	restore_status = marionette_monitor_refresh_filters(soc);
++	restore_status = marionette_monitor_refresh_filters(soc, false);
+ 	hdd_info("MARIONETTE_CAPTURE_ONCE freq=%u home=%u ms=%u capture=%d tune=%d home_restore=%d rx_restore=%d",
+ 		 target_freq, home_freq, duration, capture_status, tune_status,
+ 		 home_status, restore_status);
+@@ -20157,7 +20157,7 @@ static int marionette_capture_hold_set(const char *value,
+ 		goto stop;
+ 	}
+ 	WRITE_ONCE(marionette_capture_phase, hold);
+-	status = marionette_monitor_refresh_filters(soc);
++	status = marionette_monitor_refresh_filters(soc, hold);
+ 	hdd_info("MARIONETTE_CAPTURE_HOLD hold=%d status=%d", hold, status);
+ 	ret = qdf_status_to_os_return(status);
+ stop:

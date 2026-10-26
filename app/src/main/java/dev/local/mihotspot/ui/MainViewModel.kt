@@ -22,6 +22,7 @@ import dev.local.mihotspot.homekit.PairingBroadcastMode
  */
 class MainViewModel(context: Context) {
     private val executor = AndroidCommandExecutor(context.applicationContext)
+    fun close() { executor.close() }
     private val controlLifecycles = HomeKitControlModels.all.associate { model ->
         model.command to HomeKitControlLifecycle(model, executor)
     }

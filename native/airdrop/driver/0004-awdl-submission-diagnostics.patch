@@ -1,0 +1,57 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] hdd: expose explicit host submission diagnostics
+
+The normal ndo_get_stats reads DP interface statistics, not dev->stats.
+Expose root-only, atomic submission/rejection counters separately so monitor
+experiments do not mistake unchanged interface TX counters for DP rejection,
+or mistake host submission for over-the-air delivery. Apply after 0003.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -649,6 +649,29 @@
+ module_param_named(marionette_awdl_raw_tx, marionette_awdl_raw_tx, bool, 0600);
+ MODULE_PARM_DESC(marionette_awdl_raw_tx,
+                 "Experimental AWDL-only monitor data TX; default off");
++
++/* Host submission diagnostics, independent of DP interface statistics.
++ * A successful submission is not a firmware completion or peer receipt. */
++static atomic_long_t marionette_awdl_submitted = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_awdl_rejected = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_awdl_submitted_bytes = ATOMIC_LONG_INIT(0);
++
++static int marionette_awdl_counter_get(char *buffer,
++                                     const struct kernel_param *parameter)
++{
++	return scnprintf(buffer, PAGE_SIZE, "%ld\n",
++			 atomic_long_read(parameter->arg));
++}
++
++static const struct kernel_param_ops marionette_awdl_counter_ops = {
++	.get = marionette_awdl_counter_get,
++};
++module_param_cb(marionette_awdl_submitted, &marionette_awdl_counter_ops,
++		&marionette_awdl_submitted, 0400);
++module_param_cb(marionette_awdl_rejected, &marionette_awdl_counter_ops,
++		&marionette_awdl_rejected, 0400);
++module_param_cb(marionette_awdl_submitted_bytes, &marionette_awdl_counter_ops,
++		&marionette_awdl_submitted_bytes, 0400);
+ 
+ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+@@ -699,12 +722,12 @@
+ 	if (skb)
+ 		goto drop;
+ 	/* Submission counters only. Firmware/OTA completion is still unknown. */
+-	dev->stats.tx_packets++;
+-	dev->stats.tx_bytes += bytes;
++	atomic_long_inc(&marionette_awdl_submitted);
++	atomic_long_add(bytes, &marionette_awdl_submitted_bytes);
+ 	hdd_dp_ssr_unprotect();
+ 	return NETDEV_TX_OK;
+ drop:
+-	dev->stats.tx_dropped++;
++	atomic_long_inc(&marionette_awdl_rejected);
+ 	dev_kfree_skb_any(skb);
+ 	hdd_dp_ssr_unprotect();
+ 	return NETDEV_TX_OK;

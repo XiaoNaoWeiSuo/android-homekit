@@ -1,0 +1,80 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] cfg80211: opt-in AWDL vendor action submission
+
+The management-path probe returns ENOTCONN because a category-127 action
+frame on a station must address the associated AP. AWDL addresses its own
+BSSID instead. Add a default-off experiment limited to the AWDL signature,
+with the normal source address, driver, interface and regulatory checks.
+Even enabled builds retain a default-off root-only runtime parameter.
+
+This is a management-plane experiment ONLY. It does not implement raw data
+TX/RX, synchronization, Wi-Fi coexistence or firmware support. Not deployed.
+
+diff --git a/net/wireless/Kconfig b/net/wireless/Kconfig
+--- a/net/wireless/Kconfig
++++ b/net/wireless/Kconfig
+@@ -37,6 +37,17 @@ config CFG80211
+ 
+ if CFG80211
+ 
++config CFG80211_MARIONETTE_AWDL
++	bool "Experimental AWDL management frame submission"
++	default n
++	help
++	  Allow AWDL category-127 vendor action frames with the AWDL BSSID
++	  on a station interface without requiring them to address its AP.
++	  Local source address, driver and regulatory checks still apply.
++	  This does not provide an AWDL data path or AirDrop compatibility.
++	  Used only for isolated Marionette driver research.
++	  Say N for normal kernels.
++
+ config NL80211_TESTMODE
+ 	bool "nl80211 testmode command"
+ 	help
+diff --git a/net/wireless/mlme.c b/net/wireless/mlme.c
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -638,6 +638,33 @@ void cfg80211_mlme_purge_registrations(struct wireless_dev *wdev)
+ 	cfg80211_mgmt_registrations_update(wdev);
+ }
+ 
++#ifdef CONFIG_CFG80211_MARIONETTE_AWDL
++static bool marionette_awdl_mgmt_tx;
++module_param_named(marionette_awdl_mgmt_tx, marionette_awdl_mgmt_tx, bool, 0600);
++MODULE_PARM_DESC(marionette_awdl_mgmt_tx,
++                "Experimental AWDL vendor action TX; default off");
++#endif
++
++static bool cfg80211_marionette_awdl_action(struct wireless_dev *wdev,
++					 struct cfg80211_mgmt_tx_params *params)
++{
++#ifdef CONFIG_CFG80211_MARIONETTE_AWDL
++	static const u8 bssid[ETH_ALEN] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++	static const u8 prefix[] = { 0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10 };
++	const struct ieee80211_mgmt *mgmt = (const void *)params->buf;
++
++	return READ_ONCE(marionette_awdl_mgmt_tx) &&
++		wdev->iftype == NL80211_IFTYPE_STATION &&
++		params->len >= 24 + 16 &&
++		ieee80211_is_action(mgmt->frame_control) &&
++		ether_addr_equal(mgmt->bssid, bssid) &&
++		!memcmp(params->buf + 24, prefix, sizeof(prefix)) &&
++		(params->buf[30] == 0 || params->buf[30] == 3);
++#else
++	return false;
++#endif
++}
++
+ int cfg80211_mlme_mgmt_tx(struct cfg80211_registered_device *rdev,
+ 			  struct wireless_dev *wdev,
+ 			  struct cfg80211_mgmt_tx_params *params, u64 *cookie)
+@@ -663,7 +691,8 @@ int cfg80211_mlme_mgmt_tx(struct cfg80211_registered_device *rdev,
+ 		return -EINVAL;
+ 
+ 	if (ieee80211_is_action(mgmt->frame_control) &&
+-	    mgmt->u.action.category != WLAN_CATEGORY_PUBLIC) {
++	    mgmt->u.action.category != WLAN_CATEGORY_PUBLIC &&
++	    !cfg80211_marionette_awdl_action(wdev, params)) {
+ 		int err = 0;
+ 
+ 		wdev_lock(wdev);

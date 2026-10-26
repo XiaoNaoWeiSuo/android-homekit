@@ -1,0 +1,24 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] stop mission timer before clearing monitor vdev
+
+The monitor reset path clears mon_pdev->mvdev before asynchronous WMA/SME
+teardown. Stop the MSI polling timer before that clear and outside mon_lock,
+so a callback cannot retain a stale monitor vdev or deadlock on the lock.
+The callback rearm guard from 0030 remains a second race defense. No packet
+format, firmware, or TX behavior changes.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_mon.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_mon.c
+@@ -217,6 +217,12 @@
+ 
+ 	if (!pdev)
+ 		return QDF_STATUS_E_FAILURE;
++
++	/* Stop the mission MSI polling timer before clearing mvdev or entering
++	 * asynchronous WMA/SME teardown. This call is deliberately outside the
++	 * monitor lock: timer callback work may need that lock to drain. */
++	if (soc->intr_mode == DP_INTR_MSI)
++		dp_monitor_vdev_timer_stop(soc);
+ 
+ 	mon_pdev = pdev->monitor_pdev;
+ 

@@ -1,0 +1,26 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] stop mission monitor polling before delayed detach
+
+The mission monitor vdev starts dp_mon_vdev_timer for MSI polling. The
+rejected 0028 teardown deferred the final datapath delete while that timer
+continued to run against a vdev entering logical deletion, and the timer
+then faulted. Stop the timer synchronously at the datapath detach entry for
+monitor vdevs before any WMA/SME delayed teardown. Existing final delete still
+flushes monitor rings; this does not change packet formats or enable TX.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
+@@ -7483,6 +7483,13 @@
+ 
+ 	if (!vdev)
+ 		return QDF_STATUS_E_FAILURE;
++
++	/* Mission monitor starts a polling timer when the vdev is attached.
++	 * Stop it before any delayed WMA/SME teardown can make the vdev
++	 * unreachable; the normal final-delete path still flushes rings. */
++	if (wlan_op_mode_monitor == vdev->opmode &&
++	    soc->intr_mode == DP_INTR_MSI)
++		dp_monitor_vdev_timer_stop(soc);
+ 
+ 	soc->arch_ops.txrx_vdev_detach(soc, vdev);
+ 

@@ -1,0 +1,63 @@
+From: Marionette AirDrop driver research
+Subject: [fuxi ABI] restore SOC-info firmware identifier at the CNSS boundary
+
+Pinned stock cnss2 writes 129 bytes at cnss_soc_info + 0x98 in
+cnss_get_soc_info (0x1484c / 0x14854 / 0x1488c). The public fuxi-t-oss
+header declares only 152 bytes. This overruns the PLD stack allocation
+and its canary during HIF initialization. Stock WLAN also copies the
+same field to pld_soc_info + 0x98 (0x4feea8 / 0x4feeb8 / 0x4feee8).
+
+Append the observed field to both structs, retain every prefix offset,
+and check the size and boundary at compile time. This patch is specific
+to the pinned stock provider; it does not claim a generic CNSS ABI.
+No provider CRC is manufactured or substituted as evidence of layouts.
+
+diff --git a/platform/inc/cnss2.h b/platform/inc/cnss2.h
+--- a/platform/inc/cnss2.h
++++ b/platform/inc/cnss2.h
+@@ -73,6 +73,7 @@
+ 	char fw_build_timestamp[CNSS_MAX_TIMESTAMP_LEN + 1];
+ 	struct cnss_device_version device_version;
+ 	struct cnss_dev_mem_info dev_mem_info[CNSS_MAX_DEV_MEM_NUM];
++	char fw_build_id[129];
+ };
+ 
+ struct cnss_wlan_runtime_ops {
+diff --git a/qcacld-3.0/core/pld/inc/pld_common.h b/qcacld-3.0/core/pld/inc/pld_common.h
+--- a/qcacld-3.0/core/pld/inc/pld_common.h
++++ b/qcacld-3.0/core/pld/inc/pld_common.h
+@@ -427,6 +427,7 @@
+ 	char fw_build_timestamp[PLD_MAX_TIMESTAMP_LEN + 1];
+ 	struct pld_device_version device_version;
+ 	struct pld_dev_mem_info dev_mem_info[PLD_MAX_DEV_MEM_NUM];
++	char fw_build_id[129];
+ };
+ 
+ /**
+diff --git a/qcacld-3.0/core/pld/src/pld_pcie.c b/qcacld-3.0/core/pld/src/pld_pcie.c
+--- a/qcacld-3.0/core/pld/src/pld_pcie.c
++++ b/qcacld-3.0/core/pld/src/pld_pcie.c
+@@ -945,6 +945,14 @@
+ {
+ 	int ret = 0, i;
+ 	struct cnss_soc_info cnss_info = {0};
++
++	/* Pinned fuxi stock cnss_get_soc_info writes through byte 0x118.
++	 * Keep the observed vendor boundary explicit; matching import CRCs
++	 * alone did not catch the public header's missing 129-byte tail. */
++	static_assert(offsetof(struct cnss_soc_info, fw_build_id) == 0x98);
++	static_assert(sizeof(struct cnss_soc_info) == 0x120);
++	static_assert(offsetof(struct pld_soc_info, fw_build_id) == 0x98);
++	static_assert(sizeof(struct pld_soc_info) == 0x120);
+ 
+ 	if (!info)
+ 		return -ENODEV;
+@@ -974,6 +982,8 @@
+ 		info->dev_mem_info[i].start = cnss_info.dev_mem_info[i].start;
+ 		info->dev_mem_info[i].size = cnss_info.dev_mem_info[i].size;
+ 	}
++	strlcpy(info->fw_build_id, cnss_info.fw_build_id,
++		sizeof(info->fw_build_id));
+ 
+ 	return 0;
+ }

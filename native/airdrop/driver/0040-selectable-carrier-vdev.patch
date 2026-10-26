@@ -1,0 +1,121 @@
+Marionette AirDrop driver candidate 0040 -- selectable carrier vdev (first probe of the
+P2P/GO-carrier direction).
+
+Applies on top of 0039 (native/airdrop/driver/0039-monitor-inject-tx-spec.patch).
+File: qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+
+Why
+---
+0037, 0038 and 0039 drove the very same 24 well-formed frames down three
+different host paths and got the very same firmware assert three times:
+
+    mhi mhi_1107_00.01.00: [E][mhi_process_sfr] cmnos_thread_patch.c:1170:0x8
+    Asserted in:0x18dc754:0x1801164, line#2834
+
+The assert PC did not move between a plain vdev-based TCL MSDU, an
+exception MSDU with an all-zero HTT ext2 header, and an exception MSDU whose
+HTT ext2 header carries a complete transmit specification (host_tx_desc_pool,
+power, mcs, nss, preamble, retries, bandwidth).  That rules out every
+"the host did not tell the firmware enough" hypothesis and leaves one
+question open: is the refusal about the frame, or about the vdev it is
+addressed to?
+
+The monitor vdev is the odd one out.  It has no rate control, no peer, and
+no TX descriptor pool of its own -- 0037 had to create that pool by hand
+because the firmware's flow-pool-map never reaches a monitor vdev.  Every
+other vdev on the target (station, SAP, P2P GO, P2P client) transmits data
+frames continuously, so the firmware demonstrably knows how to build a PPDU
+there.
+
+What
+----
+A module parameter selects the vdev that carries an injected frame:
+
+    marionette_awdl_raw_tx_vdev = -1 (default)  monitor adapter's own vdev
+                                0..N            that vdev instead
+
+-1 preserves the behaviour of 0036 to 0039 byte for byte, so the control
+case is unchanged.  A vdev id of 0 or more routes the identical frame,
+identical metadata and identical queue to a vdev the firmware already
+transmits on.  The station is the cheapest probe: it already exists, already
+owns a flow pool, and sits on the channel the monitor was tuned to.
+
+Known cost, measured rather than assumed: the frame is built for AWDL, so
+addr3 is the AWDL BSSID rather than the access point's BSSID and addr1 is the
+peer rather than the AP.  Whether the firmware drops, rewrites or passes such
+a frame through on a station vdev is exactly part of what this measures, and
+the access point may react to it.  The harness still watches the station
+association and the gateway round trip, and the rollback guardian still
+restores the stock stack.
+
+Test harness
+------------
+volatile-stack-test.sh gains the action run-rawtx-sta-vdev, which is
+run-rawtx with marionette_awdl_raw_tx_vdev=0.  The summary prints which vdev
+carried the frames so a log is never ambiguous about it.
+
+wrote /tmp/pre40.c
+@@ -650,6 +650,38 @@
+ MODULE_PARM_DESC(marionette_awdl_raw_tx,
+                 "Experimental AWDL-only monitor data TX; default off");
+ 
++/* Marionette (0040): which vdev carries an injected AWDL data frame.
++ *
++ * 0037/0038/0039 proved the host path is complete and that the firmware
++ * refuses the frame on the monitor vdev with one and the same assert
++ * (mhi_process_sfr cmnos_thread_patch.c:1170 ... line#2834) no matter which
++ * TX metadata the host supplies.  The remaining question is whether the
++ * refusal is about the frame or about the vdev it is addressed to.
++ *
++ * The monitor vdev is the odd one out: it has no rate control, no peer and
++ * no TX descriptor pool of its own (0037 had to create one by hand), so it
++ * looks nothing like a vdev the firmware is willing to build a PPDU on.
++ * Every other vdev on the target -- station, SAP, P2P GO, P2P client -- does
++ * transmit data frames all day long.
++ *
++ * Default (-1) keeps the monitor adapter's own vdev, which is what 0036 to
++ * 0039 used.  A vdev id of 0 or more routes the frame to that vdev instead,
++ * so the very same frame, the very same metadata and the very same queue can
++ * be tried on a vdev the firmware knows how to transmit on.  This is the
++ * P2P/GO-carrier direction in its cheapest form: the station vdev already
++ * exists, already has a flow pool, and is on the channel the monitor was
++ * tuned to.
++ *
++ * Known cost: the frame is built for AWDL (addr3 is the AWDL BSSID, addr1 is
++ * the peer, not the AP), so the access point sees a data frame from us with
++ * a foreign BSSID.  Whether the firmware drops, rewrites or passes that
++ * through is part of what this measures. */
++static int marionette_awdl_raw_tx_vdev = -1;
++module_param_named(marionette_awdl_raw_tx_vdev, marionette_awdl_raw_tx_vdev,
++		   int, 0600);
++MODULE_PARM_DESC(marionette_awdl_raw_tx_vdev,
++		 "vdev id to carry injected AWDL data frames, -1 = monitor adapter's own");
++
+ /* Host submission diagnostics, independent of DP interface statistics.
+  * A successful submission is not a firmware completion or peer receipt. */
+ static atomic_long_t marionette_awdl_submitted = ATOMIC_LONG_INIT(0);
+@@ -733,9 +765,12 @@
+ 	enum QDF_GLOBAL_MODE con_mode;
+ 	u8 *frame;
+ 	unsigned int bytes;
++	uint8_t tx_vdev_id;
+ 
+ 	hdd_dp_ssr_protect();
+ 	adapter = WLAN_HDD_GET_PRIV_PTR(dev);
++	/* Marionette (0040): carrier vdev, see the parameter definition. */
++	tx_vdev_id = adapter->vdev_id;
+ 	/* Only filin's known radiotap layout and plain IPv6 AWDL data frames.
+ 	 * Management frames require a separate, verified WMI submission path. */
+ 	/* Marionette: mission mode is the only global mode in which the
+@@ -798,7 +833,10 @@
+ 	 * HDD can set on this path. */
+ 	metadata.is_tx_sniffer = 1;
+ 	metadata.ppdu_cookie = 1;
+-	skb = cdp_tx_send_exc(soc, adapter->vdev_id, skb, &metadata);
++	/* Marionette (0040): carrier vdev override, see the parameter above. */
++	if (READ_ONCE(marionette_awdl_raw_tx_vdev) >= 0)
++		tx_vdev_id = READ_ONCE(marionette_awdl_raw_tx_vdev);
++	skb = cdp_tx_send_exc(soc, tx_vdev_id, skb, &metadata);
+ 	if (skb)
+ 		goto drop;
+ 	/* Submission counters only. Firmware/OTA completion is still unknown. */

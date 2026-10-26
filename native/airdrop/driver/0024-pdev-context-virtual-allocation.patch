@@ -1,0 +1,60 @@
+From: Marionette AirDrop driver research
+Subject: [fuxi runtime] virtually allocate only the host PDEV preallocation context
+
+0023 could not reach ordinary Wi-Fi or monitor creation: the captured stack
+fails dp_prealloc_init+0x7c, table index 0, allocating 84592 bytes (order:5)
+with ~577MiB total free but no order-5 pages. That entry is DP_PDEV_TYPE,
+not a DMA ring and not the SoC context. Use existing zeroed qdf_mem_valloc
+only for that context and pair qdf_mem_vfree in its owning prealloc deinit.
+Return failed PDEV attachment through dp_context_free_mem, matching normal
+teardown, and unregister its minidump record before returning it to the pool.
+Context get/put retain the same pointer and zero/reuse semantics; DMA coherent,
+multipage descriptor, other context and unaligned ring allocations stay on
+their existing allocators. No reclaim settings, retry loop or HW addresses
+are changed. Verify ordinary data, monitor observation and unloading anew.
+
+diff --git a/qcacld-3.0/core/dp/txrx3.0/dp_txrx.c b/qcacld-3.0/core/dp/txrx3.0/dp_txrx.c
+--- a/qcacld-3.0/core/dp/txrx3.0/dp_txrx.c
++++ b/qcacld-3.0/core/dp/txrx3.0/dp_txrx.c
+@@ -622,7 +622,10 @@
+ 			dp_warn("i %d: context in use while free", i);
+ 
+ 		if (cp->addr) {
+-			qdf_mem_free(cp->addr);
++			if (cp->ctxt_type == DP_PDEV_TYPE)
++				qdf_mem_vfree(cp->addr);
++			else
++				qdf_mem_free(cp->addr);
+ 			cp->addr = NULL;
+ 		}
+ 	}
+@@ -743,7 +746,13 @@
+ 	/*Context pre-alloc*/
+ 	for (i = 0; i < QDF_ARRAY_SIZE(g_dp_context_allocs); i++) {
+ 		cp = &g_dp_context_allocs[i];
+-		cp->addr = qdf_mem_malloc(cp->size);
++		/* The PDEV object is host-only context, not a DMA ring or
++		 * descriptor. Avoid its observed order-5 allocation failure
++		 * after normal phone use fragments physical memory. */
++		if (cp->ctxt_type == DP_PDEV_TYPE)
++			cp->addr = qdf_mem_valloc(cp->size);
++		else
++			cp->addr = qdf_mem_malloc(cp->size);
+ 
+ 		if (qdf_unlikely(!cp->addr) && cp->is_critical) {
+ 			dp_warn("i %d: unable to preallocate %d bytes memory!",
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c b/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
+@@ -5800,7 +5800,10 @@
+ 	wlan_cfg_pdev_detach(pdev->wlan_cfg_ctx);
+ fail1:
+ 	soc->pdev_list[pdev_id] = NULL;
+-	qdf_mem_free(pdev);
++	wlan_minidump_remove(pdev, sizeof(*pdev), soc->ctrl_psoc,
++			     WLAN_MD_DP_PDEV, "dp_pdev");
++	/* Match the allocating context pool and normal detach path. */
++	dp_context_free_mem(soc, DP_PDEV_TYPE, pdev);
+ fail0:
+ 	return QDF_STATUS_E_FAILURE;
+ }

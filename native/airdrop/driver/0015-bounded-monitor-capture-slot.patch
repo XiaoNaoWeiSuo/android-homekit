@@ -1,0 +1,164 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] one bounded monitor slot then synchronous normal RX restore
+
+0014 retained the monitor vdev and ordinary gateway RX (48/48) by restoring
+the normal shared-ring layout, but monitor packet output became zero. Test
+one short capture slot at a time through the existing monitor filter API,
+then restore the normal layout before returning from the sysfs write.
+Use the compiled monitor 1.0 setup/update path directly: the advanced-filter
+CDP callback in this profile is an inline E_INVAL stub, despite being non-NULL.
+Root parameter accepts 1..200 ms only, requires the default-off 0009 gate,
+mission mode, an associated STA and an open driver-owned awdlmon. The vdev
+operation guard and netdev reference cover the synchronous operation; no
+background work/timer survives removal. Restoration is attempted on every
+capture result. RAW TX and all channel policies remain unchanged.
+This is a controlled timing experiment, not the completed AWDL scheduler.
+
+diff --git a/platform/inc/marionette_sta_monitor.h b/platform/inc/marionette_sta_monitor.h
+--- a/platform/inc/marionette_sta_monitor.h
++++ b/platform/inc/marionette_sta_monitor.h
+@@ -3,4 +3,6 @@
+ #define MARIONETTE_STA_MONITOR_H
+ #include <linux/types.h>
+ bool marionette_sta_monitor_enabled(void);
++bool marionette_sta_monitor_capture_enabled(void);
++int marionette_monitor_refresh_filters(void *soc_handle);
+ #endif
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -65,6 +65,7 @@
+ #include "qdf_talloc.h"
+ #include "qdf_trace.h"
+ #include "qdf_types.h"
++#include <cdp_txrx_cmn.h>
+ #include <cdp_txrx_peer_ops.h>
+ #include <cdp_txrx_misc.h>
+ #include <cdp_txrx_stats.h>
+@@ -19785,6 +19786,90 @@
+ 	.get = param_get_int,
+ };
+ 
++#ifdef FEATURE_MONITOR_MODE_SUPPORT
++/* Synchronous bounded capture: every write restores normal RX before return.
++ * There is no delayed work/timer to outlive a vdev or module unload. */
++static bool marionette_capture_phase;
++static unsigned int marionette_capture_ms;
++bool marionette_sta_monitor_capture_enabled(void)
++{
++	return READ_ONCE(marionette_capture_phase);
++}
++
++static int marionette_capture_once_set(const char *value,
++				      const struct kernel_param *parameter)
++{
++	struct net_device *mon_dev;
++	struct hdd_adapter *adapter, *sta;
++	struct hdd_context *hdd_ctx;
++	struct osif_vdev_sync *sync;
++	ol_txrx_soc_handle soc;
++	unsigned int duration;
++	int ret, capture_status, restore_status;
++
++	ret = kstrtouint(value, 0, &duration);
++	if (ret || !duration || duration > 200)
++		return -EINVAL;
++	if (!marionette_sta_monitor_enabled() ||
++	    hdd_get_conparam() != QDF_GLOBAL_MISSION_MODE)
++		return -EOPNOTSUPP;
++	mon_dev = dev_get_by_name(&init_net, "awdlmon");
++	if (!mon_dev)
++		return -ENODEV;
++	if (mon_dev->netdev_ops != &wlan_mon_drv_ops) {
++		ret = -EINVAL;
++		goto put;
++	}
++	ret = osif_vdev_sync_op_start(mon_dev, &sync);
++	if (ret)
++		goto put;
++	adapter = WLAN_HDD_GET_PRIV_PTR(mon_dev);
++	hdd_ctx = WLAN_HDD_GET_CTX(adapter);
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret)
++		goto stop;
++	sta = hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
++	if (!sta || !hdd_cm_is_vdev_associated(sta) ||
++	    !test_bit(DEVICE_IFACE_OPENED, &adapter->event_flags)) {
++		ret = -ENOTCONN;
++		goto stop;
++	}
++	soc = cds_get_context(QDF_MODULE_ID_SOC);
++	if (!soc) {
++		ret = -EOPNOTSUPP;
++		goto stop;
++	}
++	WRITE_ONCE(marionette_capture_phase, true);
++	capture_status = marionette_monitor_refresh_filters(soc);
++	if (QDF_IS_STATUS_SUCCESS(capture_status))
++		msleep(duration);
++	WRITE_ONCE(marionette_capture_phase, false);
++	restore_status = marionette_monitor_refresh_filters(soc);
++	hdd_info("MARIONETTE_CAPTURE_ONCE ms=%u capture=%d restore=%d",
++		 duration, capture_status, restore_status);
++	ret = qdf_status_to_os_return(restore_status);
++	if (!ret)
++		ret = qdf_status_to_os_return(capture_status);
++	if (!ret)
++		marionette_capture_ms = duration;
++stop:
++	osif_vdev_sync_op_stop(sync);
++put:
++	dev_put(mon_dev);
++	return ret;
++}
++static const struct kernel_param_ops marionette_capture_once_ops = {
++	.set = marionette_capture_once_set,
++	.get = param_get_uint,
++};
++module_param_cb(marionette_awdl_capture_ms, &marionette_capture_once_ops,
++		&marionette_capture_ms, 0600);
++MODULE_PARM_DESC(marionette_awdl_capture_ms,
++                "Capture one 1..200 ms monitor RX slot, restoring normal RX before return");
++#else
++bool marionette_sta_monitor_capture_enabled(void) { return false; }
++#endif
++
+ module_param_cb(con_mode, &con_mode_ops, &con_mode,
+ 		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+ 
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+@@ -1016,6 +1016,7 @@
+ 	}
+ 
+ 	if (marionette_sta_monitor_enabled() &&
++	    !marionette_sta_monitor_capture_enabled() &&
+ 	    !soc->wlan_cfg_ctx->rxdma1_enable) {
+ 		/* Monitor config targets RXDMA_BUF on this shared-ring device.
+ 		 * Reapply the normal architecture-specific RX layout/filters so
+@@ -1031,6 +1031,24 @@
+ 	return status;
+ }
+ 
++/* Called only with the monitor vdev operation guard held by the bounded
++ * experiment. Never cache the SoC or queue work across teardown. */
++int marionette_monitor_refresh_filters(void *soc_handle)
++{
++	struct dp_soc *soc = soc_handle;
++	struct dp_pdev *pdev;
++
++	if (!marionette_sta_monitor_enabled() || !soc)
++		return QDF_STATUS_E_NOSUPPORT;
++	pdev = soc->pdev_list[0];
++	if (!pdev || !pdev->monitor_pdev ||
++	    !pdev->monitor_pdev->monitor_configured ||
++	    !pdev->monitor_pdev->mvdev)
++		return QDF_STATUS_E_INVAL;
++	dp_mon_filter_setup_mon_mode_1_0(pdev);
++	return dp_mon_filter_update_1_0(pdev);
++}
++
+ #if defined(WLAN_CFR_ENABLE) && defined(WLAN_ENH_CFR_ENABLE)
+ /*
+  * dp_cfr_filter_1_0() -  Configure HOST RX monitor status ring for CFR

@@ -1,0 +1,161 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] make the firmware RX promiscuous filter a resident toggle
+
+Patch 0020 sends WMI_PDEV_SET_RX_FILTER_PROMISCUOUS_CMDID, which is the only
+lever that can make the firmware hand AWDL action frames to the host at all.
+The stage counters measure the boundary directly:
+
+  marionette_mgmt_rx_wmi=1713   management frames the firmware did deliver
+  marionette_awdl_rx_wmi=0      of those, AWDL frames: none
+  marionette_mon_post_awdl=1020 AWDL frames the monitor vdev did deliver
+
+So the drop is in the firmware, not in the host. LIM, mgmt-txrx and the HDD
+stage counters all sit downstream of it and cannot move until the firmware
+starts delivering. The host side is already in place: patch 0006 registered
+the exact AWDL category/OUI/type/version prefix on the STA vdev, so a frame
+that reaches LIM is forwarded to HDD and on to cfg80211.
+
+0020 fires the command only inside the bounded capture slot, and that slot is
+unreachable: marionette_awdl_capture_ms is read-only at runtime, and loading
+the module with a non-zero value fails init with -ENODEV. The one path that
+could show whether the command works is therefore dead. This patch promotes
+the flag to a resident, root-writable toggle that sends the command directly,
+with no monitor vdev, no capture phase and no channel move - which is also the
+point: the monitor vdev is what costs the station its beacons, so a receive
+path that needs one cannot be resident.
+
+Releasing is always allowed, including while the station is gone, so a session
+can always be cleaned up.
+
+Only the queue result is observable. Whether the firmware acts on the command
+is exactly what this patch exists to find out: with it enabled,
+marionette_awdl_rx_wmi must become non-zero while a peer is transmitting. If
+it stays zero, the firmware ignores the command and the resident receive path
+needs a different lever.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -20005,10 +20005,68 @@ static const struct kernel_param_ops pcie_gen_speed_ops = {
+ /* Synchronous bounded capture: every write restores normal RX before return.
+  * There is no delayed work/timer to outlive a vdev or module unload. */
+ static bool marionette_capture_phase;
++/* Resident firmware RX filter.
++ *
++ * The firmware delivers 1713 management frames to the STA vdev and not one of
++ * them is an AWDL action frame, while the monitor vdev receives 1020 of the
++ * same frames over the same period. That is a firmware filter, so no host
++ * stage counter past WMI can move until it is lifted. WMI_PDEV_SET_RX_FILTER_
++ * PROMISCUOUS_CMDID is the declared lever; this parameter drives it directly
++ * instead of from inside the unreachable capture slot.
++ *
++ * Deliberately independent of the monitor vdev and the capture phase: a
++ * receive path that needs a monitor vdev cannot be resident, because the
++ * monitor vdev costs the station its beacons. No channel is moved, so this
++ * cannot fight policy manager the way the capture slot did.
++ */
+ static bool marionette_awdl_fw_promisc;
+-module_param_named(marionette_awdl_fw_promisc, marionette_awdl_fw_promisc, bool, 0400);
++
++static int marionette_fw_promisc_set(const char *value,
++				     const struct kernel_param *parameter)
++{
++	struct hdd_context *hdd_ctx;
++	void *wmi_handle;
++	u32 pdev_id;
++	bool enable;
++	int ret;
++
++	ret = kstrtobool(value, &enable);
++	if (ret)
++		return ret;
++	if (hdd_get_conparam() != QDF_GLOBAL_MISSION_MODE)
++		return -EOPNOTSUPP;
++	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
++	if (!hdd_ctx)
++		return -EOPNOTSUPP;
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret)
++		return ret;
++	if (!hdd_ctx->pdev)
++		return -ENODEV;
++	wmi_handle = get_wmi_unified_hdl_from_psoc(hdd_ctx->psoc);
++	if (!wmi_handle)
++		return -ENODEV;
++	pdev_id = wlan_objmgr_pdev_get_pdev_id(hdd_ctx->pdev);
++	/* Only send on an edge, so a repeated write cannot stack commands. */
++	if (enable != marionette_awdl_fw_promisc) {
++		ret = marionette_wmi_rx_promiscuous(wmi_handle, pdev_id, enable);
++		if (ret)
++			return qdf_status_to_os_return(ret);
++		marionette_awdl_fw_promisc = enable;
++	}
++	hdd_info("MARIONETTE_FW_PROMISC enable=%d pdev=%u", enable, pdev_id);
++	return 0;
++}
++
++static const struct kernel_param_ops marionette_fw_promisc_ops = {
++	.set = marionette_fw_promisc_set,
++	.get = param_get_bool,
++};
++module_param_cb(marionette_awdl_fw_promisc, &marionette_fw_promisc_ops,
++		&marionette_awdl_fw_promisc, 0600);
+ MODULE_PARM_DESC(marionette_awdl_fw_promisc,
+-                "Experimental standard WMI RX promiscuous filter inside bounded capture slots; default off");
++		"Resident firmware RX promiscuous filter via WMI_PDEV_SET_RX_FILTER_PROMISCUOUS; "
++		"needs an associated station, no monitor vdev, no channel move");
+ static unsigned int marionette_capture_ms;
+ bool marionette_sta_monitor_capture_enabled(void)
+ {
+@@ -20026,9 +20084,6 @@ static int marionette_capture_once_set(const char *value,
+ 	unsigned int duration, target_freq = 0, home_freq;
+ 	enum phy_ch_width home_width;
+ 	int ret, capture_status, restore_status, tune_status = 0, home_status = 0;
+-	void *wmi_handle = NULL;
+-	u32 pdev_id = 0;
+-	int promisc_enable_status = 0, promisc_disable_status = 0;
+ 	char input[32], *duration_text, *separator;
+ 
+ 	if (strscpy(input, value, sizeof(input)) < 0)
+@@ -20079,19 +20134,8 @@ static int marionette_capture_once_set(const char *value,
+ 	home_width = hdd_get_adapter_width(sta);
+ 	if (!target_freq)
+ 		target_freq = home_freq;
+-	if (marionette_awdl_fw_promisc) {
+-		wmi_handle = get_wmi_unified_hdl_from_psoc(hdd_ctx->psoc);
+-		if (!wmi_handle || !hdd_ctx->pdev) {
+-			ret = -ENODEV;
+-			goto stop;
+-		}
+-		pdev_id = wlan_objmgr_pdev_get_pdev_id(hdd_ctx->pdev);
+-		promisc_enable_status = marionette_wmi_rx_promiscuous(
+-					wmi_handle, pdev_id, true);
+-	}
+ 	WRITE_ONCE(marionette_capture_phase, true);
+-	capture_status = QDF_IS_STATUS_SUCCESS(promisc_enable_status) ?
+-		marionette_monitor_refresh_filters(soc) : promisc_enable_status;
++	capture_status = marionette_monitor_refresh_filters(soc);
+ 	if (QDF_IS_STATUS_SUCCESS(capture_status)) {
+ 		if (target_freq != home_freq)
+ 			tune_status = wlan_hdd_set_mon_chan(adapter, target_freq,
+@@ -20102,20 +20146,12 @@ static int marionette_capture_once_set(const char *value,
+ 	/* Restore even after a failed/partial channel request. */
+ 	if (target_freq != home_freq)
+ 		home_status = wlan_hdd_set_mon_chan(adapter, home_freq, home_width);
+-	/* Pair every enable attempt, even if another slot operation failed. */
+-	if (marionette_awdl_fw_promisc)
+-		promisc_disable_status = marionette_wmi_rx_promiscuous(
+-					wmi_handle, pdev_id, false);
+ 	WRITE_ONCE(marionette_capture_phase, false);
+ 	restore_status = marionette_monitor_refresh_filters(soc);
+-	hdd_info("MARIONETTE_CAPTURE_PROMISC_RESULT enable=%d disable=%d",
+-		 promisc_enable_status, promisc_disable_status);
+ 	hdd_info("MARIONETTE_CAPTURE_ONCE freq=%u home=%u ms=%u capture=%d tune=%d home_restore=%d rx_restore=%d",
+ 		 target_freq, home_freq, duration, capture_status, tune_status,
+ 		 home_status, restore_status);
+ 	ret = qdf_status_to_os_return(restore_status);
+-	if (!ret)
+-		ret = qdf_status_to_os_return(promisc_disable_status);
+ 	if (!ret)
+ 		ret = home_status;
+ 	if (!ret)

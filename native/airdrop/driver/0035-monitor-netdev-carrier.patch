@@ -1,0 +1,23 @@
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index ec2f9c6..d6b12b5 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -2872,6 +2872,18 @@ static int __hdd_mon_open(struct net_device *dev)
+ 						     PLD_BUS_WIDTH_VERY_HIGH);
+ 	}
+ 
++	/* Marionette: a monitor netdev has no physical carrier, so
++	 * dev_activate() (net/core/dev.c: __dev_open() calls it right
++	 * after ndo_open) returns at "if (!netif_carrier_ok(dev)) return;"
++	 * before it ever runs transition_one_qdisc().  Every tx queue then
++	 * keeps qdisc == &noop_qdisc, and __dev_xmit_skb() hands the frame to
++	 * noop_enqueue(), which drops it: the skb never reaches
++	 * ndo_start_xmit, no dev counter moves and nothing is logged.  This is
++	 * what mac80211 does when it opens an NL80211_IFTYPE_MONITOR interface
++	 * (net/mac80211/iface.c), and linkwatch_do_dev() re-runs
++	 * dev_activate() on the carrier event too, so this also repairs a
++	 * monitor interface that came up before its vdev did. */
++	netif_carrier_on(dev);
+ 	return ret;
+ }
+ 

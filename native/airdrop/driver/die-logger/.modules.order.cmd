@@ -1,0 +1,1 @@
+cmd_/Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/modules.order := {   echo /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/marionette_die_logger.ko; :; } | awk '!x[$$0]++' - > /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/modules.order

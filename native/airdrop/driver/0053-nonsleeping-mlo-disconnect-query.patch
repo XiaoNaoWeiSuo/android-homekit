@@ -1,0 +1,42 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] mlo: query disconnect flag without a sleeping lock
+
+Observed on candidate 0052 during peer-unmap: ce_tasklet -> dp_tx_delete_flow_pool
+-> policy_mgr_is_mlo_sta_disconnected -> qdf_mutex_acquire/release WARN.
+LTO inlines wlan_vdev_mlme_is_mlo_vdev into that policy function.
+
+Snapshot the aligned capability word for this read-only query. Preserve the
+MLD presence check and all per-link CM state checks. Do not change structure
+layout, lock types, refcounts, or the global MLO flag/accounting writer APIs.
+The DP policy wrapper already owns WLAN_POLICY_MGR_ID on the queried vdev.
+This is not a fix for the separate monitor DELETE-before-STOP warning.
+
+--- a/qca-wifi-host-cmn/umac/mlo_mgr/src/wlan_mlo_mgr_sta.c
++++ b/qca-wifi-host-cmn/umac/mlo_mgr/src/wlan_mlo_mgr_sta.c
+@@ -19,6 +19,7 @@
+  * DOC: contains MLO manager STA related api's
+  */
+ 
++#include <linux/compiler.h>
+ #include <wlan_cmn.h>
+ #include <wlan_mlo_mgr_sta.h>
+ #include <wlan_cm_public_struct.h>
+@@ -125,7 +126,17 @@
+ 	struct wlan_mlo_dev_context *mlo_dev_ctx = vdev->mlo_dev_ctx;
+ 	uint8_t i = 0;
+ 
+-	if (!mlo_dev_ctx || !wlan_vdev_mlme_is_mlo_vdev(vdev))
++	/*
++	 * DP calls this query from the peer-unmap tasklet while holding a
++	 * referenced vdev. The public is_mlo_vdev accessor takes a mutex to
++	 * serialize flag updates with pdev MLO accounting, which cannot run
++	 * here. This query needs only the flag snapshot, not that accounting.
++	 * Its lock never protected the subsequent per-link CM state reads.
++	 * Keep the existing MLD/link-state decision; do not bypass live MLO.
++	 */
++	if (!mlo_dev_ctx ||
++	    !(READ_ONCE(vdev->vdev_mlme.vdev_feat_ext2_caps) &
++	      WLAN_VDEV_FEXT2_MLO))
+ 		return true;
+ 
+ 	for (i =  0; i < WLAN_UMAC_MLO_MAX_VDEVS; i++) {

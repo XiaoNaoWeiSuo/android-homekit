@@ -1,0 +1,69 @@
+{
+  "wlan": {
+    "repository": "https://github.com/MiCode/vendor_qcom_opensource_wlan",
+    "branch": "fuxi-t-oss",
+    "commit": "518147fd7e0199758efe9bd96a22c9c2ea30bcd9"
+  },
+  "vendor_kernel": {
+    "repository": "https://github.com/MiCode/Xiaomi_Kernel_OpenSource",
+    "branch": "fuxi-t-oss",
+    "commit": "7fad87dc178d09489b74a714e4a525d56f546855"
+  },
+  "supplementary_hwid": {
+    "repository": "https://github.com/LineageOS/android_kernel_xiaomi_sm8550",
+    "commit": "5b62347a34988bd617df057a5cad5478cb82a2a0",
+    "path": "drivers/misc/hwid",
+    "reason": "MiCode kernel Kconfig references this absent subtree; supplement used only in the isolated build, not installed on the phone"
+  },
+  "clang": {
+    "url": "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r450784e.tar.gz",
+    "archive_sha256": "7c748b8d5c219f05be1efc9eed2771b837747a0402bde1507b09c008b3705e62",
+    "version": "Android (8508608, based on r450784e) clang version 14.0.7"
+  },
+  "stock_module": {
+    "path": "/vendor_dlkm/lib/modules/qca_cld3_kiwi_v2.ko",
+    "sha256": "75a937c19a6f0461086ef9ebd3c69191a4531a5a5013fde9d4603440a99f9bb8",
+    "vermagic": "5.15.41 SMP preempt mod_unload modversions aarch64",
+    "scmversion": "g939d76a86982"
+  },
+  "running_kernel": "5.15.74-android13-8-00049-g8945ccdb2203-ab9500309",
+  "recovered_hwid_constant": {
+    "name": "HARDWARE_PROJECT_M2",
+    "value": 1,
+    "evidence": "Pinned stock module .text: 0x31f32c CALL26 get_hw_version_platform; 0x31f330 mov w21,w0; 0x31f4c4 cmp w21,#1; 0x31f4d4 csel w9,w9,wzr,eq preserves sbs_enable only for project 1. This matches the pinned source policy_mgr_init_cfg M2 branch. Device reports project 2."
+  },
+  "running_gki_artifacts": {
+    "build_id": "9500309",
+    "kernel_commit": "8945ccdb22035c2c086018799e7c61c29319ad31",
+    "base_url": "https://ci.android.com/builds/submitted/9500309/kernel_aarch64/latest/raw/",
+    "files": {
+      "vmlinux.symvers": "69a07e461a04d69517cb90cc7fc4b5be782f6d61600be916c0c3a6912ea58ca0",
+      "manifest_9500309.xml": "2e3a618ecdaafeaa388e43c4d1e34ea564f526ee16338c1015469d97f8119d28",
+      "kernel-headers.tar.gz": "7cc87ff6702e47f60e8d11c8316ee5b05245c610b1ecd60db029151e980536bd"
+    }
+  },
+  "vendor_boot_backup": {
+    "slot": "a",
+    "sha256": "c9905712eb2874fb9c8ff32a49834e09cc1b7741f45a4d4168f2417aebea96b4",
+    "size": 100663296,
+    "purpose": "Read-only extraction of stock hwid.ko export symbols; no partition writes"
+  },
+  "device_build_integration": {
+    "profile": "kiwi_v2",
+    "module_name": "kiwi_v2",
+    "devname": "kiwi_v2",
+    "wlan_ctrl_name": "wlan",
+    "evidence": "Stock module has wlan_hdd_state_ctrl_param_write and device exposes /dev/wlan and /sys/class/wlan. Android.mk supplies WLAN_CTRL_NAME from WIFI_DRIVER_STATE_CTRL_PARAM. First candidate omitted it. Stock and candidate both use pld_pcie_kiwi_v2 and kiwi_v2 firmware/INI prefix."
+  },
+  "running_wlan_firmware": {
+    "reported_fw_version": "0x1003003a",
+    "reported_build": "WLAN.HMT.1.0.c2-00058.3-QCAHMTSWPL_V1.0_V2.0_SILICONZ-1.22499.27",
+    "reported_timestamp": "2023-02-06 06:09",
+    "loaded_path": "/vendor/firmware_mnt/image/kiwi/amss20.bin",
+    "loaded_path_evidence": "ueventd kiwi/amss20.bin requests in live kernel capture",
+    "amss20_sha256": "1d05cd1862b04267a7f1414a44607860a5bd1fed2079169a885e09794c3a7837",
+    "Data20_sha256": "ac070447c2e02e8735904d45605bf2926198db4a1bdd4f398cb54450dc9915e8b",
+    "access": "Read-only extraction to ignored build research artifacts; no firmware image changes",
+    "dictionary_matches_firmware_build_verified": false
+  }
+}

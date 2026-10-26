@@ -1,0 +1,24 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] do not rearm monitor timer after synchronous stop
+
+The monitor polling callback rearmed its QDF timer unconditionally at its
+exit. A concurrent qdf_timer_sync_cancel could clear MON_VDEV_TIMER_RUNNING
+while the callback was executing, after which the callback requeued itself and
+touched monitor state during delayed vdev teardown. Check the running bit at
+the rearm point. This is limited to timer lifecycle; no RX/TX format or
+firmware behavior changes.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_1.0.c
+@@ -534,6 +534,11 @@
+ 	}
+ 
+ budget_done:
++	/* A synchronous stop can race with the callback already executing.
++	 * Do not re-arm after the stop cleared RUNNING; otherwise a delayed
++	 * monitor teardown leaves this callback touching freed monitor state. */
++	if (!(mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_RUNNING))
++		return;
+ 	if (yield == DP_TIMER_WORK_EXHAUST ||
+ 	    yield == DP_TIMER_TIME_EXHAUST)
+ 		qdf_timer_mod(&mon_soc->mon_vdev_timer, 1);

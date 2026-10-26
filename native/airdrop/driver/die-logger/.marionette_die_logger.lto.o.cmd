@@ -1,0 +1,1 @@
+cmd_/Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/marionette_die_logger.lto.o := ld.lld -EL  -maarch64elf -z norelro -mllvm -import-instr-limit=5   -r -o /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/marionette_die_logger.lto.o  --whole-archive /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/marionette_die_logger.o

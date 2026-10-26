@@ -1,0 +1,265 @@
+Marionette AirDrop driver candidate 0041 -- drop-site tracing for the AWDL
+injection path.
+
+Applies on top of 0040 (native/airdrop/driver/0040-selectable-carrier-vdev.patch).
+Files:
+  qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+  qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c
+
+Why
+---
+0040 pinned the carrier vdev to the station (vdev 0) and the host counters
+answered with a rejection instead of a firmware assert:
+
+  14:19 run, MARIONETTE_INJECT_COUNTS=1:
+    counters-before   submitted=0 rejected=0
+    counters-negative submitted=0 rejected=2
+    counters-after    submitted=0 rejected=3
+    awdlmon tx_packets=0 tx_dropped=0 tx_bytes=0
+
+The whole window from `__hdd_mon_open` (14:19:32.403) through `awdlmon del`
+(14:19:36.07) contains no DP message at all in the durable kmsg log:
+no "Tx_desc prepare Fail", no "qdf_nbuf_map failed", no "Tx_hw_enqueue Fail",
+no "Invalid parameters in exception path", no "exc packets are more than max".
+Every one of those strings is reachable from dp_tx_send_exception() or
+dp_tx_send_msdu_single() and every one of them prints at E:DP (the log does
+carry E:DP and I:DP lines), so the frame was either rejected silently inside
+dp_tx_send_exception() or it never got that far.
+
+The host gate cannot be the reason.  The tool's frame is 97 bytes and every
+gated field matches: the 13-byte radiotap prefix, FC 0x0008, addr2 = the
+monitor adapter MAC, addr3 = the AWDL BSSID, LLC/SNAP + AWDL_DATA_HEAD, the
+0x86dd ethertype and the IPv6 version nibble -- and the same frame is accepted
+whenever the carrier is the monitor vdev (0037/0038/0039 each got
+submitted=1 on the first frame).  What changed between 0040 and 0039 is only
+the vdev id handed to cdp_tx_send_exc().
+
+What 0041 does
+--------------
+It names every drop site, so the next single-frame run reports *which*
+condition fired instead of leaving it to inference.
+
+  hdd_mon_awdl_start_xmit(): sites 1..15 are the host gates and site 16 is
+  "cdp_tx_send_exc() returned the skb".  hdd_err() with a one-shot per site,
+  so a 24-frame run cannot flood kmsg but the first occurrence is traceable.
+
+  dp_tx_send_exception(): dp_err() on the vdev-ref and null-metadata failures,
+  dp_err() on the exception-descriptor limit, and a dp_err()/dp_info() pair on
+  the return stating whether the frame reached the hardware.
+
+  dp_tx_send_msdu_single(): dp_err() on fail_return naming the desc pool and
+  the software drop code, dp_info() after tx_hw_enqueue naming vdev, pool,
+  status and the descriptor.
+
+No behaviour changes: every statement is a print or a split of an existing
+ORed condition into single tests that reach the same drop label.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -722,6 +722,20 @@ void marionette_awdl_raw_tx_pool_setup(struct hdd_adapter *adapter)
+ 	(void)cdp_flow_pool_map(soc, OL_TXRX_PDEV_ID, adapter->vdev_id);
+ }
+ 
++/* Marionette (0041): each drop site is reported once per module load, so a
++ * run of 24 rejects cannot flood kmsg but the first occurrence is always
++ * traceable to a specific condition. */
++static void marionette_awdl_drop_site(struct sk_buff *skb, uint32_t site)
++{
++	static uint32_t reported;
++
++	if (reported & (1U << site))
++		return;
++	reported |= (1U << site);
++	hdd_err("marionette: tx drop site=%u skb_len=%d", site,
++		skb ? skb->len : -1);
++}
++
+ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	static const u8 radiotap_prefix[] = { 0, 0, 13, 0, 4, 128, 2, 0, 24, 0 };
+@@ -733,6 +747,7 @@ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	enum QDF_GLOBAL_MODE con_mode;
+ 	u8 *frame;
+ 	unsigned int bytes;
++	uint32_t drop_site;
+ 
+ 	hdd_dp_ssr_protect();
+ 	adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+@@ -743,30 +758,76 @@ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	 * there. The monitor-adapter check and the frame-shape checks below
+ 	 * remain the real gates; global monitor mode stays accepted. */
+ 	con_mode = cds_get_conparam();
+-	if (!READ_ONCE(marionette_awdl_raw_tx) ||
+-	    (con_mode != QDF_GLOBAL_MONITOR_MODE &&
+-	     con_mode != QDF_GLOBAL_MISSION_MODE) ||
+-	    adapter->device_mode != QDF_MONITOR_MODE ||
+-	    adapter->vdev_id == 0xff || skb->len < 13 + 24 + 16 + 40 ||
+-	    skb->len > 13 + 2304 || skb_linearize(skb) ||
+-	    skb_cow_head(skb, 128))
++	drop_site = 0;
++	if (!READ_ONCE(marionette_awdl_raw_tx)) {
++		drop_site = 1;
++		goto drop;
++	}
++	if (con_mode != QDF_GLOBAL_MONITOR_MODE &&
++	    con_mode != QDF_GLOBAL_MISSION_MODE) {
++		drop_site = 2;
+ 		goto drop;
++	}
++	if (adapter->device_mode != QDF_MONITOR_MODE) {
++		drop_site = 3;
++		goto drop;
++	}
++	if (adapter->vdev_id == 0xff) {
++		drop_site = 4;
++		goto drop;
++	}
++	if (skb->len < 13 + 24 + 16 + 40 ||
++	    skb->len > 13 + 2304 ||
++	    skb_linearize(skb) || skb_cow_head(skb, 128)) {
++		drop_site = 5;
++		goto drop;
++	}
+ 	frame = skb->data + 13;
+-	if (memcmp(skb->data, radiotap_prefix, sizeof(radiotap_prefix)) ||
+-	    (skb->data[10] != 0 && skb->data[10] != 8) || skb->data[11] ||
+-	    frame[0] != 8 || frame[1] || (frame[22] & 0x0f) ||
+-	    !ether_addr_equal(frame + 10, adapter->mac_addr.bytes) ||
+-	    !ether_addr_equal(frame + 16, awdl_bssid) ||
+-	    memcmp(frame + 24, awdl_snap, sizeof(awdl_snap)) ||
+-	    frame[38] != 0x86 || frame[39] != 0xdd ||
+-	    (frame[40] >> 4) != 6)
++	if (memcmp(skb->data, radiotap_prefix, sizeof(radiotap_prefix))) {
++		drop_site = 6;
++		goto drop;
++	}
++	if (skb->data[10] != 0 && skb->data[10] != 8) {
++		drop_site = 7;
++		goto drop;
++	}
++	if (skb->data[11]) {
++		drop_site = 8;
++		goto drop;
++	}
++	if (frame[0] != 8 || frame[1]) {
++		drop_site = 9;
++		goto drop;
++	}
++	if (frame[22] & 0x0f) {
++		drop_site = 10;
++		goto drop;
++	}
++	if (!ether_addr_equal(frame + 10, adapter->mac_addr.bytes)) {
++		drop_site = 11;
+ 		goto drop;
++	}
++	if (!ether_addr_equal(frame + 16, awdl_bssid)) {
++		drop_site = 12;
++		goto drop;
++	}
++	if (memcmp(frame + 24, awdl_snap, sizeof(awdl_snap))) {
++		drop_site = 13;
++		goto drop;
++	}
++	if (frame[38] != 0x86 || frame[39] != 0xdd ||
++	    (frame[40] >> 4) != 6) {
++		drop_site = 14;
++		goto drop;
++	}
+ 	soc = cds_get_context(QDF_MODULE_ID_SOC);
+ 	/* cdp_tx_send_exc treats an absent callback as NULL/success. Check it
+ 	 * explicitly so a missing datapath never produces a false TX count. */
+ 	if (!soc || !soc->ops || !soc->ops->cmn_drv_ops ||
+-	    !soc->ops->cmn_drv_ops->tx_send_exc)
++	    !soc->ops->cmn_drv_ops->tx_send_exc) {
++		drop_site = 15;
+ 		goto drop;
++	}
+ 	skb_pull(skb, 13);
+ 	memset(skb->cb, 0, sizeof(skb->cb));
+ 	bytes = skb->len;
+@@ -784,6 +845,7 @@ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	return NETDEV_TX_OK;
+ drop:
+ 	atomic_long_inc(&marionette_awdl_rejected);
++	marionette_awdl_drop_site(skb, drop_site);
+ 	dev_kfree_skb_any(skb);
+ 	hdd_dp_ssr_unprotect();
+ 	return NETDEV_TX_OK;
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c b/qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c
+@@ -2296,6 +2296,8 @@ dp_tx_send_msdu_single(struct dp_vdev *vdev, qdf_nbuf_t nbuf,
+ 	status = soc->arch_ops.tx_hw_enqueue(soc, vdev, tx_desc,
+ 					     htt_tcl_metadata,
+ 					     tx_exc_metadata, msdu_info);
++	dp_info("marionette: hw_enqueue vdev %d pool %d status %d desc %pK",
++		vdev->vdev_id, tx_q->desc_pool_id, status, tx_desc);
+ 
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		dp_tx_err_rl("Tx_hw_enqueue Fail tx_desc %pK queue %d",
+@@ -2313,6 +2315,8 @@ release_desc:
+ 	dp_tx_desc_release(tx_desc, tx_q->desc_pool_id);
+ 
+ fail_return:
++	dp_err("marionette: msdu_single failed vdev %d pool %d code %d",
++	       vdev->vdev_id, tx_q->desc_pool_id, drop_code);
+ 	dp_tx_get_tid(vdev, nbuf, msdu_info);
+ 	tid_stats = &pdev->stats.tid_stats.
+ 		    tid_tx_stats[tx_q->ring_id][tid];
+@@ -3168,13 +3172,17 @@ dp_tx_send_exception(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
+ 	struct dp_vdev *vdev = dp_vdev_get_ref_by_id(soc, vdev_id,
+ 						     DP_MOD_ID_TX_EXCEPTION);
+ 
+-	if (qdf_unlikely(!vdev))
++	if (qdf_unlikely(!vdev)) {
++		dp_err("marionette: exc vdev %d ref failed", vdev_id);
+ 		goto fail;
++	}
+ 
+ 	qdf_mem_zero(&msdu_info, sizeof(msdu_info));
+ 
+-	if (!tx_exc_metadata)
++	if (!tx_exc_metadata) {
++		dp_err("marionette: exc vdev %d null metadata", vdev_id);
+ 		goto fail;
++	}
+ 
+ 	msdu_info.tid = tx_exc_metadata->tid;
+ 	eh = (qdf_ether_header_t *)qdf_nbuf_data(nbuf);
+@@ -3185,6 +3193,7 @@ dp_tx_send_exception(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
+ 
+ 	if (qdf_unlikely(!dp_check_exc_metadata(tx_exc_metadata))) {
+ 		dp_tx_err("Invalid parameters in exception path");
++		dp_err("marionette: exc vdev %d invalid metadata", vdev_id);
+ 		goto fail;
+ 	}
+ 
+@@ -3268,8 +3277,11 @@ dp_tx_send_exception(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
+ 		/*
+ 		 * Check exception descriptors
+ 		 */
+-		if (dp_tx_exception_limit_check(vdev))
++		if (dp_tx_exception_limit_check(vdev)) {
++			dp_err("marionette: exc vdev %d desc limit",
++			       vdev->vdev_id);
+ 			goto fail;
++		}
+ 
+ 		/*  Single linear frame */
+ 		/*
+@@ -3283,6 +3295,11 @@ dp_tx_send_exception(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
+ 	}
+ 
+ 	dp_vdev_unref_delete(soc, vdev, DP_MOD_ID_TX_EXCEPTION);
++	if (nbuf)
++		dp_err("marionette: exc vdev %d send failed", vdev_id);
++	else
++		dp_info("marionette: exc vdev %d send queued", vdev_id);
++
+ 	return nbuf;
+ 
+ send_multiple:

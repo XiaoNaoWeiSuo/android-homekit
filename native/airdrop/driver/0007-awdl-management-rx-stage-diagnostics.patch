@@ -1,0 +1,150 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] observe WMI, LIM and HDD AWDL RX boundaries
+
+Apply after 0006. While its load-time RX experiment flag is enabled, count
+all management arrivals and exact AWDL signatures at three existing receive
+boundaries. Counters are root-read-only and atomic. No packet contents are
+logged, no ownership or forwarding changes, and no filters are relaxed.
+WMI absence is not proof of absent RF traffic; use the separate stock monitor
+witness to check the same nearby source and social channels.
+
+diff --git a/platform/inc/marionette_awdl_rx_diagnostics.h b/platform/inc/marionette_awdl_rx_diagnostics.h
+new file mode 100644
+--- /dev/null
++++ b/platform/inc/marionette_awdl_rx_diagnostics.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MARIONETTE_AWDL_RX_DIAGNOSTICS_H
++#define MARIONETTE_AWDL_RX_DIAGNOSTICS_H
++#include <linux/types.h>
++enum marionette_awdl_rx_stage {
++	MARIONETTE_AWDL_RX_WMI,
++	MARIONETTE_AWDL_RX_LIM,
++	MARIONETTE_AWDL_RX_HDD,
++	MARIONETTE_AWDL_RX_STAGE_COUNT,
++};
++/* Observation only; never changes ownership or forwards a packet. */
++void marionette_awdl_rx_observe(enum marionette_awdl_rx_stage stage,
++			      const u8 *frame, u32 len);
++#endif
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -24,6 +24,7 @@
+  *
+  */
+ 
++#include "marionette_awdl_rx_diagnostics.h"
+ #include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+@@ -19088,6 +19089,48 @@
+ 	0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10
+ };
+ 
++/* Default-off RX-stage counters, shared inside this WLAN module only. */
++static atomic_long_t marionette_mgmt_rx_stages[MARIONETTE_AWDL_RX_STAGE_COUNT];
++static atomic_long_t marionette_awdl_rx_stages[MARIONETTE_AWDL_RX_STAGE_COUNT];
++static int marionette_rx_counter_get(char *buffer,
++				     const struct kernel_param *parameter)
++{
++	return scnprintf(buffer, PAGE_SIZE, "%ld\n",
++			 atomic_long_read(parameter->arg));
++}
++static const struct kernel_param_ops marionette_rx_counter_ops = {
++	.get = marionette_rx_counter_get,
++};
++module_param_cb(marionette_mgmt_rx_wmi, &marionette_rx_counter_ops,
++		&marionette_mgmt_rx_stages[0], 0400);
++module_param_cb(marionette_awdl_rx_wmi, &marionette_rx_counter_ops,
++		&marionette_awdl_rx_stages[0], 0400);
++module_param_cb(marionette_mgmt_rx_lim, &marionette_rx_counter_ops,
++		&marionette_mgmt_rx_stages[1], 0400);
++module_param_cb(marionette_awdl_rx_lim, &marionette_rx_counter_ops,
++		&marionette_awdl_rx_stages[1], 0400);
++module_param_cb(marionette_mgmt_rx_hdd, &marionette_rx_counter_ops,
++		&marionette_mgmt_rx_stages[2], 0400);
++module_param_cb(marionette_awdl_rx_hdd, &marionette_rx_counter_ops,
++		&marionette_awdl_rx_stages[2], 0400);
++
++void marionette_awdl_rx_observe(enum marionette_awdl_rx_stage stage,
++			      const u8 *frame, u32 len)
++{
++	static const u8 bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
++
++	if (!marionette_awdl_mgmt_rx || stage >= MARIONETTE_AWDL_RX_STAGE_COUNT ||
++	    !frame || len < 24)
++		return;
++	atomic_long_inc(&marionette_mgmt_rx_stages[stage]);
++	if (len >= 40 && frame[0] == 0xd0 && !(frame[1] & 0x40) &&
++	    !memcmp(frame + 16, bssid, sizeof(bssid)) &&
++	    !memcmp(frame + 24, marionette_awdl_action_prefix,
++		    sizeof(marionette_awdl_action_prefix)) &&
++	    (frame[30] == 0 || frame[30] == 3))
++		atomic_long_inc(&marionette_awdl_rx_stages[stage]);
++}
++
+ /* This function registers for all frame which supplicant is interested in */
+ int wlan_hdd_cfg80211_register_frames(struct hdd_adapter *adapter)
+ {
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+@@ -25,6 +25,7 @@
+  *
+  */
+ 
++#include "marionette_awdl_rx_diagnostics.h"
+ #include "osif_sync.h"
+ #include <wlan_hdd_includes.h>
+ #include <wlan_hdd_hostapd.h>
+@@ -1083,6 +1084,8 @@
+ 		hdd_err("pbFrames is NULL");
+ 		return;
+ 	}
++
++	marionette_awdl_rx_observe(MARIONETTE_AWDL_RX_HDD, pb_frames, frm_len);
+ 
+ 	type = WLAN_HDD_GET_TYPE_FRM_FC(pb_frames[0]);
+ 	sub_type = WLAN_HDD_GET_SUBTYPE_FRM_FC(pb_frames[0]);
+diff --git a/qcacld-3.0/core/wma/src/wma_mgmt.c b/qcacld-3.0/core/wma/src/wma_mgmt.c
+--- a/qcacld-3.0/core/wma/src/wma_mgmt.c
++++ b/qcacld-3.0/core/wma/src/wma_mgmt.c
+@@ -25,6 +25,7 @@
+ 
+ /* Header files */
+ 
++#include "marionette_awdl_rx_diagnostics.h"
+ #include "wma.h"
+ #include "wma_api.h"
+ #include "cds_api.h"
+@@ -3868,6 +3869,9 @@
+ 		return -EINVAL;
+ 	}
+ 
++	marionette_awdl_rx_observe(MARIONETTE_AWDL_RX_WMI, bufp,
++				  mgmt_rx_params->buf_len);
++
+ 	if (!mgmt_rx_params->chan_freq) {
+ 		/*
+ 		 * It indicates that FW is legacy and is operating on
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_process_message_queue.c b/qcacld-3.0/core/mac/src/pe/lim/lim_process_message_queue.c
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_process_message_queue.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_process_message_queue.c
+@@ -27,6 +27,7 @@
+  * --------------------------------------------------------------------
+  *
+  */
++#include "marionette_awdl_rx_diagnostics.h"
+ #include "cds_api.h"
+ #include "wni_api.h"
+ #include "wma_types.h"
+@@ -1077,6 +1078,8 @@
+ 	hdr = WMA_GET_RX_MAC_HEADER(buff_desc);
+ 	fc = hdr->fc;
+ 	frm_type = (fc.type << 2) | (fc.subType << 4);
++	marionette_awdl_rx_observe(MARIONETTE_AWDL_RX_LIM, (const u8 *)hdr,
++		WMA_GET_RX_PAYLOAD_LEN(buff_desc) + sizeof(*hdr));
+ 	body = WMA_GET_RX_MPDU_DATA(buff_desc);
+ 	action_hdr = (tpSirMacActionFrameHdr)body;
+ 	frm_len = WMA_GET_RX_PAYLOAD_LEN(buff_desc);

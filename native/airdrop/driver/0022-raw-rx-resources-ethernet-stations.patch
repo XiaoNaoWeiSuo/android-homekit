@@ -1,0 +1,126 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] compare RAW firmware RX resources with Ethernet STA vdevs
+
+0021 explicitly configured monitor RX_DECAP RAW through the existing vdev
+MLME/DP/WMI path, but still delivered no action/AWDL. Global monitor mode also
+changes the earlier firmware resource RX decap default from Ethernet to RAW.
+Under a new default-off load-time flag plus the existing STA-monitor gate,
+use that same declared RAW resource value while keeping mission mode. Set
+every STA vdev (including internal links) explicitly to Ethernet through the
+same per-vdev API before association. Ordinary Wi-Fi is a prerequisite test.
+No change to descriptor layouts, channel/regulatory checks, TX or firmware
+images. This compares a documented initialization difference; actual mixed
+format support and receipt remain unproven and require volatile rollback.
+
+diff --git a/platform/inc/marionette_rx_resources.h b/platform/inc/marionette_rx_resources.h
+new file mode 100644
+--- /dev/null
++++ b/platform/inc/marionette_rx_resources.h
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MARIONETTE_RX_RESOURCES_H
++#define MARIONETTE_RX_RESOURCES_H
++#include <linux/types.h>
++bool marionette_raw_rx_resources_enabled(void);
++#endif
+diff --git a/qcacld-3.0/core/wma/src/wma_main.c b/qcacld-3.0/core/wma/src/wma_main.c
+--- a/qcacld-3.0/core/wma/src/wma_main.c
++++ b/qcacld-3.0/core/wma/src/wma_main.c
+@@ -26,6 +26,9 @@
+ 
+ /* Header files */
+ 
++#include <linux/module.h>
++#include "marionette_rx_resources.h"
++#include "marionette_sta_monitor.h"
+ #include "wma.h"
+ #include "wma_api.h"
+ #include "cds_api.h"
+@@ -550,6 +553,16 @@
+  *
+  * Return: none
+  */
++static bool marionette_awdl_raw_resources;
++module_param_named(marionette_awdl_raw_resources, marionette_awdl_raw_resources,
++		   bool, 0400);
++MODULE_PARM_DESC(marionette_awdl_raw_resources,
++                "Experimental RAW RX firmware resources with Ethernet STA vdevs; default off");
++bool marionette_raw_rx_resources_enabled(void)
++{
++	return marionette_awdl_raw_resources && marionette_sta_monitor_enabled();
++}
++
+ static void wma_set_default_tgt_config(tp_wma_handle wma_handle,
+ 				       target_resource_config *tgt_cfg,
+ 				       struct cds_config_info *cds_cfg)
+@@ -630,8 +643,12 @@
+ 			    &tgt_cfg->max_ndi);
+ 
+ 	con_mode = cds_get_conparam();
+-	if (con_mode == QDF_GLOBAL_MONITOR_MODE)
++	if (con_mode == QDF_GLOBAL_MONITOR_MODE ||
++	    marionette_raw_rx_resources_enabled())
+ 		tgt_cfg->rx_decap_mode = CFG_TGT_RX_DECAP_MODE_RAW;
++	if (marionette_raw_rx_resources_enabled())
++		wma_info("MARIONETTE_RAW_RX_RESOURCES rx_decap=%u con_mode=%u",
++			 tgt_cfg->rx_decap_mode, con_mode);
+ 
+ 	if (con_mode == QDF_GLOBAL_FTM_MODE) {
+ 		tgt_cfg->num_offload_peers = 0;
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ /* Include Files */
++#include "marionette_rx_resources.h"
+ #include "wlan_vdev_mgr_utils_api.h"
+ #include "marionette_wmi_rx_filter.h"
+ #include "marionette_sta_monitor.h"
+@@ -12895,6 +12896,34 @@
+  *
+  * Return: 0 on success or errno on failure.
+  */
++/* Set each STA vdev, including internal link adapters, explicitly to
++ * Ethernet before association when RAW resource defaults are being tested. */
++static int marionette_set_station_ethernet_rx(struct hdd_adapter *adapter)
++{
++	struct wlan_objmgr_vdev *vdev;
++	struct vdev_mlme_obj *mlme;
++	struct wlan_vdev_mgr_cfg config = { .value = htt_cmn_pkt_type_ethernet };
++	QDF_STATUS status;
++
++	if (!marionette_raw_rx_resources_enabled() ||
++	    adapter->device_mode != QDF_STA_MODE)
++		return 0;
++	vdev = hdd_objmgr_get_vdev_by_user(adapter, WLAN_OSIF_P2P_ID);
++	if (!vdev)
++		return -ENODEV;
++	mlme = wlan_vdev_mlme_get_cmpt_obj(vdev);
++	if (!mlme) {
++		hdd_objmgr_put_vdev_by_user(vdev, WLAN_OSIF_P2P_ID);
++		return -ENODEV;
++	}
++	status = wlan_util_vdev_mlme_set_param(mlme,
++				WLAN_MLME_CFG_RX_DECAP_TYPE, config);
++	hdd_info("MARIONETTE_STA_ETHERNET_RX vdev=%u type=%u queued_status=%u",
++		 adapter->vdev_id, config.value, status);
++	hdd_objmgr_put_vdev_by_user(vdev, WLAN_OSIF_P2P_ID);
++	return qdf_status_to_os_return(status);
++}
++
+ int hdd_start_station_adapter(struct hdd_adapter *adapter)
+ {
+ 	QDF_STATUS status;
+@@ -12921,6 +12950,10 @@
+ 		hdd_err("Error Initializing station mode: %d", status);
+ 		return qdf_status_to_os_return(status);
+ 	}
++
++	ret = marionette_set_station_ethernet_rx(adapter);
++	if (ret)
++		return ret;
+ 
+ 	hdd_register_tx_flow_control(adapter,
+ 		hdd_tx_resume_timer_expired_handler,

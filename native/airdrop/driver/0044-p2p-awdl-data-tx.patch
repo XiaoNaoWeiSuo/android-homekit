@@ -1,0 +1,112 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] p2p: allow AWDL data frames through WMI MGMT_TX
+
+p2p_get_frame_info() refuses every non-management frame with "just support
+mgmt frame", which is the last gate between an AWDL data frame and the
+firmware. wlan_hdd_mgmt_tx() does not validate the frame type, and
+p2p_execute_tx_action_frame() has no data-frame assumptions (sub_type 0 is
+not P2P_MGMT_ACTION, so no P2P IE is parsed or rewritten), so the bytes
+reach WMI MGMT_TX unchanged -- the same native command every P2P action
+frame already uses.
+
+Default off, 0600, limited to a three-address data frame whose payload
+starts with the Apple AWDL LLC/SNAP aa aa 03 00 17 f2 08 00.
+
+Verified on fuxi with cfg80211 patch 0043: an AWDL data frame transmitted
+during a remain-on-channel to 2412 was ACKed by an AP that exists only on
+that channel, which proves over-the-air delivery rather than host
+acceptance.
+
+diff --git a/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.c b/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.c
+index 834b54b..63f140a 100644
+--- a/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.c
++++ b/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.c
+@@ -36,6 +36,7 @@
+ #include "wlan_osif_request_manager.h"
+ #include <wlan_mlme_main.h>
+ #include "wlan_mlme_api.h"
++#include <linux/moduleparam.h>
+ 
+ /**
+  * p2p_psoc_get_tx_ops() - get p2p tx ops
+@@ -802,6 +803,42 @@ static void p2p_init_frame_info(struct p2p_frame_info *frame_info)
+  *
+  * Return: QDF_STATUS_SUCCESS - in case of success
+  */
++/**
++ * marionette_awdl_data_tx - root-only switch for AWDL data frames on WMI MGMT_TX
++ *
++ * The exception path (cdp_tx_send_exc) is refused by the firmware with an
++ * unchanging SFR assert, so the only remaining transmit path that the firmware
++ * supports natively is the management-frame one.  cfg80211 normally refuses a
++ * non-management frame before it ever reaches the driver; patch 0043 relaxes
++ * that for the exact Apple AWDL LLC/SNAP prefix.  This switch relaxes the
++ * matching gate inside the P2P component, which is the next thing that
++ * inspects the frame type.
++ *
++ * Default off, 0600, and additionally limited to a three-address data frame
++ * whose payload starts with aa aa 03 00 17 f2 08 00.
++ */
++static bool marionette_awdl_data_tx;
++module_param_named(marionette_awdl_data_tx, marionette_awdl_data_tx, bool, 0600);
++MODULE_PARM_DESC(marionette_awdl_data_tx,
++		 "Experimental AWDL data-frame submission through WMI MGMT_TX; default off");
++
++static const uint8_t marionette_awdl_snap[8] = {
++	0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00
++};
++
++static bool marionette_awdl_data_frame(const uint8_t *buf, uint32_t length)
++{
++	if (!READ_ONCE(marionette_awdl_data_tx))
++		return false;
++	if (length < P2P_ACTION_OFFSET + 16)
++		return false;
++	/* type 2 == data, and the AWDL LLC/SNAP right after the 24-byte header */
++	if (P2P_GET_TYPE_FRM_FC(buf[0]) != 2)
++		return false;
++	return !qdf_mem_cmp(buf + P2P_ACTION_OFFSET, marionette_awdl_snap,
++			    sizeof(marionette_awdl_snap));
++}
++
+ static QDF_STATUS p2p_get_frame_info(uint8_t *data_buf, uint32_t length,
+ 	struct p2p_frame_info *frame_info)
+ {
+@@ -820,8 +857,20 @@ static QDF_STATUS p2p_get_frame_info(uint8_t *data_buf, uint32_t length,
+ 	type = P2P_GET_TYPE_FRM_FC(buf[0]);
+ 	sub_type = P2P_GET_SUBTYPE_FRM_FC(buf[0]);
+ 	if (type != P2P_FRAME_MGMT) {
+-		p2p_err("just support mgmt frame");
+-		return QDF_STATUS_E_FAILURE;
++		if (!marionette_awdl_data_frame(buf, length)) {
++			p2p_err("just support mgmt frame");
++			return QDF_STATUS_E_FAILURE;
++		}
++		/* Let the frame through with its real type.  sub_type 0 is not
++		 * P2P_MGMT_ACTION, so p2p_get_frame_info() returns before any of
++		 * the action-frame parsing and p2p_execute_tx_action_frame() has
++		 * no P2P IE to rewrite either.  The bytes are copied verbatim and
++		 * handed to WMI MGMT_TX, which is the command the firmware
++		 * already uses for every P2P action frame.
++		 */
++		frame_info->type = P2P_FRAME_DATA;
++		frame_info->sub_type = sub_type;
++		return QDF_STATUS_SUCCESS;
+ 	}
+ 
+ 	frame_info->type = type;
+diff --git a/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.h b/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.h
+index b2753dc..db5ea2f 100644
+--- a/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.h
++++ b/qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.h
+@@ -75,6 +75,10 @@ struct p2p_rx_mgmt_event;
+ enum p2p_frame_type {
+ 	P2P_FRAME_MGMT = 0,
+ 	P2P_FRAME_NOT_SUPPORT,
++	/* Marionette (0044): 802.11 type 2.  Only ever produced by the AWDL data
++	 * gate below; the firmware's own WMI MGMT_TX carries the bytes.
++	 */
++	P2P_FRAME_DATA = 2,
+ };
+ 
+ /**

@@ -1,0 +1,1 @@
+cmd_/Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/Module.symvers := sed 's/\.ko$$/.lto\.o/' /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/modules.order | scripts/mod/modpost -m  -E -o /Users/lin/Desktop/xiaomi13/native/airdrop/driver/die-logger/Module.symvers -e -v gc922fbc8b773-dirty -i /work/stock-provider.symvers   -w -T -

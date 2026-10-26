@@ -1,0 +1,26 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] use complete monitor filters only inside bounded slots
+
+0016 radiotap CHANNEL observation confirms actual raw frames on 2437, 5220
+and 5745 during ROC-aligned capture, with 54 frames and no AWDL. Restricting
+the temporary capture filters to hardware other-BSS classification may omit
+broadcast action frames classified as filter-pass. During the synchronous
+0015 capture phase only, retain the existing full monitor filter categories.
+Outside that phase, keep 0013 other-BSS filters and 0014 normal RX restore.
+The <=200ms bound, STA association, vdev guard and synchronous restore remain.
+No RAW TX, firmware changes or background work. Verify actual AWDL receipt
+and ordinary Wi-Fi loss/latency; frame counts alone are insufficient.
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+@@ -570,7 +570,8 @@
+ /* Associated STA traffic must stay on the normal filter-pass path. */
+ static void marionette_mon_other_filter(struct dp_mon_filter *filter)
+ {
+-	if (!marionette_sta_monitor_enabled())
++	if (!marionette_sta_monitor_enabled() ||
++	    marionette_sta_monitor_capture_enabled())
+ 		return;
+ 	filter->tlv_filter.enable_fp = 0;
+ 	filter->tlv_filter.fp_mgmt_filter = 0;

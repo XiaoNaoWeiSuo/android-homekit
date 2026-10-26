@@ -1,0 +1,45 @@
+From: Marionette AirDrop driver research
+Subject: [fuxi runtime] allocate the CPU-only PE session table virtually
+
+During a captured ordinary-Wi-Fi startup, pe_open+0xb8 fails its session-table
+allocation with order:5, GFP_KERNEL. There is free memory but no order-5 pages;
+this occurs before monitor creation and does not diagnose firmware concurrency.
+The PE session array is host-only, indexed through CPU virtual pointers and
+not DMA mapped. Use the existing zeroing qdf_mem_valloc/vfree pair instead of
+requiring physical contiguity. Change both failure and normal teardown paths.
+No allocator retry loop, reclaim settings, DMA allocation or kernel checks
+are changed. Pinned source audit found only these two table frees.
+
+diff --git a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+--- a/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
++++ b/qcacld-3.0/core/mac/src/pe/lim/lim_api.c
+@@ -825,8 +825,10 @@
+ 		goto pe_open_timer_fail;
+ 	}
+ 
++	/* CPU-only session table: a large contiguous kmalloc can fail after
++	 * normal phone use fragments memory. No DMA mapping uses this table. */
+ 	mac->lim.gpSession =
+-		qdf_mem_malloc(sizeof(struct pe_session) * mac->lim.maxBssId);
++		qdf_mem_valloc(sizeof(struct pe_session) * mac->lim.maxBssId);
+ 	if (!mac->lim.gpSession) {
+ 		status = QDF_STATUS_E_NOMEM;
+ 		goto pe_open_psession_fail;
+@@ -865,7 +867,7 @@
+ 	return status; /* status here will be QDF_STATUS_SUCCESS */
+ 
+ pe_open_lock_fail:
+-	qdf_mem_free(mac->lim.gpSession);
++	qdf_mem_vfree(mac->lim.gpSession);
+ 	mac->lim.gpSession = NULL;
+ pe_open_psession_fail:
+ 	qdf_mem_free(mac->lim.lim_timers.gpLimCnfWaitTimer);
+@@ -907,7 +909,7 @@
+ 	qdf_mem_free(mac->lim.lim_timers.gpLimCnfWaitTimer);
+ 	mac->lim.lim_timers.gpLimCnfWaitTimer = NULL;
+ 
+-	qdf_mem_free(mac->lim.gpSession);
++	qdf_mem_vfree(mac->lim.gpSession);
+ 	mac->lim.gpSession = NULL;
+ 
+ 	pe_free_dph_node_array_buffer();

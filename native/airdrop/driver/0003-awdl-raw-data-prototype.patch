@@ -1,0 +1,124 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] hdd: gated monitor RAW AWDL IPv6 data submission
+
+Compile prototype only; not deployed or validated over the air. The module
+parameter is default-off and root-only. Does not implement management-frame
+TX, rate/retry hints, firmware ACK handling, or Wi-Fi coexistence. It tests
+whether the existing DP exception path can submit an unencrypted AWDL data
+frame without repurposing the normal station TX handler.
+
+diff --git a/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h b/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
+--- a/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
++++ b/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
+@@ -93,6 +93,9 @@
+ #endif
+ 
+ netdev_tx_t hdd_hard_start_xmit(struct sk_buff *skb, struct net_device *dev);
++#ifdef FEATURE_MONITOR_MODE_SUPPORT
++netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev);
++#endif
+ 
+ /**
+  * hdd_tx_timeout() - Wrapper function to protect __hdd_tx_timeout from SSR
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -5721,8 +5721,9 @@
+ };
+ 
+ #ifdef FEATURE_MONITOR_MODE_SUPPORT
+-/* Monitor mode net_device_ops, doesnot Tx and most of operations. */
++/* Monitor ops; experimental AWDL data TX remains disabled by default. */
+ static const struct net_device_ops wlan_mon_drv_ops = {
++	.ndo_start_xmit = hdd_mon_awdl_start_xmit,
+ 	.ndo_open = hdd_mon_open,
+ 	.ndo_stop = hdd_stop,
+ 	.ndo_get_stats = hdd_get_stats,
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -30,6 +30,7 @@
+ #include <wlan_hdd_softap_tx_rx.h>
+ #include <wlan_hdd_napi.h>
+ #include <linux/netdevice.h>
++#include <linux/module.h>
+ #include <linux/skbuff.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
+@@ -640,6 +641,76 @@
+ 	return NETDEV_TX_OK;
+ }
+ 
++
++#ifdef FEATURE_MONITOR_MODE_SUPPORT
++/* Diagnostic only: this does not implement management TX or coexistence.
++ * Keep off until module ABI and firmware behavior have been verified. */
++static bool marionette_awdl_raw_tx;
++module_param_named(marionette_awdl_raw_tx, marionette_awdl_raw_tx, bool, 0600);
++MODULE_PARM_DESC(marionette_awdl_raw_tx,
++                "Experimental AWDL-only monitor data TX; default off");
++
++netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	static const u8 radiotap_prefix[] = { 0, 0, 13, 0, 4, 128, 2, 0, 24, 0 };
++	static const u8 awdl_bssid[] = { 0, 0x25, 0, 0xff, 0x94, 0x73 };
++	static const u8 awdl_snap[] = { 0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0, 3, 4 };
++	struct hdd_adapter *adapter;
++	ol_txrx_soc_handle soc;
++	struct cdp_tx_exception_metadata metadata = {0};
++	u8 *frame;
++	unsigned int bytes;
++
++	hdd_dp_ssr_protect();
++	adapter = WLAN_HDD_GET_PRIV_PTR(dev);
++	/* Only filin's known radiotap layout and plain IPv6 AWDL data frames.
++	 * Management frames require a separate, verified WMI submission path. */
++	if (!READ_ONCE(marionette_awdl_raw_tx) ||
++	    cds_get_conparam() != QDF_GLOBAL_MONITOR_MODE ||
++	    adapter->device_mode != QDF_MONITOR_MODE ||
++	    adapter->vdev_id == 0xff || skb->len < 13 + 24 + 16 + 40 ||
++	    skb->len > 13 + 2304 || skb_linearize(skb) ||
++	    skb_cow_head(skb, 128))
++		goto drop;
++	frame = skb->data + 13;
++	if (memcmp(skb->data, radiotap_prefix, sizeof(radiotap_prefix)) ||
++	    (skb->data[10] != 0 && skb->data[10] != 8) || skb->data[11] ||
++	    frame[0] != 8 || frame[1] || (frame[22] & 0x0f) ||
++	    !ether_addr_equal(frame + 10, adapter->mac_addr.bytes) ||
++	    !ether_addr_equal(frame + 16, awdl_bssid) ||
++	    memcmp(frame + 24, awdl_snap, sizeof(awdl_snap)) ||
++	    frame[38] != 0x86 || frame[39] != 0xdd ||
++	    (frame[40] >> 4) != 6)
++		goto drop;
++	soc = cds_get_context(QDF_MODULE_ID_SOC);
++	/* cdp_tx_send_exc treats an absent callback as NULL/success. Check it
++	 * explicitly so a missing datapath never produces a false TX count. */
++	if (!soc || !soc->ops || !soc->ops->cmn_drv_ops ||
++	    !soc->ops->cmn_drv_ops->tx_send_exc)
++		goto drop;
++	skb_pull(skb, 13);
++	memset(skb->cb, 0, sizeof(skb->cb));
++	bytes = skb->len;
++	metadata.peer_id = CDP_INVALID_PEER;
++	metadata.tid = 0;
++	metadata.tx_encap_type = htt_cmn_pkt_type_raw;
++	metadata.sec_type = cdp_sec_type_none;
++	skb = cdp_tx_send_exc(soc, adapter->vdev_id, skb, &metadata);
++	if (skb)
++		goto drop;
++	/* Submission counters only. Firmware/OTA completion is still unknown. */
++	dev->stats.tx_packets++;
++	dev->stats.tx_bytes += bytes;
++	hdd_dp_ssr_unprotect();
++	return NETDEV_TX_OK;
++drop:
++	dev->stats.tx_dropped++;
++	dev_kfree_skb_any(skb);
++	hdd_dp_ssr_unprotect();
++	return NETDEV_TX_OK;
++}
++#endif
++
+ /**
+  * __hdd_tx_timeout() - TX timeout handler
+  * @dev: pointer to network device

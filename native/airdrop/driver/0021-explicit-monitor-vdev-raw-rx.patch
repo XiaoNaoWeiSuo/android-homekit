@@ -1,0 +1,74 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] explicitly configure monitor vdev RAW RX packet type
+
+The pinned global-monitor firmware resource config sets RX decap RAW, while
+mission defaults to Ethernet. The per-vdev MLME RX_DECAP_TYPE path exists and
+updates both DP configuration and the standard WMI vdev parameter. Test RAW
+on the monitor vdev only, behind a new default-off load-time flag plus the
+existing STA-monitor gate. Do not alter the associated STA or SoC-wide mode.
+Use the named HTT RAW packet enum and existing vdev reference/MLME API.
+No RAW TX, firmware image modifications or ownership changes. Host queue
+success is not firmware acknowledgement; verify raw/AWDL receive and normal
+Wi-Fi behavior. This is a control comparison, not a claimed cause or fix.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ /* Include Files */
++#include "wlan_vdev_mgr_utils_api.h"
+ #include "marionette_wmi_rx_filter.h"
+ #include "marionette_sta_monitor.h"
+ #include <wbuff.h>
+@@ -2749,6 +2750,40 @@
+  *
+  * Return: 0 for success; non-zero for failure
+  */
++/* Compare per-monitor RAW RX to the global-monitor RAW resource setting,
++ * without changing the associated STA or the SoC-wide decapsulation mode. */
++static bool marionette_awdl_monitor_raw_rx;
++module_param_named(marionette_awdl_monitor_raw_rx, marionette_awdl_monitor_raw_rx,
++		   bool, 0400);
++MODULE_PARM_DESC(marionette_awdl_monitor_raw_rx,
++                "Experimental per-monitor RAW RX packet type; default off");
++static int marionette_set_monitor_raw_rx(struct hdd_adapter *adapter)
++{
++	struct wlan_objmgr_vdev *vdev;
++	struct vdev_mlme_obj *mlme;
++	struct wlan_vdev_mgr_cfg config = { .value = htt_cmn_pkt_type_raw };
++	QDF_STATUS status;
++
++	if (!marionette_awdl_monitor_raw_rx || !marionette_sta_monitor_enabled())
++		return 0;
++	if (adapter->device_mode != QDF_MONITOR_MODE)
++		return -EINVAL;
++	vdev = hdd_objmgr_get_vdev_by_user(adapter, WLAN_OSIF_P2P_ID);
++	if (!vdev)
++		return -ENODEV;
++	mlme = wlan_vdev_mlme_get_cmpt_obj(vdev);
++	if (!mlme) {
++		hdd_objmgr_put_vdev_by_user(vdev, WLAN_OSIF_P2P_ID);
++		return -ENODEV;
++	}
++	status = wlan_util_vdev_mlme_set_param(mlme,
++				WLAN_MLME_CFG_RX_DECAP_TYPE, config);
++	hdd_info("MARIONETTE_MONITOR_RAW_RX vdev=%u type=%u queued_status=%u",
++		 adapter->vdev_id, config.value, status);
++	hdd_objmgr_put_vdev_by_user(vdev, WLAN_OSIF_P2P_ID);
++	return qdf_status_to_os_return(status);
++}
++
+ static int __hdd_mon_open(struct net_device *dev)
+ {
+ 	int ret;
+@@ -2825,6 +2860,8 @@
+ 		}
+ 		hdd_info("MARIONETTE_STA_MONITOR_INIT_RESULT ret=%d", ret);
+ 	}
++	if (!ret)
++		ret = marionette_set_monitor_raw_rx(adapter);
+ 
+ 	if (!ret) {
+ 		param.policy = BBM_DRIVER_MODE_POLICY;

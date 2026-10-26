@@ -1,0 +1,102 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] preserve associated STA for a bounded monitor RX test
+
+Management RX still has no AWDL at WMI, even with the scan receive-filter
+request. Exercise the existing monitor receive datapath while retaining the
+STA association. A root load-time gate defaults off. Existing concurrency
+checks remain. Only skip the explicit software disconnect for an already
+associated STA; monitor channel requests must exactly match the STA primary
+frequency and width. No RAW TX is enabled and no radio is retuned here.
+Firmware behavior and stability remain unverified; this is not a published
+coexistence solution. Test only with USB capture and independent stock rollback.
+
+diff --git a/platform/inc/marionette_sta_monitor.h b/platform/inc/marionette_sta_monitor.h
+new file mode 100644
+--- /dev/null
++++ b/platform/inc/marionette_sta_monitor.h
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MARIONETTE_STA_MONITOR_H
++#define MARIONETTE_STA_MONITOR_H
++#include <linux/types.h>
++bool marionette_sta_monitor_enabled(void);
++#endif
+diff --git a/qcacld-3.0/components/mlme/dispatcher/src/wlan_mlme_api.c b/qcacld-3.0/components/mlme/dispatcher/src/wlan_mlme_api.c
+--- a/qcacld-3.0/components/mlme/dispatcher/src/wlan_mlme_api.c
++++ b/qcacld-3.0/components/mlme/dispatcher/src/wlan_mlme_api.c
+@@ -20,6 +20,8 @@
+  * DOC: define public APIs exposed by the mlme component
+  */
+ 
++#include <linux/module.h>
++#include "marionette_sta_monitor.h"
+ #include "cfg_ucfg_api.h"
+ #include "wlan_mlme_main.h"
+ #include "wlan_mlme_ucfg_api.h"
+@@ -5545,8 +5547,22 @@
+ }
+ #endif
+ 
++/* Load-time-only research gate. Firmware concurrency remains unproven. */
++static bool marionette_awdl_sta_monitor;
++module_param_named(marionette_awdl_sta_monitor, marionette_awdl_sta_monitor,
++		   bool, 0400);
++MODULE_PARM_DESC(marionette_awdl_sta_monitor,
++                "Experimental associated STA plus same-channel monitor; default off");
++bool marionette_sta_monitor_enabled(void)
++{
++	return marionette_awdl_sta_monitor;
++}
++
+ bool wlan_mlme_is_sta_mon_conc_supported(struct wlan_objmgr_psoc *psoc)
+ {
++	if (marionette_sta_monitor_enabled())
++		return true;
++
+ 	if (wlan_mlme_get_monitor_mode_concurrency(psoc) ==
+ 						MONITOR_MODE_CONC_STA_SCAN_MON)
+ 		return true;
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ /* Include Files */
++#include "marionette_sta_monitor.h"
+ #include <wbuff.h>
+ #include "cfg_ucfg_api.h"
+ #include <wlan_hdd_includes.h>
+@@ -8516,6 +8517,18 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (marionette_sta_monitor_enabled() &&
++	    hdd_get_conparam() == QDF_GLOBAL_MISSION_MODE) {
++		struct hdd_adapter *sta = hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
++
++		/* Never retune the associated STA through monitor SET_CHANNEL.
++		 * Future off-channel scheduling must go through normal ROC. */
++		if (!sta || !hdd_cm_is_vdev_associated(sta) ||
++		    freq != hdd_get_adapter_home_channel(sta) ||
++		    bandwidth != hdd_get_adapter_width(sta))
++			return -EBUSY;
++	}
++
+ 	/* Verify the BW before accepting this request */
+ 	ch_width = bandwidth;
+ 
+@@ -19336,7 +19349,12 @@
+ 						PM_STA_MODE,
+ 						NULL);
+ 
+-		if (num_open_session == 1) {
++		if (num_open_session == 1 && marionette_sta_monitor_enabled()) {
++			if (!hdd_cm_is_vdev_associated(sta_adapter))
++				return -ENOTCONN;
++			hdd_info("MARIONETTE_STA_MONITOR_PRESERVE_ASSOC freq=%u",
++				 hdd_get_adapter_home_channel(sta_adapter));
++		} else if (num_open_session == 1) {
+ 			hdd_ctx->disconnect_for_sta_mon_conc = true;
+ 			/* Try disconnecting if already in connected state */
+ 			wlan_hdd_cm_issue_disconnect(sta_adapter,

@@ -1,0 +1,500 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] serialize DBR component lifetime with PDEV destruction
+
+Static audit after 0031 found that DBR response events, CFR/Spectral module
+unregister, and the object-manager PDEV destroy callback can share the same
+ring and buffer pointers without a common lifetime gate. Add a PDEV-locked
+component lookup, explicit active-user count, destroy gate, and per-module
+unregister gate. PDEV destruction waits for in-flight callbacks before ring
+deinit and never frees the component after a bounded wait timeout. This
+changes host lifetime ordering only; no firmware command values or packet
+formats. Requires static/build validation before RAM testing.
+
+diff --git a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.h b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.h
+--- a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.h
++++ b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.h
+@@ -22,6 +22,8 @@
+ 
+ #include "qdf_types.h"
+ #include "qdf_status.h"
++#include "qdf_event.h"
++#include "qdf_lock.h"
+ #include <target_if_direct_buf_rx_api.h>
+ 
+ struct wlan_objmgr_psoc;
+@@ -201,6 +203,14 @@
+  */
+ struct direct_buf_rx_pdev_obj {
+ 	uint32_t num_modules;
++	/* Protect component lifetime against DBR WMI callbacks and module
++	 * unregister while the object manager destroys the PDEV. */
++	qdf_spinlock_t lifecycle_lock;
++	qdf_atomic_t active_users;
++	qdf_event_t users_zero;
++	qdf_event_t users_idle;
++	bool destroying;
++	bool module_unregistering[DBR_MODULE_MAX];
+ 	struct direct_buf_rx_module_param (*dbr_mod_param)[DBR_SRNG_NUM];
+ #ifdef DIRECT_BUF_RX_DEBUG
+ 	struct direct_buf_rx_module_debug *dbr_mod_debug;
+diff --git a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
+--- a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
++++ b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
+@@ -38,6 +38,61 @@
+ 	[DBR_MODULE_CFR]      = {"CFR"},
+ };
+ 
++
++/*
++ * A PDEV component pointer is not itself a lifetime reference.  DBR firmware
++ * events can arrive while the object manager is running the PDEV destroy
++ * callback, so take a small explicit user reference while touching the
++ * component.  The PDEV object lock serializes the lookup with the destroy
++ * gate; the component lock serializes module state transitions.
++ */
++static bool target_if_dbr_user_get(struct wlan_objmgr_pdev *pdev,
++				   struct direct_buf_rx_pdev_obj **out)
++{
++	struct direct_buf_rx_pdev_obj *obj;
++	int users;
++
++	if (!pdev || !out)
++		return false;
++
++	wlan_pdev_obj_lock(pdev);
++	obj = wlan_objmgr_pdev_get_comp_private_obj(
++			pdev, WLAN_TARGET_IF_COMP_DIRECT_BUF_RX);
++	if (!obj) {
++		wlan_pdev_obj_unlock(pdev);
++		return false;
++	}
++
++	qdf_spin_lock_bh(&obj->lifecycle_lock);
++	if (obj->destroying) {
++		qdf_spin_unlock_bh(&obj->lifecycle_lock);
++		wlan_pdev_obj_unlock(pdev);
++		return false;
++	}
++	users = qdf_atomic_inc_return(&obj->active_users);
++	if (users == 1)
++		qdf_event_reset(&obj->users_zero);
++	if (users == 2)
++		qdf_event_reset(&obj->users_idle);
++	*out = obj;
++	qdf_spin_unlock_bh(&obj->lifecycle_lock);
++	wlan_pdev_obj_unlock(pdev);
++	return true;
++}
++
++static void target_if_dbr_user_put(struct direct_buf_rx_pdev_obj *obj)
++{
++	int users;
++
++	if (!obj)
++		return;
++	users = qdf_atomic_dec_return(&obj->active_users);
++	if (users <= 1)
++		qdf_event_set(&obj->users_idle);
++	if (users == 0)
++		qdf_event_set(&obj->users_zero);
++}
++
+ static uint8_t get_num_dbr_modules_per_pdev(struct wlan_objmgr_pdev *pdev)
+ {
+ 	struct wlan_objmgr_psoc *psoc;
+@@ -388,6 +443,17 @@
+ 	if (!dbr_pdev_obj)
+ 		return QDF_STATUS_E_NOMEM;
+ 
++	qdf_spinlock_create(&dbr_pdev_obj->lifecycle_lock);
++	qdf_atomic_init(&dbr_pdev_obj->active_users);
++	status = qdf_event_create(&dbr_pdev_obj->users_zero);
++	if (QDF_IS_STATUS_ERROR(status))
++		goto lifecycle_init_fail;
++	status = qdf_event_create(&dbr_pdev_obj->users_idle);
++	if (QDF_IS_STATUS_ERROR(status))
++		goto users_zero_destroy;
++	qdf_event_set(&dbr_pdev_obj->users_zero);
++	qdf_event_set(&dbr_pdev_obj->users_idle);
++
+ 	status = wlan_objmgr_pdev_component_obj_attach(pdev,
+ 					WLAN_TARGET_IF_COMP_DIRECT_BUF_RX,
+ 					dbr_pdev_obj, QDF_STATUS_SUCCESS);
+@@ -395,8 +461,7 @@
+ 	if (status != QDF_STATUS_SUCCESS) {
+ 		direct_buf_rx_err("Failed to attach dir buf rx component %d",
+ 				  status);
+-		qdf_mem_free(dbr_pdev_obj);
+-		return status;
++		goto users_idle_destroy;
+ 	}
+ 
+ 	dbr_psoc_obj->dbr_pdev_obj[wlan_objmgr_pdev_get_pdev_id(pdev)] =
+@@ -438,9 +503,17 @@
+ 	wlan_objmgr_pdev_component_obj_detach(
+ 				pdev, WLAN_TARGET_IF_COMP_DIRECT_BUF_RX,
+ 				dbr_pdev_obj);
++	goto users_idle_destroy;
++
++users_idle_destroy:
++	qdf_event_destroy(&dbr_pdev_obj->users_idle);
++users_zero_destroy:
++	qdf_event_destroy(&dbr_pdev_obj->users_zero);
++lifecycle_init_fail:
++	qdf_spinlock_destroy(&dbr_pdev_obj->lifecycle_lock);
+ 	qdf_mem_free(dbr_pdev_obj);
+ 
+-	return QDF_STATUS_E_NOMEM;
++	return status;
+ }
+ 
+ QDF_STATUS target_if_direct_buf_rx_pdev_destroy_handler(
+@@ -455,21 +528,43 @@
+ 		return QDF_STATUS_E_INVAL;
+ 	}
+ 
+-	dbr_pdev_obj = wlan_objmgr_pdev_get_comp_private_obj(pdev,
+-				WLAN_TARGET_IF_COMP_DIRECT_BUF_RX);
+-
++	/* Close the gate while the component pointer is still attached. */
++	wlan_pdev_obj_lock(pdev);
++	dbr_pdev_obj = wlan_objmgr_pdev_get_comp_private_obj(
++			pdev, WLAN_TARGET_IF_COMP_DIRECT_BUF_RX);
+ 	if (!dbr_pdev_obj) {
++		wlan_pdev_obj_unlock(pdev);
+ 		direct_buf_rx_err("dir buf rx object is null");
+ 		return QDF_STATUS_E_FAILURE;
+ 	}
+-
++	qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
++	if (dbr_pdev_obj->destroying) {
++		qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++		wlan_pdev_obj_unlock(pdev);
++		return QDF_STATUS_E_BUSY;
++	}
++	dbr_pdev_obj->destroying = true;
++	qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++	wlan_pdev_obj_unlock(pdev);
++
++	/* A response callback may already be using ring pointers. Never free the
++	 * component while one is still in flight. */
++	status = qdf_wait_for_event_completion(&dbr_pdev_obj->users_zero, 5000);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		direct_buf_rx_err("DBR PDEV destroy deferred: %d active users", status);
++		qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
++		dbr_pdev_obj->destroying = false;
++		qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++		return status;
++	}
++
++	qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
+ 	num_modules = dbr_pdev_obj->num_modules;
++	for (mod_idx = 0; mod_idx < num_modules; mod_idx++)
++		dbr_pdev_obj->module_unregistering[mod_idx] = true;
++	qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++
+ 	for (mod_idx = 0; mod_idx < num_modules; mod_idx++) {
+-		/*
+-		 * If the module didn't stop the ring debug by this time,
+-		 * it will result in memory leak of its ring debug entries.
+-		 * So, stop the ring debug
+-		 */
+ 		target_if_dbr_stop_ring_debug(pdev, mod_idx);
+ 		for (srng_id = 0; srng_id < DBR_SRNG_NUM; srng_id++)
+ 			target_if_deinit_dbr_ring(pdev, dbr_pdev_obj,
+@@ -484,14 +579,14 @@
+ 	status = wlan_objmgr_pdev_component_obj_detach(pdev,
+ 					WLAN_TARGET_IF_COMP_DIRECT_BUF_RX,
+ 					dbr_pdev_obj);
+-
+-	if (status != QDF_STATUS_SUCCESS) {
++	if (status != QDF_STATUS_SUCCESS)
+ 		direct_buf_rx_err("failed to detach dir buf rx component %d",
+ 				  status);
+-	}
+-
++
++	qdf_event_destroy(&dbr_pdev_obj->users_idle);
++	qdf_event_destroy(&dbr_pdev_obj->users_zero);
++	qdf_spinlock_destroy(&dbr_pdev_obj->lifecycle_lock);
+ 	qdf_mem_free(dbr_pdev_obj);
+-
+ 	return status;
+ }
+ 
+@@ -1766,47 +1861,47 @@
+ QDF_STATUS target_if_direct_buf_rx_module_unregister(
+ 			struct wlan_objmgr_pdev *pdev, uint8_t mod_id)
+ {
+-	QDF_STATUS status;
++	QDF_STATUS status = QDF_STATUS_SUCCESS;
+ 	struct direct_buf_rx_pdev_obj *dbr_pdev_obj;
+ 	uint8_t srng_id;
+ 
+-	if (!pdev) {
+-		direct_buf_rx_err("pdev context passed is null");
+-		return QDF_STATUS_E_INVAL;
+-	}
+-
+-	if (mod_id >= DBR_MODULE_MAX) {
+-		direct_buf_rx_err("Invalid module id");
+-		return QDF_STATUS_E_INVAL;
+-	}
+-
+-	dbr_pdev_obj = wlan_objmgr_pdev_get_comp_private_obj
+-			(pdev,
+-			 WLAN_TARGET_IF_COMP_DIRECT_BUF_RX);
+-
+-	if (!dbr_pdev_obj) {
+-		direct_buf_rx_err("dir buf rx object is null");
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	direct_buf_rx_debug("Dbr pdev obj %pK", dbr_pdev_obj);
+-
+-	if (!dbr_pdev_obj->dbr_mod_param) {
+-		direct_buf_rx_err("dbr_pdev_obj->dbr_mod_param is NULL");
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	if (mod_id >= dbr_pdev_obj->num_modules) {
+-		direct_buf_rx_err("Module %d not supported in target", mod_id);
+-		return QDF_STATUS_E_FAILURE;
++	if (!pdev || mod_id >= DBR_MODULE_MAX)
++		return QDF_STATUS_E_INVAL;
++	if (!target_if_dbr_user_get(pdev, &dbr_pdev_obj))
++		return QDF_STATUS_E_BUSY;
++
++	qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
++	if (!dbr_pdev_obj->dbr_mod_param ||
++	    mod_id >= dbr_pdev_obj->num_modules ||
++	    dbr_pdev_obj->module_unregistering[mod_id] ||
++	    !dbr_pdev_obj->dbr_mod_param[mod_id][0].registered) {
++		qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++		target_if_dbr_user_put(dbr_pdev_obj);
++		return QDF_STATUS_SUCCESS;
++	}
++	dbr_pdev_obj->module_unregistering[mod_id] = true;
++	/* The active reference held by this function keeps PDEV destruction from
++	 * freeing the component while we wait for already admitted callbacks. */
++	qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++	status = qdf_wait_for_event_completion(&dbr_pdev_obj->users_idle, 5000);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
++		dbr_pdev_obj->module_unregistering[mod_id] = false;
++		qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++		target_if_dbr_user_put(dbr_pdev_obj);
++		return status;
+ 	}
+ 
+ 	for (srng_id = 0; srng_id < DBR_SRNG_NUM; srng_id++) {
+ 		status = target_if_deinit_dbr_ring(pdev, dbr_pdev_obj,
+ 						   mod_id, srng_id);
+-		direct_buf_rx_info("status %d", status);
+-	}
+-
++		if (QDF_IS_STATUS_ERROR(status))
++			break;
++	}
++	qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
++	dbr_pdev_obj->module_unregistering[mod_id] = false;
++	qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++	target_if_dbr_user_put(dbr_pdev_obj);
+ 	return status;
+ }
+ 
+@@ -2095,142 +2190,91 @@
+ 						uint32_t data_len)
+ {
+ 	int ret = 0;
+-	uint8_t i = 0;
++	uint8_t i = 0, srng_id = 0;
+ 	QDF_STATUS status;
+ 	uint32_t cookie = 0;
+ 	struct direct_buf_rx_rsp dbr_rsp = {0};
+ 	struct direct_buf_rx_data dbr_data = {0};
+ 	struct wlan_objmgr_psoc *psoc;
+-	struct wlan_objmgr_pdev *pdev;
+-	struct direct_buf_rx_buf_info *dbr_buf_pool;
+-	struct direct_buf_rx_pdev_obj *dbr_pdev_obj;
++	struct wlan_objmgr_pdev *pdev = NULL;
++	struct direct_buf_rx_pdev_obj *dbr_pdev_obj = NULL;
+ 	struct direct_buf_rx_module_param *mod_param;
+ 	struct wmi_unified *wmi_handle;
+ 	wlan_objmgr_ref_dbgid dbr_mod_id = WLAN_DIRECT_BUF_RX_ID;
+-	uint8_t srng_id = 0;
+ 
+ 	direct_buf_rx_enter();
+-
+ 	psoc = target_if_get_psoc_from_scn_hdl(scn);
+-	if (!psoc) {
+-		direct_buf_rx_err("psoc is null");
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
++	if (!psoc) return QDF_STATUS_E_FAILURE;
+ 	wmi_handle = GET_WMI_HDL_FROM_PSOC(psoc);
+-	if (!wmi_handle) {
+-		direct_buf_rx_err("WMI handle is null");
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	if (wmi_extract_dbr_buf_release_fixed(
+-		wmi_handle, data_buf, &dbr_rsp) != QDF_STATUS_SUCCESS) {
+-		direct_buf_rx_err("unable to extract DBR rsp fixed param");
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	direct_buf_rx_debug("Num buf release entry = %d",
+-			    dbr_rsp.num_buf_release_entry);
++	if (!wmi_handle) return QDF_STATUS_E_FAILURE;
++	if (wmi_extract_dbr_buf_release_fixed(wmi_handle, data_buf,
++						&dbr_rsp) != QDF_STATUS_SUCCESS)
++		return QDF_STATUS_E_FAILURE;
+ 
+ 	pdev = dbr_get_pdev_and_srng_id(psoc, (uint8_t)dbr_rsp.pdev_id,
+ 					&srng_id);
+-	if (!pdev || (srng_id >= DBR_SRNG_NUM)) {
+-		direct_buf_rx_err("invalid pdev or srng, pdev %pK, srng %d",
+-				  pdev, srng_id);
+-		return QDF_STATUS_E_INVAL;
+-	}
+-
+-	dbr_pdev_obj = wlan_objmgr_pdev_get_comp_private_obj(pdev,
+-				WLAN_TARGET_IF_COMP_DIRECT_BUF_RX);
+-
+-	if (!dbr_pdev_obj) {
+-		direct_buf_rx_err("dir buf rx object is null");
+-		wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	if (dbr_rsp.mod_id >= dbr_pdev_obj->num_modules) {
+-		direct_buf_rx_err("Invalid module id:%d", dbr_rsp.mod_id);
+-		wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-		return QDF_STATUS_E_FAILURE;
++	if (!pdev || srng_id >= DBR_SRNG_NUM ||
++	    !target_if_dbr_user_get(pdev, &dbr_pdev_obj)) {
++		if (pdev) wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
++		return QDF_STATUS_E_BUSY;
++	}
++
++	qdf_spin_lock_bh(&dbr_pdev_obj->lifecycle_lock);
++	if (dbr_rsp.mod_id >= dbr_pdev_obj->num_modules ||
++	    !dbr_pdev_obj->dbr_mod_param ||
++	    dbr_pdev_obj->module_unregistering[dbr_rsp.mod_id]) {
++		qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++		status = QDF_STATUS_E_BUSY;
++		goto out;
+ 	}
+ 	mod_param = &(dbr_pdev_obj->dbr_mod_param[dbr_rsp.mod_id][srng_id]);
+-
+-	if (!mod_param) {
+-		direct_buf_rx_err("dir buf rx module param is null");
+-		wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	dbr_buf_pool = mod_param->dbr_buf_pool;
++	if (!mod_param->registered || !mod_param->dbr_rsp_handler) {
++		qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++		status = QDF_STATUS_E_BUSY;
++		goto out;
++	}
++	qdf_spin_unlock_bh(&dbr_pdev_obj->lifecycle_lock);
++
+ 	dbr_rsp.dbr_entries = qdf_mem_malloc(dbr_rsp.num_buf_release_entry *
+ 					sizeof(struct direct_buf_rx_entry));
+-	if (!dbr_rsp.dbr_entries) {
+-		direct_buf_rx_err("invalid dbr_entries");
+-		wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-		return QDF_STATUS_E_FAILURE;
+-	}
+-
+-	if (dbr_rsp.num_meta_data_entry > dbr_rsp.num_buf_release_entry) {
+-		direct_buf_rx_err("More than expected number of metadata");
+-		wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-		return QDF_STATUS_E_FAILURE;
++	if (!dbr_rsp.dbr_entries ||
++	    dbr_rsp.num_meta_data_entry > dbr_rsp.num_buf_release_entry) {
++		status = QDF_STATUS_E_FAILURE;
++		goto out_entries;
+ 	}
+ 
+ 	for (i = 0; i < dbr_rsp.num_buf_release_entry; i++) {
+-		if (wmi_extract_dbr_buf_release_entry(
+-			wmi_handle, data_buf, i,
+-			&dbr_rsp.dbr_entries[i]) != QDF_STATUS_SUCCESS) {
+-			direct_buf_rx_err("Unable to extract DBR buf entry %d",
+-					  i+1);
+-			qdf_mem_free(dbr_rsp.dbr_entries);
+-			wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-			return QDF_STATUS_E_FAILURE;
++		if (wmi_extract_dbr_buf_release_entry(wmi_handle, data_buf, i,
++						&dbr_rsp.dbr_entries[i]) != QDF_STATUS_SUCCESS) {
++			status = QDF_STATUS_E_FAILURE;
++			goto out_entries;
+ 		}
+ 		status = target_if_get_dbr_data(pdev, mod_param, &dbr_rsp,
+ 						&dbr_data, i, &cookie);
+-
+-		if (QDF_IS_STATUS_ERROR(status)) {
+-			direct_buf_rx_err("DBR data get failed");
+-			qdf_mem_free(dbr_rsp.dbr_entries);
+-			wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-			return QDF_STATUS_E_FAILURE;
+-		}
+-
++		if (QDF_IS_STATUS_ERROR(status)) goto out_entries;
+ 		dbr_data.meta_data_valid = false;
+-		if (i < dbr_rsp.num_meta_data_entry) {
+-			if (wmi_extract_dbr_buf_metadata(
+-				wmi_handle, data_buf, i,
+-				&dbr_data.meta_data) == QDF_STATUS_SUCCESS)
+-				dbr_data.meta_data_valid = true;
+-		}
+-
++		if (i < dbr_rsp.num_meta_data_entry &&
++		    wmi_extract_dbr_buf_metadata(wmi_handle, data_buf, i,
++						 &dbr_data.meta_data) == QDF_STATUS_SUCCESS)
++			dbr_data.meta_data_valid = true;
+ 		target_if_dbr_add_ring_debug_entry(pdev, dbr_rsp.mod_id,
+-						   DBR_RING_DEBUG_EVENT_RX,
+-						   srng_id);
++						   DBR_RING_DEBUG_EVENT_RX, srng_id);
+ 		if (mod_param->dbr_rsp_handler(pdev, &dbr_data)) {
+ 			status = target_if_dbr_replenish_ring(pdev, mod_param,
+-							      dbr_data.vaddr,
+-							      cookie);
+-
+-			target_if_dbr_add_ring_debug_entry(
+-				pdev, dbr_rsp.mod_id,
+-				DBR_RING_DEBUG_EVENT_REPLENISH_RING,
+-				srng_id);
+-
+-			if (QDF_IS_STATUS_ERROR(status)) {
+-				direct_buf_rx_err("Ring replenish failed");
+-				qdf_mem_free(dbr_rsp.dbr_entries);
+-				wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-				return QDF_STATUS_E_FAILURE;
+-			}
++							      dbr_data.vaddr, cookie);
++			target_if_dbr_add_ring_debug_entry(pdev, dbr_rsp.mod_id,
++							   DBR_RING_DEBUG_EVENT_REPLENISH_RING,
++							   srng_id);
++			if (QDF_IS_STATUS_ERROR(status)) goto out_entries;
+ 		}
+ 	}
+-
++	status = QDF_STATUS_SUCCESS;
++out_entries:
+ 	qdf_mem_free(dbr_rsp.dbr_entries);
++out:
++	target_if_dbr_user_put(dbr_pdev_obj);
+ 	wlan_objmgr_pdev_release_ref(pdev, dbr_mod_id);
+-
+-	return ret;
++	return status == QDF_STATUS_SUCCESS ? ret : status;
+ }
+ 
+ static QDF_STATUS target_if_dbr_empty_ring(struct wlan_objmgr_pdev *pdev,

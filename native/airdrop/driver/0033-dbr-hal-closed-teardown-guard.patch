@@ -1,0 +1,67 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] skip HAL SRNG teardown when HIF is already closed
+
+Static audit of the 0031 Oops (target_if_deinit_dbr_ring+0x1f4, ESR
+0x96000047, WnR=1) shows the faulting call chain is a normal driver
+shutdown, not a module-unregister race:
+
+  cnss_recovery_work_handler -> cnss_bus_dev_shutdown ->
+  cnss_pci_dev_shutdown -> pld_pcie_shutdown -> wlan_hdd_pld_shutdown ->
+  hdd_wlan_shutdown -> hdd_wlan_stop_modules -> hdd_check_for_leaks ->
+  wlan_objmgr_vdev_release_ref -> wlan_objmgr_vdev_obj_free ->
+  wlan_objmgr_pdev_vdev_detach -> wlan_objmgr_pdev_release_ref ->
+  target_if_direct_buf_rx_pdev_destroy_handler ->
+  target_if_deinit_dbr_ring
+
+hdd_wlan_stop_modules() calls hdd_hif_close() at wlan_hdd_main.c:14922 and
+only later hdd_check_for_leaks() at :14956. hdd_hif_close() clears the
+QDF_MODULE_ID_HIF context (hdd_deinit_cds_hif_context, wlan_hdd_driver_ops.c)
+and then hif_close() frees the HAL SRNG table. A monitor vdev whose delete
+did not complete survives until hdd_check_for_leaks(), which force-releases
+its reference and destroys the monitor PDEV after HAL is gone. DBR then
+calls hal_srng_cleanup() with the stale hal_soc/srng pair.
+
+This is why 0028-0031 only made things worse: 0028 deferred the WMA detach,
+turning a warning-level delete into a 20 s timeout and leaving the vdev
+leaked; the leaked vdev is what reaches the late destroy path.
+
+The patch keeps host ring memory ownership unchanged and only skips the HAL
+operation when the HIF context is already gone. Normal monitor delete
+(HAL alive) is unchanged. It does not fix the STOP/DELETE ordering warning;
+it makes shutdown survive it, which is required before any persistent use.
+
+diff --git a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
+--- a/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
++++ b/qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c
+@@ -24,6 +24,7 @@
+ #include "hal_api.h"
+ #include <service_ready_util.h>
+ #include <init_deinit_lmac.h>
++#include <cds_api.h>
+ 
+ /**
+  * struct module_name : Module name information structure
+@@ -2291,7 +2292,22 @@ static QDF_STATUS target_if_dbr_deinit_ring(struct wlan_objmgr_pdev *pdev,
+ 	dbr_ring_cfg = mod_param->dbr_ring_cfg;
+ 	if (dbr_ring_cfg) {
+ 		target_if_dbr_empty_ring(pdev, dbr_psoc_obj, mod_param);
+-		hal_srng_cleanup(dbr_psoc_obj->hal_soc, dbr_ring_cfg->srng);
++		/*
++		 * hdd_hif_close() releases the HIF/HAL context before
++		 * hdd_check_for_leaks() force-drops vdev references that
++		 * survived a failed delete.  A leaked monitor vdev therefore
++		 * reaches this PDEV destroy callback with a stale hal_soc and
++		 * a stale SRNG pointer.  Host ring memory is still ours and
++		 * must be released, but touching HAL here writes through a
++		 * freed SRNG table.
++		 */
++		if (cds_get_context(QDF_MODULE_ID_HIF))
++			hal_srng_cleanup(dbr_psoc_obj->hal_soc,
++					 dbr_ring_cfg->srng);
++		else
++			direct_buf_rx_err("HAL already closed; skip srng cleanup for module %d srng %d",
++					  mod_param->mod_id,
++					  mod_param->srng_id);
+ 		qdf_mem_free_consistent(dbr_psoc_obj->osdev,
+ 					dbr_psoc_obj->osdev->dev,
+ 					dbr_ring_cfg->ring_alloc_size,

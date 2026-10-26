@@ -1,0 +1,92 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] count a single STA MLD once in the monitor guard
+
+The 0010 candidate passed ordinary association, then monitor creation was
+rejected with 3 STA open sessions. The pinned single-netdev MLO path opens
+internal link adapters as STA vdevs. Under the default-off 0009 experiment
+only, normalize these to one logical STA only if all live STA objects belong to
+one complete non-NULL MLD with a valid unicast address. The MLD object count
+must match the observed live objects and cannot exceed open-session refs.
+Legacy-AP association clears the MLO/link capability flags, so role flags
+are diagnostic only; grouping uses the owned MLD context. Otherwise retain
+the original rejection. Log role/count evidence without kernel addresses.
+All other concurrency checks and same-channel restrictions remain.
+
+diff --git a/qcacld-3.0/components/cmn_services/policy_mgr/src/wlan_policy_mgr_get_set_utils.c b/qcacld-3.0/components/cmn_services/policy_mgr/src/wlan_policy_mgr_get_set_utils.c
+--- a/qcacld-3.0/components/cmn_services/policy_mgr/src/wlan_policy_mgr_get_set_utils.c
++++ b/qcacld-3.0/components/cmn_services/policy_mgr/src/wlan_policy_mgr_get_set_utils.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ /* Include files */
++#include "marionette_sta_monitor.h"
+ #include "target_if.h"
+ #include "wlan_policy_mgr_api.h"
+ #include "wlan_policy_mgr_i.h"
+@@ -8666,6 +8667,57 @@
+ 	return false;
+ }
+ 
++/* Keep one logical STA restriction while accounting for its internal MLO
++ * link vdevs. Only the explicit monitor experiment uses this observation. */
++static uint8_t marionette_monitor_sta_count(struct wlan_objmgr_psoc *psoc,
++					  uint8_t opened)
++{
++#ifdef WLAN_FEATURE_11BE_MLO
++	struct wlan_objmgr_vdev *vdev;
++	struct wlan_mlo_dev_context *group = NULL;
++	uint16_t id;
++	uint8_t total = 0, roots = 0, links = 0;
++	bool same_group = true;
++
++	if (!marionette_sta_monitor_enabled() || opened <= 1)
++		return opened;
++	for (id = 0; id < WLAN_UMAC_PSOC_MAX_VDEVS; id++) {
++		vdev = wlan_objmgr_get_vdev_by_id_from_psoc(psoc, id,
++							 WLAN_POLICY_MGR_ID);
++		if (!vdev)
++			continue;
++		if (wlan_vdev_mlme_get_opmode(vdev) == QDF_STA_MODE) {
++			bool link = wlan_vdev_mlme_is_mlo_link_vdev(vdev);
++
++			total++;
++			if (link)
++				links++;
++			else
++				roots++;
++			if (!vdev->mlo_dev_ctx)
++				same_group = false;
++			else if (!group)
++				group = vdev->mlo_dev_ctx;
++			else if (group != vdev->mlo_dev_ctx)
++				same_group = false;
++			policy_mgr_info("MARIONETTE_MON_STA_VDEV id=%u link=%u mlo=%u",
++				id, link, wlan_vdev_mlme_is_mlo_vdev(vdev));
++		}
++		wlan_objmgr_vdev_release_ref(vdev, WLAN_POLICY_MGR_ID);
++	}
++	policy_mgr_info("MARIONETTE_MON_STA_COUNT opened=%u objects=%u roots=%u links=%u same_mld=%u",
++			opened, total, roots, links, same_group);
++	/* Legacy APs clear role flags (mlo_mld_clear_mlo_cap) while the MLD
++	 * still owns the internal vdevs. Count that complete MLD once. */
++	if (total && total <= opened && group && same_group &&
++	    group->wlan_vdev_count == total &&
++	    !qdf_is_macaddr_zero(&group->mld_addr) &&
++	    !qdf_is_macaddr_group(&group->mld_addr))
++		return 1;
++#endif
++	return opened;
++}
++
+ QDF_STATUS policy_mgr_check_mon_concurrency(struct wlan_objmgr_psoc *psoc)
+ {
+ 	uint8_t num_open_session = 0;
+@@ -8697,6 +8745,8 @@
+ 				QDF_STA_MODE,
+ 				&num_open_session) != QDF_STATUS_SUCCESS)
+ 		return QDF_STATUS_E_INVAL;
++
++	num_open_session = marionette_monitor_sta_count(psoc, num_open_session);
+ 
+ 	if (num_open_session > 1) {
+ 		policy_mgr_err("cannot add monitor mode, due to %u sta interfaces",

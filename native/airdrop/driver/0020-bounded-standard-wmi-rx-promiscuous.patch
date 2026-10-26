@@ -1,0 +1,149 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] pair standard WMI RX promiscuous filter in short slots
+
+The pinned firmware API explicitly defines a separate fixed-parameter
+WMI_PDEV_SET_RX_FILTER_PROMISCUOUS_CMDID with pdev_id and enable/disable
+field, plus a TLV validation table. Use that declared command, not guessed
+WMI_PDEV_PARAM_RX_FILTER bit masks or old-generation parameter numbers.
+A new root load-time flag defaults off. When enabled, each existing bounded
+slot queues enable before channel/capture work and always queues disable
+before normal RX restoration, even on failure. Convert host pdev IDs using
+the existing WMI mapping. Existing vdev operation guard, dwell/frequency bounds,
+channel/home restore and independent stock rollback remain.
+Host queue success does not prove firmware acceptance; capture and measure it.
+No firmware blob or persistent driver replacement is performed.
+
+diff --git a/platform/inc/marionette_wmi_rx_filter.h b/platform/inc/marionette_wmi_rx_filter.h
+new file mode 100644
+--- /dev/null
++++ b/platform/inc/marionette_wmi_rx_filter.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MARIONETTE_WMI_RX_FILTER_H
++#define MARIONETTE_WMI_RX_FILTER_H
++#include <linux/types.h>
++/* Host queue submission result only; no firmware acknowledgement implied. */
++int marionette_wmi_rx_promiscuous(void *handle, u32 pdev_id, bool enable);
++#endif
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ /* Include Files */
++#include "marionette_wmi_rx_filter.h"
+ #include "marionette_sta_monitor.h"
+ #include <wbuff.h>
+ #include "cfg_ucfg_api.h"
+@@ -19798,6 +19799,10 @@
+ /* Synchronous bounded capture: every write restores normal RX before return.
+  * There is no delayed work/timer to outlive a vdev or module unload. */
+ static bool marionette_capture_phase;
++static bool marionette_awdl_fw_promisc;
++module_param_named(marionette_awdl_fw_promisc, marionette_awdl_fw_promisc, bool, 0400);
++MODULE_PARM_DESC(marionette_awdl_fw_promisc,
++                "Experimental standard WMI RX promiscuous filter inside bounded capture slots; default off");
+ static unsigned int marionette_capture_ms;
+ bool marionette_sta_monitor_capture_enabled(void)
+ {
+@@ -19815,6 +19820,9 @@
+ 	unsigned int duration, target_freq = 0, home_freq;
+ 	enum phy_ch_width home_width;
+ 	int ret, capture_status, restore_status, tune_status = 0, home_status = 0;
++	void *wmi_handle = NULL;
++	u32 pdev_id = 0;
++	int promisc_enable_status = 0, promisc_disable_status = 0;
+ 	char input[32], *duration_text, *separator;
+ 
+ 	if (strscpy(input, value, sizeof(input)) < 0)
+@@ -19865,8 +19873,19 @@
+ 	home_width = hdd_get_adapter_width(sta);
+ 	if (!target_freq)
+ 		target_freq = home_freq;
++	if (marionette_awdl_fw_promisc) {
++		wmi_handle = get_wmi_unified_hdl_from_psoc(hdd_ctx->psoc);
++		if (!wmi_handle || !hdd_ctx->pdev) {
++			ret = -ENODEV;
++			goto stop;
++		}
++		pdev_id = wlan_objmgr_pdev_get_pdev_id(hdd_ctx->pdev);
++		promisc_enable_status = marionette_wmi_rx_promiscuous(
++					wmi_handle, pdev_id, true);
++	}
+ 	WRITE_ONCE(marionette_capture_phase, true);
+-	capture_status = marionette_monitor_refresh_filters(soc);
++	capture_status = QDF_IS_STATUS_SUCCESS(promisc_enable_status) ?
++		marionette_monitor_refresh_filters(soc) : promisc_enable_status;
+ 	if (QDF_IS_STATUS_SUCCESS(capture_status)) {
+ 		if (target_freq != home_freq)
+ 			tune_status = wlan_hdd_set_mon_chan(adapter, target_freq,
+@@ -19877,12 +19896,20 @@
+ 	/* Restore even after a failed/partial channel request. */
+ 	if (target_freq != home_freq)
+ 		home_status = wlan_hdd_set_mon_chan(adapter, home_freq, home_width);
++	/* Pair every enable attempt, even if another slot operation failed. */
++	if (marionette_awdl_fw_promisc)
++		promisc_disable_status = marionette_wmi_rx_promiscuous(
++					wmi_handle, pdev_id, false);
+ 	WRITE_ONCE(marionette_capture_phase, false);
+ 	restore_status = marionette_monitor_refresh_filters(soc);
++	hdd_info("MARIONETTE_CAPTURE_PROMISC_RESULT enable=%d disable=%d",
++		 promisc_enable_status, promisc_disable_status);
+ 	hdd_info("MARIONETTE_CAPTURE_ONCE freq=%u home=%u ms=%u capture=%d tune=%d home_restore=%d rx_restore=%d",
+ 		 target_freq, home_freq, duration, capture_status, tune_status,
+ 		 home_status, restore_status);
+ 	ret = qdf_status_to_os_return(restore_status);
++	if (!ret)
++		ret = qdf_status_to_os_return(promisc_disable_status);
+ 	if (!ret)
+ 		ret = home_status;
+ 	if (!ret)
+diff --git a/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c b/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
+--- a/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
++++ b/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
+@@ -17,6 +17,7 @@
+  * PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include "marionette_wmi_rx_filter.h"
+ #include "wmi_unified_api.h"
+ #include "wmi.h"
+ #include "wmi_version.h"
+@@ -20984,3 +20985,36 @@
+ {
+ 	wmi_unified_register_module(WMI_TLV_TARGET, &wmi_tlv_attach);
+ }
++
++/* Isolated research caller; the command and field semantics are defined in
++ * fw-api/fw/wmi_unified.h and its fixed-parameter TLV table. */
++int marionette_wmi_rx_promiscuous(void *handle, u32 pdev_id, bool enable)
++{
++	wmi_unified_t wmi_handle = handle;
++	wmi_pdev_set_rx_filter_promiscuous_cmd_fixed_param *cmd;
++	wmi_buf_t buffer;
++	QDF_STATUS status;
++
++	static_assert(sizeof(*cmd) == 12);
++	if (!wmi_handle || !wmi_handle->ops ||
++	    !wmi_handle->ops->convert_pdev_id_host_to_target)
++		return QDF_STATUS_E_INVAL;
++	buffer = wmi_buf_alloc(wmi_handle, sizeof(*cmd));
++	if (!buffer)
++		return QDF_STATUS_E_NOMEM;
++	cmd = (void *)wmi_buf_data(buffer);
++	qdf_mem_zero(cmd, sizeof(*cmd));
++	WMITLV_SET_HDR(&cmd->tlv_header,
++		WMITLV_TAG_STRUC_wmi_pdev_set_rx_filter_promiscuous_cmd_fixed_param,
++		WMITLV_GET_STRUCT_TLVLEN(wmi_pdev_set_rx_filter_promiscuous_cmd_fixed_param));
++	cmd->pdev_id = wmi_handle->ops->convert_pdev_id_host_to_target(
++						wmi_handle, pdev_id);
++	cmd->rx_filter_promiscuous_enable = enable ? 1 : 0;
++	status = wmi_unified_cmd_send(wmi_handle, buffer, sizeof(*cmd),
++				     WMI_PDEV_SET_RX_FILTER_PROMISCUOUS_CMDID);
++	if (QDF_IS_STATUS_ERROR(status))
++		wmi_buf_free(buffer);
++	pr_info("MARIONETTE_WMI_RX_PROMISCUOUS enable=%u host_pdev=%u queued_status=%u\n",
++		enable, pdev_id, status);
++	return status;
++}

@@ -1,0 +1,57 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] opt-in STA social-channel ROC receive filter
+
+WMI/LIM/HDD stage observation found no AWDL reaching WMI during STA ROC,
+although the adjacent stock monitor witness sees real AWDL including the
+local Mac on channels 6 and 149. Use the existing scan_f_promisc_mode API,
+which maps to WMI_SCAN_FILTER_PROMISCOUS, during bounded STA social-channel
+ROC only. Root load-time flag defaults off; duration <=1000ms, channels
+6/44/149 only. No firmware modification or global monitor mode. Normal
+scan scheduling/regulatory checks remain. Firmware behavior is unverified.
+Apply after 0007; requires its observation to evaluate the result.
+
+diff --git a/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c b/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c
+--- a/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c
++++ b/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c
+@@ -21,6 +21,7 @@
+  * DOC: This file contains RoC API definitions
+  */
+ 
++#include <linux/module.h>
+ #include <wlan_mgmt_txrx_utils_api.h>
+ #include <wlan_scan_public_structs.h>
+ #include <wlan_scan_api.h>
+@@ -68,6 +69,13 @@
+ 	return status;
+ }
+ 
++/* Default-off, bounded STA receive experiment using the existing scan API.
++ * This is a scan receive-filter request, not global monitor mode. */
++static bool marionette_awdl_roc_rx;
++module_param_named(marionette_awdl_roc_rx, marionette_awdl_roc_rx, bool, 0400);
++MODULE_PARM_DESC(marionette_awdl_roc_rx,
++                "Experimental STA ROC receive filter; default off");
++
+ /**
+  * p2p_scan_start() - Start scan
+  * @roc_ctx: remain on channel request
+@@ -119,6 +127,19 @@
+ 	req->scan_req.chan_list.chan[0].freq = roc_ctx->chan_freq;
+ 	req->scan_req.dwell_time_passive = roc_ctx->duration;
+ 	req->scan_req.dwell_time_active = 0;
++	if (marionette_awdl_roc_rx &&
++	    wlan_vdev_mlme_get_opmode(vdev) == QDF_STA_MODE &&
++	    roc_ctx->duration <= 1000 &&
++	    (roc_ctx->chan_freq == 2437 || roc_ctx->chan_freq == 5220 ||
++	     roc_ctx->chan_freq == 5745)) {
++		/* WMI_SCAN_FILTER_PROMISCOUS already has a normal scan API
++		 * mapping. Ask firmware to deliver other management traffic
++		 * during these bounded social-channel dwells. LIM and
++		 * cfg80211 still retain the AWDL-only subscription filters. */
++		req->scan_req.scan_f_promisc_mode = true;
++		p2p_info("MARIONETTE_AWDL_ROC_RX freq=%u duration=%u",
++			 roc_ctx->chan_freq, roc_ctx->duration);
++	}
+ 	req->scan_req.scan_priority = SCAN_PRIORITY_HIGH;
+ 	req->scan_req.num_bssid = 1;
+ 	qdf_set_macaddr_broadcast(&req->scan_req.bssid_list[0]);

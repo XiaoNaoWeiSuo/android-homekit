@@ -1,0 +1,135 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] retain mission monitor until asynchronous STOP completes
+
+0027 delivered 15 real AWDL frames to userspace with STA still associated,
+but monitor deletion issued DELETE while STOP response was pending. Keep
+the existing WMA reference until the normal STOP/timeout callback; send DOWN
+then perform existing DP detach and reference release. No scheduler wait,
+assert suppression, firmware change or TX enable. Only default-off gated
+mission monitor in UP state uses this ordering. SME marks it logically deleted
+before WMA detach, so the STOP dispatcher uses the existing no-state reference
+API only as a gated monitor fallback; the retained WMA reference keeps it alive.
+Runtime validation required.
+
+diff --git a/qcacld-3.0/core/wma/inc/wma.h b/qcacld-3.0/core/wma/inc/wma.h
+--- a/qcacld-3.0/core/wma/inc/wma.h
++++ b/qcacld-3.0/core/wma/inc/wma.h
+@@ -747,6 +747,8 @@
+ 	struct wma_invalid_peer_params invalid_peers[INVALID_PEER_MAX_NUM];
+ 	uint8_t invalid_peer_idx;
+ 	uint16_t bss_max_idle_period;
++	/* Gated mission monitor retains its WMA reference until STOP reply. */
++	bool marionette_monitor_detach_pending;
+ };
+ 
+ /**
+diff --git a/qcacld-3.0/core/wma/src/wma_dev_if.c b/qcacld-3.0/core/wma/src/wma_dev_if.c
+--- a/qcacld-3.0/core/wma/src/wma_dev_if.c
++++ b/qcacld-3.0/core/wma/src/wma_dev_if.c
+@@ -24,6 +24,7 @@
+ 
+ /* Header files */
+ 
++#include "marionette_sta_monitor.h"
+ #include "wma.h"
+ #include "wma_api.h"
+ #include "cds_api.h"
+@@ -467,6 +468,7 @@
+ 
+ 	vdev = iface->vdev;
+ 
++	iface->marionette_monitor_detach_pending = false;
+ 	iface->vdev_active = false;
+ 	iface->vdev = NULL;
+ 	if (vdev)
+@@ -512,6 +514,28 @@
+ 
+ 	if (!soc) {
+ 		status = QDF_STATUS_E_FAILURE;
++		goto rel_ref;
++	}
++
++	if (marionette_sta_monitor_enabled() &&
++	    cds_get_conparam() == QDF_GLOBAL_MISSION_MODE &&
++	    !qdf_is_recovering() && iface->vdev &&
++	    wlan_vdev_mlme_get_opmode(iface->vdev) == QDF_MONITOR_MODE &&
++	    wlan_vdev_mlme_get_state(iface->vdev) == WLAN_VDEV_S_UP) {
++		/* DOWN issues asynchronous STOP. Keep the existing WMA object
++		 * reference until its response (or existing timeout callback),
++		 * so object destruction cannot issue DELETE while STOP is live.
++		 * Do not block the scheduler that processes the response. */
++		iface->marionette_monitor_detach_pending = true;
++		status = wlan_vdev_mlme_sm_deliver_evt(iface->vdev,
++						      WLAN_VDEV_SM_EV_DOWN,
++						      0, NULL);
++		if (QDF_IS_STATUS_SUCCESS(status)) {
++			wma_info("MARIONETTE_MONITOR_DETACH_WAIT_STOP vdev=%u",
++				 vdev_id);
++			return status;
++		}
++		iface->marionette_monitor_detach_pending = false;
+ 		goto rel_ref;
+ 	}
+ 
+@@ -2596,11 +2620,28 @@
+ 	if (!wma)
+ 		return status;
+ 
+-	iface = &wma->interfaces[vdev_mlme->vdev->vdev_objmgr.vdev_id];
+-
+ 	if (rsp->vdev_id >= wma->max_bssid) {
+ 		wma_err("Invalid vdev_id %d from FW", rsp->vdev_id);
+ 		return QDF_STATUS_E_INVAL;
++	}
++
++	iface = &wma->interfaces[rsp->vdev_id];
++	if (iface->marionette_monitor_detach_pending) {
++		void *soc = cds_get_context(QDF_MODULE_ID_SOC);
++
++		/* The target-if response handler has stopped the STOP timer.
++		 * Complete monitor DOWN before dropping the retained reference
++		 * and allowing the normal object destructor to send DELETE.
++		 * Its existing timeout/recovery path reaches this callback too. */
++		iface->marionette_monitor_detach_pending = false;
++		status = QDF_STATUS_SUCCESS;
++		if (!qdf_is_recovering())
++			status = wma_send_vdev_down_to_fw(wma, rsp->vdev_id);
++		wma_info("MARIONETTE_MONITOR_DETACH_AFTER_STOP vdev=%u down=%d recovery=%u",
++			 rsp->vdev_id, status, qdf_is_recovering());
++		wma_cdp_vdev_detach(soc, wma, rsp->vdev_id);
++		wma_release_vdev_ref(iface);
++		return status;
+ 	}
+ 
+ 	status = wma_handle_vdev_stop_rsp(wma, rsp);
+diff --git a/qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/src/wlan_vdev_mgr_tgt_if_rx_api.c b/qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/src/wlan_vdev_mgr_tgt_if_rx_api.c
+--- a/qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/src/wlan_vdev_mgr_tgt_if_rx_api.c
++++ b/qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/src/wlan_vdev_mgr_tgt_if_rx_api.c
+@@ -22,6 +22,7 @@
+  *
+  * This file provide definition for APIs registered for LMAC MLME Rx Ops
+  */
++#include "marionette_sta_monitor.h"
+ #include <qdf_types.h>
+ #include <qdf_module.h>
+ #include <wlan_vdev_mgr_tgt_if_rx_defs.h>
+@@ -133,6 +134,19 @@
+ 
+ 	vdev = wlan_objmgr_get_vdev_by_id_from_psoc(psoc, rsp->vdev_id,
+ 						    WLAN_VDEV_TARGET_IF_ID);
++	/* A monitor being detached is already logically deleted by SME.
++	 * The gated WMA STOP path retains its existing reference until this
++	 * callback. Take a checked reference to that object so STOP can finish
++	 * before the final release issues DELETE. Never revive other modes. */
++	if (!vdev && marionette_sta_monitor_enabled()) {
++		vdev = wlan_objmgr_get_vdev_by_id_from_psoc_no_state(psoc,
++							 rsp->vdev_id,
++							 WLAN_VDEV_TARGET_IF_ID);
++		if (vdev && wlan_vdev_mlme_get_opmode(vdev) != QDF_MONITOR_MODE) {
++			wlan_objmgr_vdev_release_ref(vdev, WLAN_VDEV_TARGET_IF_ID);
++			vdev = NULL;
++		}
++	}
+ 	if (!vdev) {
+ 		mlme_err("VDEV is NULL");
+ 		return QDF_STATUS_E_FAILURE;

@@ -1,0 +1,73 @@
+From: Marionette <marionette@localhost>
+Subject: [EXPERIMENTAL] deliver AWDL data frames to the host-only sink
+
+marionette_monitor_post_frame() starts with
+
+	if (frame[0] != 0xd0)
+		return;
+
+0xd0 is a management Action frame, so every non-action frame is dropped at the
+door.  That was invisible while the only consumer was a counter, but it is fatal
+for the sink: the frames that carry AirDrop's mDNS service advertisements -- and,
+later, the file payload itself -- are 802.11 QoS *data* frames, not action
+frames.  Measured on device 2026-10-23 with patch 0047 delivering action frames
+correctly:
+
+	mon_desc_data        144821   (data frames do reach the monitor ring)
+	mon_post_awdl           452   (only action frames were classified)
+	mdns_rx_other             0   (filin never saw a peer's mDNS)
+
+so the ring was carrying data all along and this check was throwing it away.
+
+AWDL data frames are identified the same way the action ones are: the AWDL BSSID
+in addr3 (00:25:00:ff:94:73).  They do not carry the 7f 00 17 f2 08 10 action
+prefix, which is exactly why the existing predicate cannot be reused.
+
+This is the smallest change that admits them: relax the type check, add a data
+predicate keyed on addr3, and count deliveries separately so the two populations
+stay distinguishable.  No firmware interaction, no new vdev, no channel change.
+
+Not addressed here: the sink's radiotap header still carries no TSFT field, so
+filin cannot compute tsf_offset_us and reports synced=false.  That needs the
+descriptor timestamp plumbed into marionette_monitor_post_frame(), which is a
+separate change.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+@@ -135,6 +135,10 @@ module_param_cb(marionette_awdl_sink_rx, &marionette_mon_counter_ops,
+ module_param_cb(marionette_awdl_sink_drop, &marionette_mon_counter_ops,
+ 		&marionette_awdl_sink_drop, 0400);
+ 
++static atomic_long_t marionette_mon_post_data = ATOMIC_LONG_INIT(0);
++module_param_cb(marionette_mon_post_data, &marionette_mon_counter_ops,
++		&marionette_mon_post_data, 0400);
++
+ static struct net_device *marionette_sink_dev;
+ static void marionette_sink_create(struct work_struct *work);
+ static DECLARE_WORK(marionette_sink_work, marionette_sink_create);
+@@ -337,8 +341,24 @@ void marionette_monitor_post_frame(const u8 *frame, u32 length)
+ 	    !frame || length < 2)
+ 		return;
+ 	atomic_long_inc(&marionette_mon_post_total);
+-	if (frame[0] != 0xd0)
++	if (frame[0] != 0xd0) {
++		static const u8 awdl_bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
++
++		/*
++		 * AWDL data frames -- the ones carrying mDNS and, later, the
++		 * AirDrop payload -- are QoS data with the AWDL BSSID in addr3.
++		 * They never carry the action prefix, so the predicate below
++		 * cannot classify them; without this branch the sink only ever
++		 * sees PSF/MIF and filin reports mdns_rx_other = 0.
++		 */
++		if ((frame[0] & 0x0c) != 0x08 || length < 24 ||
++		    memcmp(frame + 16, awdl_bssid, sizeof(awdl_bssid)))
++			return;
++		atomic_long_inc(&marionette_mon_post_data);
++		if (marionette_awdl_sink)
++			marionette_awdl_sink_deliver(frame, length);
+ 		return;
++	}
+ 	atomic_long_inc(&marionette_mon_post_action);
+ 	if (!marionette_monitor_is_awdl(frame, length))
+ 		return;

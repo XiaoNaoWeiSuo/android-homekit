@@ -14,13 +14,22 @@ import android.provider.Settings
 import android.telephony.TelephonyManager
 import android.os.Handler
 import android.os.Looper
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.util.concurrent.TimeUnit
 import dev.local.mihotspot.data.HotspotSettingsRepository
 
 /** Android implementation kept independent from the HAP GATT server. */
-class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecutor {
+class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecutor, AutoCloseable {
+    private val gate = CommandGate()
+    private val rootShell = PersistentShell(listOf("su", "-c", "/system/bin/sh"))
+    val stalled: Boolean get() = gate.stalled
+
+    private fun executeSafely(action: () -> CommandResult): CommandResult = try {
+        gate.write(action)
+    } catch (error: Exception) {
+        CommandResult(false, "control unavailable: ${error.message}")
+    }
+
+    override fun close() { rootShell.close() }
+
     private val values = mutableMapOf(
         HomeKitCommand.SCREEN to false,
         HomeKitCommand.BRIGHTNESS to false,
@@ -38,11 +47,12 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
     private var mediaVolumeBeforeMute: Int? = null
     private var volumeBeforeControl: Int? = null
 
-    @Synchronized
-    override fun execute(command: HomeKitCommand, enabled: Boolean): CommandResult {
+    override fun execute(command: HomeKitCommand, enabled: Boolean): CommandResult = executeSafely {
         val result = when (command) {
             HomeKitCommand.SCREEN -> toggleScreen()
-            HomeKitCommand.BRIGHTNESS -> setScreenBrightness(if (enabled) 100 else 0)
+            HomeKitCommand.BRIGHTNESS -> if (enabled && (currentValueInt(command) ?: 0) > 0) {
+                CommandResult(true, "brightness already on; existing percentage preserved")
+            } else setScreenBrightness(if (enabled) 100 else 0)
             HomeKitCommand.HOTSPOT -> setHotspot(enabled)
             HomeKitCommand.MUTE -> setMediaMuted(enabled)
             HomeKitCommand.FLASHLIGHT -> setFlashlight(enabled)
@@ -50,13 +60,15 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             HomeKitCommand.LOW_POWER_MODE -> setLowPowerMode(enabled)
             HomeKitCommand.DO_NOT_DISTURB -> setDoNotDisturb(enabled)
             HomeKitCommand.MOBILE_DATA -> setMobileData(enabled)
-            HomeKitCommand.VOLUME -> setVolume(if (enabled) 50 else 0)
+            HomeKitCommand.VOLUME -> if (enabled && (currentValueInt(command) ?: 0) > 0) {
+                CommandResult(true, "volume already on; existing percentage preserved")
+            } else setVolume(if (enabled) 50 else 0)
         }
         if (result.success) values[command] = enabled
-        return result
+        result
     }
 
-    override fun executeValue(command: HomeKitCommand, value: Int): CommandResult = synchronized(this) {
+    override fun executeValue(command: HomeKitCommand, value: Int): CommandResult = executeSafely {
         when (command) {
             HomeKitCommand.BRIGHTNESS -> setScreenBrightness(value.coerceIn(0, 100)).also { result ->
                 if (result.success) values[command] = value > 0
@@ -68,7 +80,7 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         }
     }
 
-    override fun currentValueInt(command: HomeKitCommand): Int? = synchronized(this) {
+    override fun currentValueInt(command: HomeKitCommand): Int? = gate.read {
         when (command) {
             HomeKitCommand.BRIGHTNESS -> {
                 // HomeKit's percentage is the Android user brightness level,
@@ -81,17 +93,17 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
                 } catch (_: Throwable) {
                     rootOutput("settings get system screen_brightness")?.trim()?.toIntOrNull()
                 }
-                raw?.let { return@synchronized (((it - 1).coerceAtLeast(0) * 100) / 254).coerceIn(0, 100) }
-                val backlight = backlightNode() ?: return@synchronized null
-                val current = rootOutput("cat ${backlight.first}")?.trim()?.toIntOrNull() ?: return@synchronized null
+                raw?.let { return@read (((it - 1).coerceAtLeast(0) * 100) / 254).coerceIn(0, 100) }
+                val backlight = backlightNode() ?: return@read null
+                val current = rootOutput("cat ${backlight.first}")?.trim()?.toIntOrNull() ?: return@read null
                 val normalMax = normalBacklightMax(backlight.second)
-                return@synchronized ((current.coerceAtLeast(0) * 100) / normalMax).coerceIn(0, 100)
+                return@read ((current.coerceAtLeast(0) * 100) / normalMax).coerceIn(0, 100)
             }
             HomeKitCommand.VOLUME -> {
                 val volumeState = mediaVolumeState()
                 if (volumeState != null) {
                     val (current, max) = volumeState
-                    return@synchronized (current * 100 / max).coerceIn(0, 100)
+                    return@read (current * 100 / max).coerceIn(0, 100)
                 }
                 null
             }
@@ -99,7 +111,7 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         }
     }
 
-    override fun currentValue(command: HomeKitCommand): Boolean = synchronized(this) {
+    override fun currentValue(command: HomeKitCommand): Boolean = gate.read {
         // HAP reads must describe the phone's current state, even when the
         // change was made outside HomeKit or before this process was started.
         when (command) {
@@ -108,13 +120,10 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             HomeKitCommand.BRIGHTNESS -> (currentValueInt(command) ?: 0) > 0
             HomeKitCommand.HOTSPOT -> isHotspotActive()
             HomeKitCommand.MUTE -> {
-                val audio = context.getSystemService(AudioManager::class.java)
-                audio?.isStreamMute(AudioManager.STREAM_MUSIC) == true ||
-                    audio?.getStreamVolume(AudioManager.STREAM_MUSIC) == 0 ||
-                    mediaVolumeIndex() == 0 ||
-                    audioMuteFromDump() == true
+                val index = mediaVolumeState()?.first ?: throw ControlUnavailable("media volume unavailable")
+                index == 0 || context.getSystemService(AudioManager::class.java)?.isStreamMute(AudioManager.STREAM_MUSIC) == true
             }
-            HomeKitCommand.FLASHLIGHT -> torchEnabled || isTorchSysfsEnabled()
+            HomeKitCommand.FLASHLIGHT -> isTorchSysfsEnabled()
             HomeKitCommand.GPS -> isGpsActive()
             HomeKitCommand.LOW_POWER_MODE -> isLowPowerModeActive()
             HomeKitCommand.DO_NOT_DISTURB -> isDoNotDisturbActive()
@@ -158,39 +167,34 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         }
     }
 
-    private fun setTorchSysfs(enabled: Boolean): Boolean {
-        val leds = rootOutput("ls /sys/class/leds/").orEmpty()
-            .lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
-        val torches = leds.filter { it.startsWith("led:torch_") }
-        val switches = leds.filter { it.startsWith("led:switch_") }
-        if (torches.isEmpty()) return false
-        var ok = true
-        // PM8550 flash driver latches the torch current at the moment the switch
-        // is enabled: writing switch=1 with a zero current lights nothing, so the
-        // current must be programmed before the switch (and cleared after it).
-        if (enabled) {
-            for (torch in torches) {
-                val max = rootOutput("cat /sys/class/leds/$torch/max_brightness")?.trim()?.toIntOrNull() ?: 500
-                ok = runRoot("echo $max > /sys/class/leds/$torch/brightness") && ok
-            }
-            for (switch in switches) ok = runRoot("echo 1 > /sys/class/leds/$switch/brightness") && ok
-        } else {
-            for (switch in switches) ok = runRoot("echo 0 > /sys/class/leds/$switch/brightness") && ok
-            for (torch in torches) ok = runRoot("echo 0 > /sys/class/leds/$torch/brightness") && ok
-        }
-        return ok
+    private var torchNodes: Pair<List<String>, List<String>>? = null
+
+    private fun torchNodes(): Pair<List<String>, List<String>> {
+        torchNodes?.let { return it }
+        val names = requireRootOutput("ls /sys/class/leds/").lineSequence().map { it.trim() }.toList()
+        val torches = names.filter { it.matches(Regex("led:torch_[0-9]+")) }
+        val switches = names.filter { it.matches(Regex("led:switch_[0-9]+")) }
+        return (torches to switches).also { if (torches.isNotEmpty() && switches.isNotEmpty()) torchNodes = it }
     }
 
-    /** Read the kernel torch switch so external changes are reflected in the UI. */
-    private fun isTorchSysfsEnabled(): Boolean {
-        val switches = rootOutput("ls /sys/class/leds/").orEmpty()
-            .lineSequence().map { it.trim() }
-            .filter { it.startsWith("led:switch_") }
-            .toList()
-        return switches.any { switch ->
-            rootOutput("cat /sys/class/leds/$switch/brightness")
-                ?.trim()?.toIntOrNull()?.let { it > 0 } == true
+    private fun setTorchSysfs(enabled: Boolean): Boolean {
+        val (torches, switches) = torchNodes()
+        if (torches.isEmpty() || switches.isEmpty()) return false
+        val writes = if (enabled) {
+            torches.map { "cat /sys/class/leds/$it/max_brightness > /sys/class/leds/$it/brightness" } +
+                switches.map { "echo 1 > /sys/class/leds/$it/brightness" }
+        } else {
+            switches.map { "echo 0 > /sys/class/leds/$it/brightness" } +
+                torches.map { "echo 0 > /sys/class/leds/$it/brightness" }
         }
+        return runRoot(writes.joinToString(" && "))
+    }
+
+    private fun isTorchSysfsEnabled(): Boolean {
+        val switches = torchNodes().second
+        if (switches.isEmpty()) return torchEnabled
+        val output = requireRootOutput(switches.joinToString(" && ") { "cat /sys/class/leds/$it/brightness" })
+        return output.lineSequence().any { it.trim().toIntOrNull()?.let { value -> value > 0 } == true }
     }
 
     private fun registerTorchCallback(camera: CameraManager) {
@@ -210,7 +214,9 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
     /** Emulates one physical power-button press; the current display state is
      * intentionally ignored so a Home tap always performs a toggle. */
     private fun toggleScreen(): CommandResult {
-        if (runRoot("input keyevent 26")) return CommandResult(true, "screen=toggle (root power key)")
+        val root = rootResult("input keyevent 26")
+        if (root == null) return CommandResult(false, "screen action timed out; outcome unknown, not replayed")
+        if (root.exitCode == 0) return CommandResult(true, "screen=toggle (root power key)")
         val power = context.getSystemService(PowerManager::class.java)
             ?: return CommandResult(false, "PowerManager unavailable")
         if (power.isInteractive) {
@@ -242,8 +248,6 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         // a linear raw panel value makes the slider and readback disagree.
         val level = 1 + (pct * 254 + 50) / 100
         return try {
-            val backlight = backlightNode()
-
             // canWrite()/putInt() may throw when WRITE_SETTINGS is not declared
             // or its AppOp is denied. That is only a failed optional route; it
             // must never prevent the rooted route from running.
@@ -270,6 +274,7 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
             // Only use a raw panel write when the Android setting route is not
             // available at all. This is a fallback for unusual rooted ROMs;
             // it is deliberately not used together with MIUI's setting path.
+            val backlight = backlightNode()
             val hardwareTarget = backlight?.let {
                 val normalMax = normalBacklightMax(it.second)
                 if (pct == 0) 0 else 1 + ((normalMax - 1).toLong() * pct / 100L).toInt()
@@ -306,27 +311,22 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         return null
     }
 
-    private fun runRoot(command: String): Boolean = try {
-        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-        process.inputStream.close()
-        process.errorStream.close()
-        val finished = process.waitFor(3, TimeUnit.SECONDS)
-        if (!finished) process.destroyForcibly()
-        finished && process.exitValue() == 0
-    } catch (_: Throwable) {
-        false
-    }
-
-    private fun rootOutput(command: String): String? = try {
-        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-        val output = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }
-        process.errorStream.close()
-        val finished = process.waitFor(3, TimeUnit.SECONDS)
-        if (!finished) process.destroyForcibly()
-        output.takeIf { finished && process.exitValue() == 0 }
-    } catch (_: Throwable) {
+    private fun rootResult(command: String): BoundedShell.Result? = try {
+        rootShell.run(command, CommandBudget.remainingMs(3000L)).also {
+            if (it == null) android.util.Log.w("MiHotspotHap", "ROOT_COMMAND_TIMEOUT")
+        }
+    } catch (error: Exception) {
+        android.util.Log.w("MiHotspotHap", "ROOT_COMMAND_FAILED ${error.javaClass.simpleName}:${error.message}")
         null
     }
+
+    private fun runRoot(command: String): Boolean = rootResult(command)?.exitCode == 0
+
+    private fun rootOutput(command: String): String? =
+        rootResult(command)?.takeIf { it.exitCode == 0 }?.output
+
+    private fun requireRootOutput(command: String): String =
+        rootOutput(command) ?: throw ControlUnavailable("root state query failed")
 
     private fun setHotspot(enabled: Boolean): CommandResult {
         if (Build.VERSION.SDK_INT < 26) return CommandResult(false, "hotspot API unavailable")
@@ -368,7 +368,7 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         // reports curState=StartedState — stopped ones show curState=<QUIT>, and
         // always-present fields like "client_control_is_enabled=false" must not
         // be treated as proof that the AP is up.
-        val dump = rootOutput("dumpsys wifi | grep curState=") ?: return rootHotspotActive
+        val dump = requireRootOutput("dumpsys wifi | grep curState=")
         return dump.lineSequence().any { it.trim().startsWith("curState=StartedState") }
     }
 
@@ -444,54 +444,20 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
 
     /** Returns (current index, max index) for the media stream in MIUI's native scale. */
     private fun mediaVolumeState(): Pair<Int, Int>? {
-        val out = rootOutput("cmd media_session volume --stream 3 --get") ?: return null
+        val out = requireRootOutput("cmd media_session volume --stream 3 --get")
         val match = Regex("""volume is (\d+) in range \[0\.\.(\d+)]""").find(out) ?: return null
         val current = match.groupValues[1].toIntOrNull() ?: return null
         val max = match.groupValues[2].toIntOrNull() ?: return null
         return current to max
     }
 
-    private fun mediaVolumeIndex(): Int? = mediaVolumeState()?.first
+    private fun setGps(enabled: Boolean): CommandResult =
+        if (runRoot("settings put secure location_mode ${if (enabled) 3 else 0}")) {
+            CommandResult(true, "gps=${if (enabled) "on" else "off"} (root)")
+        } else CommandResult(false, "gps requires root; opening settings does not apply a command")
 
-    private fun audioMuteFromDump(): Boolean? {
-        val dump = rootOutput("dumpsys audio") ?: return null
-        val music = dump.substringAfter("STREAM_MUSIC", "").substringBefore("- STREAM_")
-        return when {
-            music.contains("Muted: true", ignoreCase = true) -> true
-            music.contains("Muted: false", ignoreCase = true) -> false
-            else -> null
-        }
-    }
-
-    private fun setGps(enabled: Boolean): CommandResult {
-        // GPS/Location toggle - requires root or location settings permission
-        return if (enabled) {
-            if (runRoot("settings put secure location_mode 3")) {
-                CommandResult(true, "gps=on (root)")
-            } else {
-                // Try non-root approach
-                try {
-                    val intent = android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)
-                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                    CommandResult(true, "gps=on (settings opened)")
-                } catch (t: Throwable) {
-                    CommandResult(false, "gps failed: ${t.message}")
-                }
-            }
-        } else {
-            if (runRoot("settings put secure location_mode 0")) {
-                CommandResult(true, "gps=off (root)")
-            } else {
-                CommandResult(false, "gps requires root or location settings permission")
-            }
-        }
-    }
-
-    private fun isGpsActive(): Boolean {
-        val mode = rootOutput("settings get secure location_mode")?.trim()?.toIntOrNull()
-        return mode != null && mode > 0
-    }
+    private fun isGpsActive(): Boolean =
+        Settings.Secure.getInt(context.contentResolver, Settings.Secure.LOCATION_MODE) != 0
 
     private fun setLowPowerMode(enabled: Boolean): CommandResult {
         // Low power mode via settings global low_power (works on MIUI)
@@ -510,10 +476,8 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         }
     }
 
-    private fun isLowPowerModeActive(): Boolean {
-        val mode = rootOutput("settings get global low_power")?.trim()
-        return mode == "1"
-    }
+    private fun isLowPowerModeActive(): Boolean =
+        Settings.Global.getInt(context.contentResolver, "low_power") != 0
 
     private fun setDoNotDisturb(enabled: Boolean): CommandResult {
         // DND via cmd notification set_dnd (works on MIUI)
@@ -532,11 +496,8 @@ class AndroidCommandExecutor(private val context: Context) : HomeKitCommandExecu
         }
     }
 
-    private fun isDoNotDisturbActive(): Boolean {
-        val dump = rootOutput("dumpsys notification") ?: return false
-        return dump.contains("mZenMode=ZEN_MODE_IMPORTANT_INTERRUPTIONS") ||
-            dump.contains("mZenMode=ZEN_MODE_NO_INTERRUPTIONS")
-    }
+    private fun isDoNotDisturbActive(): Boolean =
+        Settings.Global.getInt(context.contentResolver, "zen_mode") != 0
 
     private fun setVolume(percent: Int): CommandResult {
         val pct = percent.coerceIn(0, 100)

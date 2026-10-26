@@ -13,7 +13,7 @@ object ServiceControl {
     private const val PREFS = "homekit"
     private const val KEY_ENABLED = "driver_service_enabled"
     private const val KEY_BROADCAST_STRATEGY = "broadcast_strategy"
-    private const val WATCHDOG_INTERVAL_MS = 30L * 60L * 1000L
+    private const val WATCHDOG_INTERVAL_MS = 5L * 60L * 1000L
     private const val NIGHT_START_HOUR = 23
     private const val DAY_START_HOUR = 7
 
@@ -134,6 +134,7 @@ object ServiceControl {
     fun cancelWatchdog(context: Context) {
         val alarmManager = context.getSystemService(AlarmManager::class.java) ?: return
         alarmManager.cancel(watchdogPendingIntent(context))
+        alarmManager.cancel(modeBoundaryPendingIntent(context))
     }
 
     private fun watchdogPendingIntent(context: Context): PendingIntent {
@@ -149,6 +150,7 @@ object ServiceControl {
 
     const val ACTION_WATCHDOG = "dev.local.mihotspot.action.WATCHDOG"
     const val ACTION_BROADCAST_MODE_BOUNDARY = "dev.local.mihotspot.action.BROADCAST_MODE_BOUNDARY"
+    const val ACTION_RELIABILITY_PROFILE = "dev.local.mihotspot.action.RELIABILITY_PROFILE"
 
     private const val WATCHDOG_REQUEST_CODE = 7298
     private const val MODE_BOUNDARY_REQUEST_CODE = 7297

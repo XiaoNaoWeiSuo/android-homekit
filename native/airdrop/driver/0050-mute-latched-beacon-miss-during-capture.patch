@@ -1,0 +1,133 @@
+From: Marionette <marionette@localhost>
+Subject: [EXPERIMENTAL] mute the latched beacon-miss indication during AWDL capture
+
+Patch 0049 made capture_hold=0 actually reset the monitor filters, and that
+part works: dmesg shows
+
+	MARIONETTE_STA_NORMAL_RX_RESTORED status=0 monitor=0
+
+and station RX keeps moving after the release.  The link still dies anyway.
+
+Measured 2026-10-23, station associated to 70:3a:73:a2:26:68 on 5260, one
+resident monitor vdev, never deleted:
+
+| shape                                  | result                                  |
+|----------------------------------------|-----------------------------------------|
+| hold 2 s once, then released for 60 s  | rxbytes 105748 -> 119214 over 13 s, then |
+|                                        | disconnect at t=15 s, 3 bmiss events    |
+| hold 2 s / release 3 s, 60 s loop      | disconnect at t=15 s, assert_delta=0    |
+| hold 200 ms / release 800 ms, 60 s     | disconnect at t=12 s, assert_delta=0    |
+
+The 200 ms shape is the giveaway.  If the miss counter were a per-beacon count
+that a good beacon reset, a 200 ms hold would never accumulate enough misses
+to trip.  It dies at the same ~12-15 s as the 2 s shape, so the indication is
+latched in the firmware the first time the filters are installed and fires on
+its own schedule afterwards, regardless of how much beacon traffic flows in
+between.
+
+The chain is:
+
+	wmi event -> wma_beacon_miss_handler()            (core/wma/src/wma_mgmt.c)
+	          -> WMA_MISSED_BEACON_IND
+	          -> lim_ps_offload_handle_missed_beacon_ind()   "Received Heart Beat Failure"
+	          -> lim_send_heart_beat_timeout_ind()
+	          -> AP probing -> QCA_DISCONNECT_REASON_BEACON_MISS_FAILURE
+
+Every step after the first is host-side policy.  This patch drops the
+indication at the first host boundary, before the netif queues are stopped and
+before PE starts probing, so the station stays associated and data keeps
+flowing for the whole capture session.
+
+The mute is a writable module parameter rather than an unconditional behaviour,
+because it does hide a real link loss.  radio.sh is expected to set it while
+the resident capture runs, check real traffic during the release gaps, and
+clear it if the link is genuinely gone.
+
+	/sys/module/kiwi_v2/parameters/marionette_awdl_bmiss_mute
+
+If this holds, the resident design needs no vdev churn and no asserts: one
+monitor vdev opened once, filters toggled, beacon-miss muted for the duration.
+
+--- a/platform/inc/marionette_sta_monitor.h
++++ b/platform/inc/marionette_sta_monitor.h
+@@ -5,4 +5,5 @@
+ bool marionette_sta_monitor_enabled(void);
+ bool marionette_sta_monitor_capture_enabled(void);
+ int marionette_monitor_refresh_filters(void *soc_handle, bool hold);
++bool marionette_bmiss_mute_enabled(void);
+ #endif
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -20176,8 +20176,44 @@
+ 		"Hold the capture RX filters on without moving the channel; "
+ 		"pair with a remain-on-channel reservation");
+ 
++/* Mute the firmware beacon-miss indication while the resident AWDL capture
++ * owns the receive ring.
++ *
++ * Holding the monitor filters diverts beacons away from the station, so the
++ * firmware raises a missed-beacon indication and PE drops the link about 13 s
++ * later -- even after the filters are released and beacons are flowing again.
++ * Measured 2026-10-23 with a single 2 s hold: station RX kept moving for 13 s
++ * (105748 -> 119214 bytes) and then went down with
++ * QCA_DISCONNECT_REASON_BEACON_MISS_FAILURE.  The indication is latched, so
++ * releasing the filters cannot cancel it, and neither a 2 s nor a 200 ms
++ * capture window changes the outcome: both shapes died ~12-15 s after the
++ * first hold.
++ *
++ * Dropping the indication at the WMA boundary keeps the link up for the whole
++ * capture session.  Liveness is then the service's job: radio.sh checks real
++ * traffic while the filters are released and lifts the mute if the link is
++ * genuinely gone.
++ */
++static bool marionette_awdl_bmiss_mute;
++
++bool marionette_bmiss_mute_enabled(void)
++{
++	return READ_ONCE(marionette_awdl_bmiss_mute);
++}
++
++static const struct kernel_param_ops marionette_bmiss_mute_ops = {
++	.set = param_set_bool,
++	.get = param_get_bool,
++};
++
++module_param_cb(marionette_awdl_bmiss_mute, &marionette_bmiss_mute_ops,
++		&marionette_awdl_bmiss_mute, 0600);
++MODULE_PARM_DESC(marionette_awdl_bmiss_mute,
++		"Drop firmware beacon-miss indications while the AWDL capture ring is held");
++
+ #else
+ bool marionette_sta_monitor_capture_enabled(void) { return false; }
++bool marionette_bmiss_mute_enabled(void) { return false; }
+ #endif
+ 
+ module_param_cb(con_mode, &con_mode_ops, &con_mode,
+--- a/qcacld-3.0/core/wma/src/wma_mgmt.c
++++ b/qcacld-3.0/core/wma/src/wma_mgmt.c
+@@ -26,6 +26,7 @@
+ /* Header files */
+ 
+ #include "marionette_awdl_rx_diagnostics.h"
++#include "marionette_sta_monitor.h"
+ #include "wma.h"
+ #include "wma_api.h"
+ #include "cds_api.h"
+@@ -2641,6 +2642,17 @@
+ 	struct missed_beacon_ind *beacon_miss_ind;
+ 	struct mac_context *mac = cds_get_context(QDF_MODULE_ID_PE);
+ 
++	/* The resident AWDL capture diverts beacons, so the firmware reports a
++	 * miss that is an artefact of the experiment rather than a dead link.
++	 * The indication is latched in the firmware: once raised it disconnects
++	 * the station ~13 s later no matter how quickly the filters are
++	 * released.  Drop it here, before the netif queues are stopped and
++	 * before PE starts AP probing, so traffic keeps flowing. */
++	if (marionette_bmiss_mute_enabled()) {
++		wma_info("MARIONETTE_BMISS_MUTED vdev=%d rssi=%d", vdev_id, rssi);
++		return;
++	}
++
+ 	beacon_miss_ind = qdf_mem_malloc(sizeof(*beacon_miss_ind));
+ 	if (!beacon_miss_ind)
+ 		return;

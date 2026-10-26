@@ -1,0 +1,242 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] host-only AWDL receive sink netdev
+
+A monitor vdev held open alongside an associated station kills this firmware:
+cnss reports "Driver recovery is triggered with reason: RDDM(2)" 5-25 s after
+the vdev comes up and the STA is dropped with
+QCA_DISCONNECT_REASON_DEVICE_RECOVERY.  The platform genuinely does not support
+STA+MON concurrency; patch 0009 only convinced the host otherwise.  Duty-cycled
+2 s windows do survive (measured 2026-10-23: 10 windows, 92 AWDL frames, zero
+recoveries) but cannot serve a resident service that must never drop the link.
+
+The monitor RX ring does not need that vdev.  AWDL action frames keep reaching
+marionette_monitor_post_frame() with no monitor vdev present, so deliver them to
+a netdev that exists only on the host: userspace keeps a plain AF_PACKET reader
+(tcpdump works unchanged) and the firmware is never told that a monitor session
+was requested.  The sink is created lazily from the RX path through a work item
+and unregistered from hdd_wlan_shutdown() so module unload stays safe.
+
+No firmware write, no channel retune, no new RX ownership, no TX change.
+
+diff --git a/platform/inc/marionette_monitor_rx_observe.h b/platform/inc/marionette_monitor_rx_observe.h
+index d389ef6..adec588 100644
+--- a/platform/inc/marionette_monitor_rx_observe.h
++++ b/platform/inc/marionette_monitor_rx_observe.h
+@@ -3,4 +3,5 @@
+ #define MARIONETTE_MONITOR_RX_OBSERVE_H
+ #include <linux/types.h>
+ void marionette_monitor_post_frame(const u8 *frame, u32 linear_length);
++void marionette_awdl_sink_exit(void);
+ #endif
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+index 8bbda3f..4f184b3 100644
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+@@ -17,6 +17,11 @@
+ 
+ #include <linux/module.h>
+ #include <linux/atomic.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++#include <linux/if_ether.h>
++#include <linux/rtnetlink.h>
++#include <linux/workqueue.h>
+ #include "marionette_sta_monitor.h"
+ #include "marionette_monitor_rx_observe.h"
+ #include "hal_hw_headers.h"
+@@ -96,6 +101,145 @@ module_param_cb(marionette_mon_tlv_awdl, &marionette_mon_counter_ops,
+ 		&marionette_mon_tlv_awdl, 0400);
+ module_param_cb(marionette_mon_hdr_unavailable, &marionette_mon_counter_ops,
+ 		&marionette_mon_hdr_unavailable, 0400);
++
++/*
++ * Host-only AWDL receive sink.
++ *
++ * Holding a monitor vdev open next to an associated station kills this
++ * firmware: cnss reports "Driver recovery is triggered with reason: RDDM(2)"
++ * within 5-25 s (measured 2026-10-23).  The monitor RX ring does not need
++ * that vdev, though -- AWDL action frames still reach
++ * marionette_monitor_post_frame() with no monitor vdev present.  Hand them to
++ * a netdev that exists only on the host instead: userspace keeps a plain
++ * AF_PACKET reader (tcpdump works unchanged) and the firmware is never told
++ * that a monitor session was requested.
++ */
++#define MARIONETTE_SINK_NAME "awdlsink"
++#define MARIONETTE_SINK_RTAP 12
++
++static bool marionette_awdl_sink = true;
++module_param_named(marionette_awdl_sink, marionette_awdl_sink, bool, 0600);
++MODULE_PARM_DESC(marionette_awdl_sink,
++		 "Deliver AWDL action frames to the host-only awdlsink netdev");
++
++static unsigned int marionette_awdl_sink_freq = 5260;
++module_param_named(marionette_awdl_sink_freq, marionette_awdl_sink_freq,
++		   uint, 0600);
++MODULE_PARM_DESC(marionette_awdl_sink_freq,
++		 "Frequency reported in the sink's radiotap header");
++
++static atomic_long_t marionette_awdl_sink_rx = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_awdl_sink_drop = ATOMIC_LONG_INIT(0);
++module_param_cb(marionette_awdl_sink_rx, &marionette_mon_counter_ops,
++		&marionette_awdl_sink_rx, 0400);
++module_param_cb(marionette_awdl_sink_drop, &marionette_mon_counter_ops,
++		&marionette_awdl_sink_drop, 0400);
++
++static struct net_device *marionette_sink_dev;
++static void marionette_sink_create(struct work_struct *work);
++static DECLARE_WORK(marionette_sink_work, marionette_sink_create);
++
++static netdev_tx_t marionette_sink_xmit(struct sk_buff *skb,
++					struct net_device *dev)
++{
++	kfree_skb(skb);
++	return NETDEV_TX_OK;
++}
++
++static const struct net_device_ops marionette_sink_ops = {
++	.ndo_start_xmit = marionette_sink_xmit,
++};
++
++static void marionette_sink_setup(struct net_device *dev)
++{
++	dev->type = ARPHRD_IEEE80211_RADIOTAP;
++	dev->hard_header_len = 0;
++	dev->addr_len = 0;
++	dev->mtu = 2304;
++	dev->tx_queue_len = 0;
++	dev->flags |= IFF_NOARP;
++}
++
++static void marionette_sink_create(struct work_struct *work)
++{
++	struct net_device *dev;
++	int ret;
++
++	if (READ_ONCE(marionette_sink_dev))
++		return;
++	dev = alloc_netdev(0, MARIONETTE_SINK_NAME, NET_NAME_UNKNOWN,
++			   marionette_sink_setup);
++	if (!dev)
++		return;
++	dev->netdev_ops = &marionette_sink_ops;
++	rtnl_lock();
++	ret = register_netdevice(dev);
++	if (!ret)
++		ret = dev_open(dev, NULL);
++	rtnl_unlock();
++	if (ret) {
++		free_netdev(dev);
++		pr_info("MARIONETTE_AWDL_SINK_UP_FAILED ret=%d\n", ret);
++		return;
++	}
++	WRITE_ONCE(marionette_sink_dev, dev);
++	pr_info("MARIONETTE_AWDL_SINK_UP dev=%s freq=%u\n",
++		dev->name, marionette_awdl_sink_freq);
++}
++
++void marionette_awdl_sink_exit(void)
++{
++	struct net_device *dev = READ_ONCE(marionette_sink_dev);
++
++	cancel_work_sync(&marionette_sink_work);
++	if (!dev)
++		return;
++	WRITE_ONCE(marionette_sink_dev, NULL);
++	rtnl_lock();
++	dev_close(dev);
++	unregister_netdevice(dev);
++	rtnl_unlock();
++	pr_info("MARIONETTE_AWDL_SINK_DOWN\n");
++}
++
++static void marionette_awdl_sink_deliver(const u8 *frame, u32 length)
++{
++	struct net_device *dev = READ_ONCE(marionette_sink_dev);
++	struct sk_buff *skb;
++	u8 *p;
++
++	if (!dev) {
++		schedule_work(&marionette_sink_work);
++		atomic_long_inc(&marionette_awdl_sink_drop);
++		return;
++	}
++	skb = netdev_alloc_skb(dev, MARIONETTE_SINK_RTAP + length);
++	if (!skb) {
++		atomic_long_inc(&marionette_awdl_sink_drop);
++		return;
++	}
++	p = skb_put(skb, MARIONETTE_SINK_RTAP + length);
++	/* radiotap: version 0, header length 12, present = CHANNEL only */
++	p[0] = 0;
++	p[1] = 0;
++	p[2] = MARIONETTE_SINK_RTAP;
++	p[3] = 0;
++	p[4] = 0x08;
++	p[5] = 0;
++	p[6] = 0;
++	p[7] = 0;
++	p[8] = marionette_awdl_sink_freq & 0xff;
++	p[9] = (marionette_awdl_sink_freq >> 8) & 0xff;
++	p[10] = 0;
++	p[11] = 0;
++	memcpy(p + MARIONETTE_SINK_RTAP, frame, length);
++	skb->dev = dev;
++	skb->protocol = htons(ETH_P_ALL);
++	skb_reset_mac_header(skb);
++	netif_rx(skb);
++	atomic_long_inc(&marionette_awdl_sink_rx);
++}
++
+ static bool marionette_monitor_is_awdl(const u8 *frame, u32 length)
+ {
+ 	static const u8 bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
+@@ -189,9 +333,6 @@ static void marionette_monitor_descriptor(struct dp_soc *soc, void *descriptor)
+ }
+ void marionette_monitor_post_frame(const u8 *frame, u32 length)
+ {
+-	static const u8 bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
+-	static const u8 prefix[] = {0x7f, 0, 0x17, 0xf2, 8, 0x10};
+-
+ 	if (!marionette_sta_monitor_enabled() ||
+ 	    !frame || length < 2)
+ 		return;
+@@ -199,11 +340,11 @@ void marionette_monitor_post_frame(const u8 *frame, u32 length)
+ 	if (frame[0] != 0xd0)
+ 		return;
+ 	atomic_long_inc(&marionette_mon_post_action);
+-	if (length >= 40 && !(frame[1] & 0x40) &&
+-	    !memcmp(frame + 16, bssid, sizeof(bssid)) &&
+-	    !memcmp(frame + 24, prefix, sizeof(prefix)) &&
+-	    (frame[30] == 0 || frame[30] == 3))
+-		atomic_long_inc(&marionette_mon_post_awdl);
++	if (!marionette_monitor_is_awdl(frame, length))
++		return;
++	atomic_long_inc(&marionette_mon_post_awdl);
++	if (marionette_awdl_sink)
++		marionette_awdl_sink_deliver(frame, length);
+ }
+ 
+ /*
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+index dc84823..2d9d957 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_power.c
+@@ -93,6 +93,7 @@
+ #include <wlan_cp_stats_mc_ucfg_api.h>
+ #include "wlan_dp_ucfg_api.h"
+ #include "qdf_lock.h"
++#include "marionette_monitor_rx_observe.h"
+ 
+ /* Preprocessor definitions and constants */
+ #ifdef QCA_WIFI_EMULATION
+@@ -1936,6 +1937,10 @@ QDF_STATUS hdd_wlan_shutdown(void)
+ 
+ 	hdd_lpass_notify_stop(hdd_ctx);
+ 
++	/* The host-only AWDL sink netdev lives inside this module; it must be
++	 * unregistered before the module can be unloaded. */
++	marionette_awdl_sink_exit();
++
+ 	qdf_set_smmu_fault_state(false);
+ 	hdd_info("WLAN driver shutdown complete");
+ 

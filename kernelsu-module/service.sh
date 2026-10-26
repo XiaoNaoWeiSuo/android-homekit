@@ -39,18 +39,15 @@ done
 
 if [ -x "$TERMUX_PREFIX/bin/sshd" ]; then
   if ! /system/bin/pidof sshd >/dev/null 2>&1; then
-    su -u "$TERMUX_UID" -c "HOME=$TERMUX_HOME PREFIX=$TERMUX_PREFIX PATH=$TERMUX_PREFIX/bin:$TERMUX_PREFIX/bin/applets:$TERMUX_PREFIX/sbin /system/bin/sh -c '$TERMUX_PREFIX/bin/sshd -p 8022'" >/dev/null 2>&1 &
+    su "$TERMUX_UID" -c "HOME=$TERMUX_HOME PREFIX=$TERMUX_PREFIX PATH=$TERMUX_PREFIX/bin:$TERMUX_PREFIX/bin/applets:$TERMUX_PREFIX/sbin /system/bin/sh -c '$TERMUX_PREFIX/bin/sshd -p 8022'" >/dev/null 2>&1 &
   fi
 fi
 
 # 启动mihomo
 if [ -x "$TERMUX_PREFIX/bin/mihomo" ]; then
   if ! /system/bin/pidof mihomo >/dev/null 2>&1; then
-    su -u "$TERMUX_UID" -c "HOME=$TERMUX_HOME PREFIX=$TERMUX_PREFIX PATH=$TERMUX_PREFIX/bin $TERMUX_PREFIX/bin/mihomo -d $TERMUX_HOME/.config/mihomo" >/dev/null 2>&1 &
+    su "$TERMUX_UID" -c "HOME=$TERMUX_HOME PREFIX=$TERMUX_PREFIX PATH=$TERMUX_PREFIX/bin $TERMUX_PREFIX/bin/mihomo -d $TERMUX_HOME/.config/mihomo" >/dev/null 2>&1 &
   fi
 fi
 
-# 启动保活脚本
-if [ -f "$MODDIR/termux-keepalive.sh" ]; then
-  sh "$MODDIR/termux-keepalive.sh" &
-fi
+# No keepalive loop: failed background children can interrupt BusyBox sleep.

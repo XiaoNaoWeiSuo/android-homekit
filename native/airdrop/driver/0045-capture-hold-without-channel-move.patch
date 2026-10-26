@@ -1,0 +1,123 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] hold the capture RX filters without moving the channel
+
+Three measured defects made the bounded capture slot unusable as a resident
+receive path:
+
+ 1. A remain-on-channel reservation on the station does not hold the radio on
+    the social channel.  Measured with a 2 s reservation and a concurrent ping:
+    0% loss, but latency went 14 ms -> 52 ms inside the window, so policy
+    manager time shares the radio with the station instead of yielding it.
+ 2. The slot moves the monitor vdev through wlan_hdd_set_mon_chan, which policy
+    manager never sees, so the station's beacon watchdog keeps running and the
+    link dies with QCA_DISCONNECT_REASON_BEACON_MISS_FAILURE after roughly ten
+    missed beacons.  Every later transmission then fails with -ENOTCONN, which
+    reads like an injection bug and is not one.
+ 3. Each slot costs about 280 ms of channel-switch completion wait on top of
+    its dwell (six 200 ms slots in a 600 ms loop landed 870-910 ms apart), so
+    a short dwell plus a long gap cannot be scheduled at all.
+
+All three come from binding "install the full filters" to "move the channel".
+The filters have to be driven from inside the driver, because the monitor's
+full RX set is only installed while the capture phase is set; the channel has to
+be driven through a path policy manager schedules, or the beacon watchdog kills
+the link.  This patch separates them: the new parameter only toggles the
+capture phase, never the channel, and userspace pairs it with a normal
+remain-on-channel reservation.
+
+Release is always allowed, including while the station is gone, because it is
+the only way back to normal RX after a held capture.  No lock is held across a
+sleep, so a reservation may start and expire underneath a held capture.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -20045,6 +20045,88 @@
+ MODULE_PARM_DESC(marionette_awdl_capture_ms,
+                 "Capture [2437|5220|5745:]1..200 ms, restoring STA home channel and normal RX");
+ 
++/* Hold the capture filters on, and leave the channel to the scheduler.
++ *
++ * The bounded slot moves the monitor vdev with wlan_hdd_set_mon_chan, which
++ * policy manager never sees: it keeps the station's beacon watchdog running and
++ * drops the link after a run of missed beacons.  A remain-on-channel
++ * reservation on the station is the opposite trade: policy manager schedules
++ * it and yields beacon windows, so the link survives, but the monitor's full
++ * filters are only installed while the capture phase is set, so a plain
++ * reservation receives nothing.
++ *
++ * This parameter separates the two concerns.  It holds the filters on while
++ * userspace drives the channel with a normal reservation.  It never touches the
++ * channel itself, so it cannot fight the scheduler, and it holds no lock
++ * across a sleep, so a reservation may start and expire underneath it.
++ */
++static int marionette_capture_hold_set(const char *value,
++				       const struct kernel_param *parameter)
++{
++	struct net_device *mon_dev;
++	struct hdd_adapter *adapter, *sta;
++	struct hdd_context *hdd_ctx;
++	struct osif_vdev_sync *sync;
++	ol_txrx_soc_handle soc;
++	QDF_STATUS status;
++	bool hold;
++	int ret;
++
++	ret = kstrtobool(value, &hold);
++	if (ret)
++		return ret;
++	if (!marionette_sta_monitor_enabled() ||
++	    hdd_get_conparam() != QDF_GLOBAL_MISSION_MODE)
++		return -EOPNOTSUPP;
++	mon_dev = dev_get_by_name(&init_net, "awdlmon");
++	if (!mon_dev)
++		return -ENODEV;
++	if (mon_dev->netdev_ops != &wlan_mon_drv_ops) {
++		ret = -EINVAL;
++		goto put;
++	}
++	ret = osif_vdev_sync_op_start(mon_dev, &sync);
++	if (ret)
++		goto put;
++	adapter = WLAN_HDD_GET_PRIV_PTR(mon_dev);
++	hdd_ctx = WLAN_HDD_GET_CTX(adapter);
++	ret = wlan_hdd_validate_context(hdd_ctx);
++	if (ret)
++		goto stop;
++	/* Releasing is always allowed: it is the only way back to normal RX when
++	 * the station has gone away underneath a held capture. */
++	if (hold) {
++		sta = hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
++		if (!sta || !hdd_cm_is_vdev_associated(sta) ||
++		    !test_bit(DEVICE_IFACE_OPENED, &adapter->event_flags)) {
++			ret = -ENOTCONN;
++			goto stop;
++		}
++	}
++	soc = cds_get_context(QDF_MODULE_ID_SOC);
++	if (!soc) {
++		ret = -EOPNOTSUPP;
++		goto stop;
++	}
++	WRITE_ONCE(marionette_capture_phase, hold);
++	status = marionette_monitor_refresh_filters(soc);
++	hdd_info("MARIONETTE_CAPTURE_HOLD hold=%d status=%d", hold, status);
++	ret = qdf_status_to_os_return(status);
++stop:
++	osif_vdev_sync_op_stop(sync);
++put:
++	dev_put(mon_dev);
++	return ret;
++}
++static const struct kernel_param_ops marionette_capture_hold_ops = {
++	.set = marionette_capture_hold_set,
++	.get = param_get_bool,
++};
++module_param_cb(marionette_awdl_capture_hold, &marionette_capture_hold_ops,
++		&marionette_capture_phase, 0600);
++MODULE_PARM_DESC(marionette_awdl_capture_hold,
++		"Hold the capture RX filters on without moving the channel; "
++		"pair with a remain-on-channel reservation");
+ #else
+ bool marionette_sta_monitor_capture_enabled(void) { return false; }
+ #endif

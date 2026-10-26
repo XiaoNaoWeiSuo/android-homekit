@@ -1,0 +1,41 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] include HTT Monitor_Direct action frames in short slots
+
+The pinned HTT RX ring command documents independent FP/MD/MO category bits
+for each management subtype. Its serializer explicitly handles MD action and
+no-ACK action filters. Existing full monitor defaults subscribed FP/MO only;
+0018's real-frequency short captures had no action frames while the immediate
+stock global-monitor control saw real AWDL. Test the missing MD category,
+limited to action subtypes and the already bounded capture phase. No MD data
+or control subscription, unknown PDEV parameter values, firmware writes or
+new RX ownership. This is a hypothesis, not proof of an MD delivery path.
+Normal RX restoration and channel restoration remain unchanged.
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+@@ -570,9 +570,21 @@
+ /* Associated STA traffic must stay on the normal filter-pass path. */
+ static void marionette_mon_other_filter(struct dp_mon_filter *filter)
+ {
+-	if (!marionette_sta_monitor_enabled() ||
+-	    marionette_sta_monitor_capture_enabled())
+-		return;
++	if (!marionette_sta_monitor_enabled())
++		return;
++	if (marionette_sta_monitor_capture_enabled()) {
++		/* HTT has a distinct Monitor_Direct category. Observe only its
++		 * action subtypes during the bounded capture window; earlier
++		 * full FP/MO windows did not subscribe to this category. */
++		filter->tlv_filter.enable_md = 1;
++		filter->tlv_filter.md_mgmt_filter =
++			FILTER_MGMT_ACTION | FILTER_MGMT_ACT_NO_ACK;
++		filter->tlv_filter.md_ctrl_filter = 0;
++		filter->tlv_filter.md_data_filter = 0;
++		pr_info("MARIONETTE_CAPTURE_MD_ACTION_FILTER md_mgmt=0x%x\n",
++			filter->tlv_filter.md_mgmt_filter);
++		return;
++	}
+ 	filter->tlv_filter.enable_fp = 0;
+ 	filter->tlv_filter.fp_mgmt_filter = 0;
+ 	filter->tlv_filter.fp_ctrl_filter = 0;

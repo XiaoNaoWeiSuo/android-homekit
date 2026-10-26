@@ -1,0 +1,176 @@
+From: Marionette <marionette@localhost>
+Subject: [EXPERIMENTAL] carry the descriptor TSF into the AWDL sink's radiotap
+
+The sink's radiotap header has only a CHANNEL field:
+
+	present = 0x08, it_len = 12
+
+filin reads TSFT from that header to build its TSF bridge:
+
+	let rx_time_us = radiotap.tsft
+	    .map(|hw_tsft| bridge.timestamp_rx(hw_tsft, host_now_us))
+	    .unwrap_or(host_now_us);
+
+With no TSFT it always falls back to host time, so `/status` reports
+
+	"tsf_offset_us":0, "synced":false, "aw_alignment_pct":0
+
+Peer discovery still works (peer_count 3-4, neighbor entries installed), but
+the availability windows never line up, and file transfer cannot start without
+that alignment.
+
+The timestamp is already in the descriptor: `dp_rx_mon_deliver()` has
+`mon_pdev->ppdu_info.rx_status.tsft` in scope -- the CBF path a few lines above
+reads exactly that field -- so pass it through `marionette_monitor_post_frame()`
+into the sink.
+
+Radiotap layout when a timestamp is present:
+
+	offset  0  version 0, pad
+	offset  2  it_len = 24
+	offset  4  present = 0x09  (TSFT | CHANNEL)
+	offset  8  TSFT, 8 bytes LE
+	offset 16  channel frequency, channel flags
+	offset 20  padding, so the 802.11 header stays 8-byte aligned
+
+When the descriptor carries no timestamp the header keeps its old 12-byte
+CHANNEL-only shape, so nothing that worked before changes.
+
+--- a/platform/inc/marionette_monitor_rx_observe.h
++++ b/platform/inc/marionette_monitor_rx_observe.h
+@@ -2,6 +2,7 @@
+ #ifndef MARIONETTE_MONITOR_RX_OBSERVE_H
+ #define MARIONETTE_MONITOR_RX_OBSERVE_H
+ #include <linux/types.h>
+-void marionette_monitor_post_frame(const u8 *frame, u32 linear_length);
++void marionette_monitor_post_frame(const u8 *frame, u32 linear_length,
++				   u64 tsft);
+ void marionette_awdl_sink_exit(void);
+ #endif
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
+@@ -1837,8 +1837,13 @@
+ 		goto mon_deliver_fail;
+ 	}
+ 
++	/* The descriptor's TSF is the only 802.11 timestamp the host has;
++	 * without it filin cannot derive the peer's availability windows.
++	 * It lives in rx_status, next to the fields the CBF path already
++	 * reads, so pass it through while the descriptor is in scope. */
+ 	marionette_monitor_post_frame(qdf_nbuf_data(mon_mpdu),
+-				     qdf_nbuf_headlen(mon_mpdu));
++				     qdf_nbuf_headlen(mon_mpdu),
++				     mon_pdev->ppdu_info.rx_status.tsft);
+ 	dp_rx_mon_process_dest_pktlog(soc, mac_id, mon_mpdu);
+ 
+ 	/* monitor vap cannot be present when mcopy is enabled
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+@@ -116,6 +116,7 @@
+  */
+ #define MARIONETTE_SINK_NAME "awdlsink"
+ #define MARIONETTE_SINK_RTAP 12
++#define MARIONETTE_SINK_RTAP_TSFT 24
+ 
+ static bool marionette_awdl_sink = true;
+ module_param_named(marionette_awdl_sink, marionette_awdl_sink, bool, 0600);
+@@ -206,37 +207,60 @@
+ 	pr_info("MARIONETTE_AWDL_SINK_DOWN\n");
+ }
+ 
+-static void marionette_awdl_sink_deliver(const u8 *frame, u32 length)
++static void marionette_awdl_sink_deliver(const u8 *frame, u32 length,
++					 u64 tsft)
+ {
+ 	struct net_device *dev = READ_ONCE(marionette_sink_dev);
+ 	struct sk_buff *skb;
++	u32 rtap = tsft ? MARIONETTE_SINK_RTAP_TSFT : MARIONETTE_SINK_RTAP;
+ 	u8 *p;
++	int i;
+ 
+ 	if (!dev) {
+ 		schedule_work(&marionette_sink_work);
+ 		atomic_long_inc(&marionette_awdl_sink_drop);
+ 		return;
+ 	}
+-	skb = netdev_alloc_skb(dev, MARIONETTE_SINK_RTAP + length);
++	skb = netdev_alloc_skb(dev, rtap + length);
+ 	if (!skb) {
+ 		atomic_long_inc(&marionette_awdl_sink_drop);
+ 		return;
+ 	}
+-	p = skb_put(skb, MARIONETTE_SINK_RTAP + length);
+-	/* radiotap: version 0, header length 12, present = CHANNEL only */
++	p = skb_put(skb, rtap + length);
++	/*
++	 * radiotap: version 0, present = TSFT|CHANNEL when the descriptor
++	 * carried a timestamp, CHANNEL alone otherwise.  TSFT is 8-byte
++	 * aligned and therefore lands at offset 8; the channel follows at 16
++	 * and the header is padded to 24 so the 802.11 header stays 8-byte
++	 * aligned for readers that care.
++	 *
++	 * Without TSFT filin falls back to host time, which leaves
++	 * tsf_offset_us at 0 and aw_alignment_pct at 0: peer discovery works
++	 * but the availability windows never line up.
++	 */
+ 	p[0] = 0;
+ 	p[1] = 0;
+-	p[2] = MARIONETTE_SINK_RTAP;
+-	p[3] = 0;
+-	p[4] = 0x08;
++	p[2] = rtap & 0xff;
++	p[3] = (rtap >> 8) & 0xff;
++	p[4] = tsft ? 0x09 : 0x08;
+ 	p[5] = 0;
+ 	p[6] = 0;
+ 	p[7] = 0;
+-	p[8] = marionette_awdl_sink_freq & 0xff;
+-	p[9] = (marionette_awdl_sink_freq >> 8) & 0xff;
+-	p[10] = 0;
+-	p[11] = 0;
+-	memcpy(p + MARIONETTE_SINK_RTAP, frame, length);
++	if (tsft) {
++		for (i = 0; i < 8; i++)
++			p[8 + i] = (tsft >> (8 * i)) & 0xff;
++		p[16] = marionette_awdl_sink_freq & 0xff;
++		p[17] = (marionette_awdl_sink_freq >> 8) & 0xff;
++		p[18] = 0;
++		p[19] = 0;
++		memset(p + 20, 0, 4);
++	} else {
++		p[8] = marionette_awdl_sink_freq & 0xff;
++		p[9] = (marionette_awdl_sink_freq >> 8) & 0xff;
++		p[10] = 0;
++		p[11] = 0;
++	}
++	memcpy(p + rtap, frame, length);
+ 	skb->dev = dev;
+ 	skb->protocol = htons(ETH_P_ALL);
+ 	skb_reset_mac_header(skb);
+@@ -335,7 +359,7 @@
+ 	}
+ 	marionette_monitor_header(soc, descriptor, fc);
+ }
+-void marionette_monitor_post_frame(const u8 *frame, u32 length)
++void marionette_monitor_post_frame(const u8 *frame, u32 length, u64 tsft)
+ {
+ 	if (!marionette_sta_monitor_enabled() ||
+ 	    !frame || length < 2)
+@@ -356,7 +380,7 @@
+ 			return;
+ 		atomic_long_inc(&marionette_mon_post_data);
+ 		if (marionette_awdl_sink)
+-			marionette_awdl_sink_deliver(frame, length);
++			marionette_awdl_sink_deliver(frame, length, tsft);
+ 		return;
+ 	}
+ 	atomic_long_inc(&marionette_mon_post_action);
+@@ -364,7 +388,7 @@
+ 		return;
+ 	atomic_long_inc(&marionette_mon_post_awdl);
+ 	if (marionette_awdl_sink)
+-		marionette_awdl_sink_deliver(frame, length);
++		marionette_awdl_sink_deliver(frame, length, tsft);
+ }
+ 
+ /*

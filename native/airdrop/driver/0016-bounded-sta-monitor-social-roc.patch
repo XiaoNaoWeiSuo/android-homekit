@@ -1,0 +1,45 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] permit bounded STA social-channel ROC beside monitor
+
+0015 revision captured 316 raw monitor frames across six synchronous slots,
+while ordinary Wi-Fi stayed associated and gateway responses were 47/48,
+then 3/3 after the experiment. The existing HDD STA+MON check rejects all
+ROC requests before reaching normal scan scheduling. Under default-off
+0009 only, allow <=200ms ROC on 6/44/149 from the associated STA. All normal
+regulatory, firmware, policy manager and scan scheduling still apply. Other
+interfaces, frequencies and durations retain the original rejection.
+No monitor channel retune, RAW data TX or automatic slot loop is added.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+@@ -25,6 +25,7 @@
+  *
+  */
+ 
++#include "marionette_sta_monitor.h"
+ #include "marionette_awdl_rx_diagnostics.h"
+ #include "osif_sync.h"
+ #include <wlan_hdd_includes.h>
+@@ -179,8 +180,19 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (policy_mgr_is_sta_mon_concurrency(hdd_ctx->psoc))
+-		return -EINVAL;
++	if (policy_mgr_is_sta_mon_concurrency(hdd_ctx->psoc)) {
++		/* Keep the normal scheduling/regulatory path, permitting only
++		 * explicitly gated short AWDL social-channel receive dwells. */
++		if (!marionette_sta_monitor_enabled() ||
++		    adapter->device_mode != QDF_STA_MODE ||
++		    !hdd_cm_is_vdev_associated(adapter) || !chan ||
++		    !duration || duration > 200 ||
++		    (chan->center_freq != 2437 && chan->center_freq != 5220 &&
++		     chan->center_freq != 5745))
++			return -EINVAL;
++		hdd_info("MARIONETTE_STA_MON_ROC freq=%u duration=%u",
++			 chan->center_freq, duration);
++	}
+ 
+ 	if (wlan_hdd_validate_vdev_id(adapter->vdev_id))
+ 		return -EINVAL;

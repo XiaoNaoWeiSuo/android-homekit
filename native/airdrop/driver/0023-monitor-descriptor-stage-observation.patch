@@ -1,0 +1,177 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] observe monitor descriptors before and after MPDU restitch
+
+WMI and userspace saw no AWDL in the mission tests. Observe the missing
+host-DP boundary before inferring firmware rejection: use existing HAL frame
+control validity/value accessors at the exact descriptor pointer already
+used by both monitor 1.0 restitch paths, then count reconstructed frames
+before packet-log/radiotap delivery. Root read-only atomic counters run only
+while the gated STA-monitor experiment is loaded, including queued processing
+that arrives after a bounded capture slot returns. Do not change buffer ownership, classification,
+filtering, payload or packet fate. Post-frame reads are limited to the linear
+head length. Missing HAL callbacks/invalid FC are reported rather than treated
+as proof of absent frames. 0022 RAW resource experiment must be off for the
+ordinary-Wi-Fi-preserving test.
+
+diff --git a/platform/inc/marionette_monitor_rx_observe.h b/platform/inc/marionette_monitor_rx_observe.h
+new file mode 100644
+--- /dev/null
++++ b/platform/inc/marionette_monitor_rx_observe.h
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MARIONETTE_MONITOR_RX_OBSERVE_H
++#define MARIONETTE_MONITOR_RX_OBSERVE_H
++#include <linux/types.h>
++void marionette_monitor_post_frame(const u8 *frame, u32 linear_length);
++#endif
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+@@ -15,6 +15,10 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <linux/module.h>
++#include <linux/atomic.h>
++#include "marionette_sta_monitor.h"
++#include "marionette_monitor_rx_observe.h"
+ #include "hal_hw_headers.h"
+ #include "dp_types.h"
+ #include "dp_rx.h"
+@@ -36,6 +40,100 @@
+ #ifdef WLAN_TX_PKT_CAPTURE_ENH
+ #include "dp_rx_mon_feature.h"
+ #endif
++
++/* Observation only; include deferred processing after capture returns. */
++static atomic_long_t marionette_mon_desc_total = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_desc_valid_fc = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_desc_mgmt = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_desc_action = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_desc_data = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_desc_control = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_post_total = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_post_action = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_post_awdl = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_missing_hal_ops = ATOMIC_LONG_INIT(0);
++static int marionette_mon_counter_get(char *buffer,
++				      const struct kernel_param *parameter)
++{
++	return scnprintf(buffer, PAGE_SIZE, "%ld\n",
++			 atomic_long_read(parameter->arg));
++}
++static const struct kernel_param_ops marionette_mon_counter_ops = {
++	.get = marionette_mon_counter_get,
++};
++module_param_cb(marionette_mon_desc_total, &marionette_mon_counter_ops,
++		&marionette_mon_desc_total, 0400);
++module_param_cb(marionette_mon_desc_valid_fc, &marionette_mon_counter_ops,
++		&marionette_mon_desc_valid_fc, 0400);
++module_param_cb(marionette_mon_desc_mgmt, &marionette_mon_counter_ops,
++		&marionette_mon_desc_mgmt, 0400);
++module_param_cb(marionette_mon_desc_action, &marionette_mon_counter_ops,
++		&marionette_mon_desc_action, 0400);
++module_param_cb(marionette_mon_desc_data, &marionette_mon_counter_ops,
++		&marionette_mon_desc_data, 0400);
++module_param_cb(marionette_mon_desc_control, &marionette_mon_counter_ops,
++		&marionette_mon_desc_control, 0400);
++module_param_cb(marionette_mon_post_total, &marionette_mon_counter_ops,
++		&marionette_mon_post_total, 0400);
++module_param_cb(marionette_mon_post_action, &marionette_mon_counter_ops,
++		&marionette_mon_post_action, 0400);
++module_param_cb(marionette_mon_post_awdl, &marionette_mon_counter_ops,
++		&marionette_mon_post_awdl, 0400);
++module_param_cb(marionette_mon_missing_hal_ops, &marionette_mon_counter_ops,
++		&marionette_mon_missing_hal_ops, 0400);
++
++static void marionette_monitor_descriptor(struct dp_soc *soc, void *descriptor)
++{
++	struct hal_soc *hal;
++	u16 fc;
++
++	if (!marionette_sta_monitor_enabled() ||
++	    !descriptor)
++		return;
++	atomic_long_inc(&marionette_mon_desc_total);
++	hal = (struct hal_soc *)soc->hal_soc;
++	if (!hal || !hal->ops ||
++	    !hal->ops->hal_rx_get_mpdu_frame_control_valid ||
++	    !hal->ops->hal_rx_get_frame_ctrl_field) {
++		atomic_long_inc(&marionette_mon_missing_hal_ops);
++		return;
++	}
++	if (!hal_rx_get_mpdu_frame_control_valid(soc->hal_soc, descriptor))
++		return;
++	atomic_long_inc(&marionette_mon_desc_valid_fc);
++	fc = hal_rx_get_frame_ctrl_field(soc->hal_soc, descriptor);
++	switch (fc & 0x0c) {
++	case 0:
++		atomic_long_inc(&marionette_mon_desc_mgmt);
++		if ((fc & 0xf0) == 0xd0)
++			atomic_long_inc(&marionette_mon_desc_action);
++		break;
++	case 4:
++		atomic_long_inc(&marionette_mon_desc_control);
++		break;
++	case 8:
++		atomic_long_inc(&marionette_mon_desc_data);
++		break;
++	}
++}
++void marionette_monitor_post_frame(const u8 *frame, u32 length)
++{
++	static const u8 bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
++	static const u8 prefix[] = {0x7f, 0, 0x17, 0xf2, 8, 0x10};
++
++	if (!marionette_sta_monitor_enabled() ||
++	    !frame || length < 2)
++		return;
++	atomic_long_inc(&marionette_mon_post_total);
++	if (frame[0] != 0xd0)
++		return;
++	atomic_long_inc(&marionette_mon_post_action);
++	if (length >= 40 && !(frame[1] & 0x40) &&
++	    !memcmp(frame + 16, bssid, sizeof(bssid)) &&
++	    !memcmp(frame + 24, prefix, sizeof(prefix)) &&
++	    (frame[30] == 0 || frame[30] == 3))
++		atomic_long_inc(&marionette_mon_post_awdl);
++}
+ 
+ /*
+  * PPDU id is from 0 to 64k-1. PPDU id read from status ring and PPDU id
+@@ -1309,6 +1407,7 @@
+ 	msdu_orig = head_msdu;
+ 
+ 	rx_desc = qdf_nbuf_data(msdu_orig);
++	marionette_monitor_descriptor(soc, rx_desc);
+ 	qdf_mem_zero(&buf_info, sizeof(buf_info));
+ 	hal_rx_populate_buf_info(soc, &buf_info, rx_desc);
+ 
+@@ -1677,6 +1776,7 @@
+ 		goto mpdu_stitch_fail;
+ 
+ 	rx_desc = qdf_nbuf_get_frag_addr(head_msdu, 0) - rx_mon_tlv_size;
++	marionette_monitor_descriptor(soc, rx_desc);
+ 
+ 	if (hal_rx_tlv_mpdu_len_err_get(soc->hal_soc, rx_desc)) {
+ 		/* It looks like there is some issue on MPDU len err */
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
+@@ -17,6 +17,7 @@
+  * PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include "marionette_monitor_rx_observe.h"
+ #include "hal_hw_headers.h"
+ #include "dp_types.h"
+ #include "dp_rx.h"
+@@ -1836,6 +1837,8 @@
+ 		goto mon_deliver_fail;
+ 	}
+ 
++	marionette_monitor_post_frame(qdf_nbuf_data(mon_mpdu),
++				     qdf_nbuf_headlen(mon_mpdu));
+ 	dp_rx_mon_process_dest_pktlog(soc, mac_id, mon_mpdu);
+ 
+ 	/* monitor vap cannot be present when mcopy is enabled

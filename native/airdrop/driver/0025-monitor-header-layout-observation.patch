@@ -1,0 +1,108 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] compare monitor HAL header storage with valid descriptor FC
+
+0024 got 444 valid monitor descriptors including 20 Action types, and 444
+post-restitch frames but zero post-restitch Actions. Counts do not prove those
+Actions are AWDL, and equal input/output counts do not demonstrate packet loss.
+Compare the existing HAL header pointer with metadata frame control, count
+exact AWDL signatures there and within the bounded monitor descriptor region,
+and log layout/tag values for at most eight Action descriptors. This reads
+metadata already used by the restitch routines, never selects a new packet
+header or changes reconstruction. No payload logging, packet-fate changes or
+radio settings. Missing/out-of-bounds header storage is reported explicitly.
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c
+@@ -52,6 +52,11 @@
+ static atomic_long_t marionette_mon_post_action = ATOMIC_LONG_INIT(0);
+ static atomic_long_t marionette_mon_post_awdl = ATOMIC_LONG_INIT(0);
+ static atomic_long_t marionette_mon_missing_hal_ops = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_hdr_fc_match = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_hdr_action = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_hdr_awdl = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_tlv_awdl = ATOMIC_LONG_INIT(0);
++static atomic_long_t marionette_mon_hdr_unavailable = ATOMIC_LONG_INIT(0);
+ static int marionette_mon_counter_get(char *buffer,
+ 				      const struct kernel_param *parameter)
+ {
+@@ -81,6 +86,71 @@
+ 		&marionette_mon_post_awdl, 0400);
+ module_param_cb(marionette_mon_missing_hal_ops, &marionette_mon_counter_ops,
+ 		&marionette_mon_missing_hal_ops, 0400);
++module_param_cb(marionette_mon_hdr_fc_match, &marionette_mon_counter_ops,
++		&marionette_mon_hdr_fc_match, 0400);
++module_param_cb(marionette_mon_hdr_action, &marionette_mon_counter_ops,
++		&marionette_mon_hdr_action, 0400);
++module_param_cb(marionette_mon_hdr_awdl, &marionette_mon_counter_ops,
++		&marionette_mon_hdr_awdl, 0400);
++module_param_cb(marionette_mon_tlv_awdl, &marionette_mon_counter_ops,
++		&marionette_mon_tlv_awdl, 0400);
++module_param_cb(marionette_mon_hdr_unavailable, &marionette_mon_counter_ops,
++		&marionette_mon_hdr_unavailable, 0400);
++static bool marionette_monitor_is_awdl(const u8 *frame, u32 length)
++{
++	static const u8 bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
++	static const u8 prefix[] = {0x7f, 0, 0x17, 0xf2, 8, 0x10};
++
++	return length >= 40 && frame[0] == 0xd0 && !(frame[1] & 0x40) &&
++		!memcmp(frame + 16, bssid, sizeof(bssid)) &&
++		!memcmp(frame + 24, prefix, sizeof(prefix)) &&
++		(frame[30] == 0 || frame[30] == 3);
++}
++static void marionette_monitor_header(struct dp_soc *soc, const u8 *descriptor,
++				      u16 metadata_fc)
++{
++	struct hal_soc *hal = (struct hal_soc *)soc->hal_soc;
++	const u8 *header;
++	long offset;
++	u32 i, length = soc->rx_mon_pkt_tlv_size;
++	u16 header_fc;
++	u64 tag = 0;
++
++	if (!hal->ops->hal_rx_desc_get_80211_hdr || length < 40) {
++		atomic_long_inc(&marionette_mon_hdr_unavailable);
++		return;
++	}
++	header = hal_rx_desc_get_80211_hdr(soc->hal_soc, (void *)descriptor);
++	offset = (long)(header - descriptor);
++	if (!header || offset < 16 || offset > length - 40) {
++		atomic_long_inc(&marionette_mon_hdr_unavailable);
++		return;
++	}
++	header_fc = (u16)header[0] | ((u16)header[1] << 8);
++	if (header_fc == metadata_fc)
++		atomic_long_inc(&marionette_mon_hdr_fc_match);
++	if (header[0] == 0xd0)
++		atomic_long_inc(&marionette_mon_hdr_action);
++	if (marionette_monitor_is_awdl(header, length - offset))
++		atomic_long_inc(&marionette_mon_hdr_awdl);
++	/* Search only the already-present monitor descriptor/TLV region. This
++	 * is observation, not a new header selection or reconstruction rule. */
++	for (i = 0; i <= length - 40; i++) {
++		if (marionette_monitor_is_awdl(descriptor + i, length - i)) {
++			atomic_long_inc(&marionette_mon_tlv_awdl);
++			pr_info("MARIONETTE_MON_TLV_AWDL offset=%u hal_offset=%ld\n", i, offset);
++			break;
++		}
++	}
++	if ((metadata_fc & 0x00fc) == 0x00d0 &&
++	    atomic_long_read(&marionette_mon_desc_action) <= 8) {
++		memcpy(&tag, header - 16, sizeof(tag));
++		pr_info("MARIONETTE_MON_ACTION_LAYOUT metadata_fc=0x%x header_fc=0x%x offset=%ld tlv_tag=0x%llx normal_size=%u monitor_size=%u\n",
++			metadata_fc, header_fc, offset, (unsigned long long)tag,
++			soc->rx_pkt_tlv_size, soc->rx_mon_pkt_tlv_size);
++	}
++}
++
+ 
+ static void marionette_monitor_descriptor(struct dp_soc *soc, void *descriptor)
+ {
+@@ -115,6 +185,7 @@
+ 		atomic_long_inc(&marionette_mon_desc_data);
+ 		break;
+ 	}
++	marionette_monitor_header(soc, descriptor, fc);
+ }
+ void marionette_monitor_post_frame(const u8 *frame, u32 length)
+ {

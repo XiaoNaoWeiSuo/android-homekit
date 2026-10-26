@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
@@ -10,6 +11,8 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.NFC" />
@@ -17,14 +20,59 @@
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- 收到文件时在其他应用之上弹确认/进度悬浮窗（和系统 AirDrop 一样）。
+         用户拒绝时自动退回通知 + 应用内对话框，功能不受影响。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="Marionette"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/AppTheme">
+        <activity
+            android:name=".airdrop.AirDropActivity"
+            android:exported="false" />
+        <!-- 系统分享面板里的「隔空投送」目标：任意应用分享文件都能直接进到这里，
+             实时扫描附近设备、点按即发。 -->
+        <activity
+            android:name=".airdrop.AirDropShareActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="隔空投送"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+        <!-- 通知栏上的「接收 / 拒绝」：没有悬浮窗权限时的退路。 -->
+        <receiver
+            android:name=".airdrop.AirDropActionReceiver"
+            android:exported="false" />
+        <service
+            android:name=".airdrop.AirDropResidentService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="connectedDevice" />
+        <service
+            android:name=".airdrop.AirDropService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <provider
+            android:name=".airdrop.AirDropFilesProvider"
+            android:authorities="dev.local.mihotspot.airdrop.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -45,7 +93,6 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.USER_UNLOCKED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>

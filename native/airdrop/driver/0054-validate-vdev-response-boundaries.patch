@@ -1,0 +1,53 @@
+From: Marionette driver research
+Subject: [EXPERIMENTAL] wma: validate vdev response bounds before dereference
+
+Pinned baseline: WLAN 518147fd7e0199758efe9bd96a22c9c2ea30bcd9.
+max_bssid is an exclusive bound (allocation/iteration elsewhere use <).
+The delete response allowed id == max_bssid. The stop handler dereferenced
+vdev_mlme before validating arguments and addressed an unused slot before
+checking rsp->vdev_id. Check nulls, bounds and referenced-vdev identity first.
+
+Does not retain references, defer DP teardown, change STOP/DELETE ordering,
+silence firmware asserts, or establish recovery concurrency safety. Validate
+against the actual 0053 build tree before compiling/loading; not deployed.
+
+--- a/qcacld-3.0/core/wma/src/wma_dev_if.c
++++ b/qcacld-3.0/core/wma/src/wma_dev_if.c
+@@ -402,11 +402,11 @@
+ 	struct wma_txrx_node *iface = NULL;
+ 
+ 	wma = cds_get_context(QDF_MODULE_ID_WMA);
+-	if (!wma)
++	if (!wma || !rsp)
+ 		return QDF_STATUS_E_FAILURE;
+ 
+ 	/* Sanitize the vdev id*/
+-	if (rsp->vdev_id > wma->max_bssid) {
++	if (rsp->vdev_id >= wma->max_bssid) {
+ 		wma_err("vdev delete response with invalid vdev_id :%d",
+ 			rsp->vdev_id);
+ 		QDF_BUG(0);
+@@ -2593,15 +2593,20 @@
+ 	QDF_STATUS status = QDF_STATUS_E_FAILURE;
+ 
+ 	wma = cds_get_context(QDF_MODULE_ID_WMA);
+-	if (!wma)
++	if (!wma || !rsp || !vdev_mlme || !vdev_mlme->vdev)
+ 		return status;
+-
+-	iface = &wma->interfaces[vdev_mlme->vdev->vdev_objmgr.vdev_id];
+ 
+ 	if (rsp->vdev_id >= wma->max_bssid) {
+ 		wma_err("Invalid vdev_id %d from FW", rsp->vdev_id);
+ 		return QDF_STATUS_E_INVAL;
+ 	}
++
++	iface = &wma->interfaces[rsp->vdev_id];
++	/* The dispatcher owns a reference to vdev_mlme->vdev. Do not
++	 * deliver a late response through a cleared/replaced WMA slot. */
++	if (wlan_vdev_get_id(vdev_mlme->vdev) != rsp->vdev_id ||
++	    iface->vdev != vdev_mlme->vdev)
++		return QDF_STATUS_E_INVAL;
+ 
+ 	status = wma_handle_vdev_stop_rsp(wma, rsp);
+ 

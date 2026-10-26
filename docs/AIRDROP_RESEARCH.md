@@ -1,0 +1,160 @@
+# AirDrop 社区核对与下一阶段（2026-10-24）
+
+## 当前问题与资料给出的边界
+
+- AWDL 本身是设备直连。项目当前必须先关联 AP，是 0009/0012 + STA 的 kiwi 固件路径限制，不是 AirDrop 必须联网。不能仅删除 radio.sh 的关联检查：monitor open 和 ROC 在未关联状态已有 ENOTCONN/EINVAL 证据。
+- OWL 的 [README](https://github.com/seemoo-lab/owl#requirements) 和 [netutils.c](https://github.com/seemoo-lab/owl/blob/master/daemon/netutils.c) 明确区分 active monitor，实际设置 NL80211_MNTR_FLAG_ACTIVE。普通监听能收到帧不等于能及时回复硬件 ACK；缺 ACK 可导致对端重复发送、吞吐严重下降。
+- [Qualcomm #60](https://github.com/seemoo-lab/owl/issues/60) 直接讨论 con_mode=4 和不支持 active monitor，但没有可复用的 kiwi_v2 内置驱动修复；评论转向外置适配器。不能据此声称 Android 内置芯片已经有成熟方案。
+- [Android #66](https://github.com/seemoo-lab/owl/issues/66) 的交叉编译进展与运行时不支持 monitor 并存。编译通过不是硬件可用证据。
+- [丢包 #38](https://github.com/seemoo-lab/owl/issues/38) 中有广播/发现可见而单播间歇丢失的复现，包含外部设备已发响应而接收侧未见的观察。这里只是相似症状，不是本项目根因证明。
+- OpenDrop [README](https://github.com/seemoo-lab/opendrop#current-limitationstodos) 仍列出 BLE 触发、身份验证等限制。[#119](https://github.com/seemoo-lab/opendrop/issues/119) 有较新 iOS/macOS 兼容失败报告，但不能据评论断言协议已整体失效。
+- 联系人模式的上游路径使用真实的 Apple AirDrop 身份材料；本项目尚无联系人验证，不把 Everyone 模式等同完整复刻。这轮没有读取或导出用户钥匙串。
+
+## 下一步实现顺序
+
+1. 保留当前只读接收、TX 提交、空口响应、TAP 收包、TCP/TLS/Upload 的分层证据。已有 SYN/RST、SYN/SYN-ACK，仍没有完整 TLS/文件传输。
+2. 硬件 ACK 专项：对照本机 Mac 地址、真正的 AirDrop 服务端口，观察 802.11 重试/ACK 与 TCP 回复。不要使用上次别的设备的 8770 端口。用户暂时不做无线测试，这一步待现场恢复。
+3. 时隙对齐：以同一 master 的 TSF/AW 相位与 peer 的当前信道作为发包条件；当前 station fixed-channel 是同 AP 局部方案，不覆盖异信道或无 AP。200/400ms 窗口未证明改善，不作为修复发布。
+4. 无 AP 方案：静态审计独立 P2P-device/GO vdev 的生命周期、ROC、ACK 地址归属和接收路由。只有有明确源码路径后才实现；避免在 STA 未关联时直接强开监视或删除固件前置条件。互联网访问不是目标前置条件。
+5. 生命周期：0053 对 MLO 查询的软中断 mutex 修复已编译/短测；独立 STOP/DELETE 竞态仍需修复，不重新累计已拒绝的 0028 方案。
+6. 双向文件端到端后，才进入重复传输、拒绝/超时、睡眠/开机恢复、普通 Wi-Fi 丢包和功耗验收；BLE 唤醒和联系人身份另有明确实现边界。
+
+## 本轮不依赖无线的实现
+
+Android 后端增加可选 MARIONETTE_CONTROL_STDIN：启动者关闭管道/死亡，root 子进程自行退出并释放 HTTPS/mDNS 描述符。普通 CLI 不开启此机制。EOF 退出不是传输成功，也不保证发送 mDNS goodbye；缓存失效仍按网络协议处理。
+
+发送端 stderr 始终排空，避免无日志文件的 SEND 进程被满管道阻塞；等待线程在通知退出前先等待 stdout 事件泵收尾。真实后台 EOF 子进程测试通过；Android 真机离线测试连续两次 HTTPS 绑定 8771，关管道后均约 4ms 退出，第二次绑定成功。未因此证明 app crash/设备重启的全部恢复链。
+
+资料原文与 GitHub issue/comments 保存在 build/airdrop/community-research/。通用 web 搜索接口不可用时直接读取上游 GitHub API/raw 源码；未使用二手推测替代源码。
+
+## 固定源码的 P2P 审计与单播 ACK 修复
+
+本节依据 MiCode WLAN 518147fd 与 kernel 7fad87dc，原文和 SHA-256 在 build/airdrop/p2p-audit/sources.json。
+
+| 层次 | 已核对的约束 | 推进条件 |
+| --- | --- | --- |
+| cfg80211 mlme.c:722 | P2P_DEVICE 的非 public action 返回 EOPNOTSUPP；AWDL 是 vendor action | 必须有独立、默认关闭的精确 AWDL 门；现有 0002 仅接受 STATION |
+| cfg80211 0043 | AWDL data 例外也只接受 STATION | 不能只在 radio.sh 把 wlan0 改成 p2p0 |
+| HDD wlan_hdd_p2p.c:156 | ROC 先检查 STA+monitor concurrency，有则直接 EINVAL | 与当前监视接收方案存在冲突；需完整接收替代或经审计的有界共存 |
+| P2P wlan_p2p_roc.c:79 | ROC 转成 SCAN_TYPE_P2P_LISTEN，经过有效 vdev、scan 及 ready-on-channel 事件 | 请求接受不是到达目标信道，必须匹配 ready/cookie/frequency 后发 |
+| P2P wlan_p2p_off_chan_tx.c:1233 | no_ack 选择 download completion；否则选择 OTA completion callback | 软件提交成功、下载完成与空口确认不得混称 |
+| 接收 | 现有 awdlsink 依赖 monitor，尚未证明 P2P 自身能上送第三方 AWDL 数据 | 是无 AP 方案仍未解决的必要条件 |
+
+不为上述未解决路径新增“假就绪”开关。本节不是无 AP 已实现的声明。
+
+已实现的发送修复：filin 的 NL80211 请求原先对所有帧写 DONT_WAIT_FOR_ACK；现在只有组地址设置它，单播不设置，让驱动走已有 OTA 完成路径。Netlink ACK 仍只说明请求接受；本轮没有实现/验证对无线 TX_STATUS 的 cookie 跟踪，也没有证明硬件重传次数。软件盲重发仅保留给原 AF_PACKET 注入后端，避免叠加到 NL80211 单播。
+
+编码迁到可在 macOS 测试的 frame_tx.rs：检查命令、接口、频率、原帧字节、NLA 对齐、单播/广播/组播 flag、短帧及过大帧拒绝。Linux/Android 生产路径直接使用该编码器；主机测试不依赖旧 unsupported OS stub。Android 目标 tests 编译检查、Rust 测试和 clippy 通过；无线行为待用户恢复测试条件后验收。
+
+## TX_STATUS 诊断实现（2026-10-24）
+
+filin 现在动态解析 nl80211 的 mlme multicast group 并订阅，按接口索引和当前单播请求返回的 cookie 跟踪 CMD_FRAME_TX_STATUS。解析器处理同一数据报里的 cookie/Netlink ACK/无线状态、状态早于 cookie、重复或无关事件，拒绝截断与重复关键属性。只有请求已被接受且 cookie 匹配才统计单播 ACK；广播不进入该统计。后端主循环每约 100ms 非阻塞排空迟到状态，每次最多 32 个数据报，等待请求使用一个共享 3 秒截止时间，不等待无线 ACK 阻塞主循环。
+
+GET /status 新增 tx_status（AF_PACKET 后端为 null）：
+
+| 字段 | 含义 |
+| --- | --- |
+| subscribed | 是否成功订阅 mlme；false 时不能用零确认数推断未发出 |
+| requests_accepted | Netlink ACK 成功的请求数，含广播，不能当空口送达 |
+| requests_failed | 请求拒绝、超时或解析失败；超时未必表示没有发射 |
+| unicast_acked | 驱动报告 ACK 的匹配单播；不代表 TLS/Upload 或应用接受 |
+| unicast_no_ack | 匹配单播收到明确未 ACK 状态 |
+| status_missing | 已取得 cookie 的单播超过 5 秒没有状态，或 128 项队列上限淘汰 |
+| cookie_missing | 已接受的单播没有取得可归属 cookie；观测缺口 |
+| pending | 尚待状态的已接受单播数 |
+
+状态/早到缓存均有 128 项上限。不保证驱动一定发送 TX_STATUS 或 cookie 唯一性跨模块重载；重开后端会重建 tracker。本轮是实现和离线验证，遵从用户指示未订阅真机无线组、未发包、未部署 APK。解析/归属测试共 8 项，另有 /status JSON 测试；Android 目标 clippy 和编译检查通过。旧仅测试的 frame_ack 解析器与对应镜像测试已移除，真实发送路径统一使用 tx_status::parse，避免测试与生产实现偏离。
+
+后续验收：真实单播负对照（不存在的对端）、已知对端正对照、广播不计单播确认、最后一帧迟到状态、接口重建后计数归零，再与外部抓包和 TCP/TLS 结果对应。当前不把这些离线用例当作任何无线兼容证明。
+
+## 接收准入和组播误锁定修复（2026-10-24）
+
+源码确认 runtime 的 data RX 分支无条件调用 note_unicast_rx，连 mDNS 组播也被算作单播传输，刷新 transfer pin；在非 fixed-channel 模式会阻止正常信道序列更新。监视接口上的其他目的地址单播也没有明确目的地址过滤，A-MSDU 子帧直接写入 TAP。
+
+新增 data_rx.rs 作为真实 RX 的统一入口：检查 AWDL BSSID、DATA/QOS_DATA 类型、支持的三地址布局及 LLC/SNAP 完整 OUI；排除本机反射与其他目的单播；聚合包逐子帧检查目的地址，仅交付本机和组地址。只有真正交付本机的单播才更新 transfer pin。现有 peer 存在性检查仍保留。未实现的分片、加密、四地址及 HT-control 布局明确拒绝，不把其扩展头当作业务数据。
+
+Action RX 同样先检查 MAC 类型、BSSID 和布局，再处理时钟。错误包不会更新 TSFT bridge。已有 /status 的 mdns_rx_self 同时统计 TAP 出站本机 mDNS，因此其增长不能作为本机无线反射证据。
+
+新增 5 项数据路径回归（单播/组播、第三方/反射、错误头/OUI/截断、QoS/Retry/FCS、混合 A-MSDU）和 1 项错误同步帧不得修改时钟的回归。测试不证明该缺陷是现场 Finder 服务抖动的根因；需要在具备无线条件后对应空口/TAP/mDNS 缓存观察。本轮未操作手机或无线接口。
+
+## 发现事件顺序与 mDNS 重播生命周期（2026-10-24）
+
+源码复现的竞态：spawn_browse 先启动线程，主线程才输出 browsing（Android 收到后清空列表）。缓存命中的 peer 可以先于 browsing 到达，被随后清空，去重表又阻止同样的 peer 重发。现在 spawn_browse_with_started 在同一消费线程先发重置信号，再消费任何缓存事件；只有实际启动成功才发信号。
+
+浏览通道断开原来走立即重试，可能忙循环。现在区分超时与断开，结束时移除已报告的 peer；接收 supervisor 观察线程结束并重建发现会话。地址集合顺序改变不再产生伪“设备变化”。3 项确定性无网络测试覆盖预先缓存的 peer 事件顺序、断开不重试/及时 lost、重复 removal 和地址集合重排。
+
+filin 的单帧重播缓存原来将所有本机 mDNS 目的端口 5353 数据当成宣告，查询和 TTL=0 goodbye 也会被保存。现在只缓存完整、成功的标准响应；查询不覆盖缓存，goodbye/不完整响应清除缓存；缓存重播时间不超过记录中最短 TTL 且上限 45 秒。原始报文仍按原路径发送；此处只改变后续重播，未改 DNS 原始字节/UDP checksum。报文内 TTL 本身未随重播重写，不能据此保证对端缓存恰在本机超时同时消失。它仍是一个报文的缓存，并非完整 DNS 记录缓存；多报文服务重建/进程无 goodbye 强退仍需后续验证。
+
+新增 mdns_cache.rs 与真实发送路径集成，5 项用例验证正向响应、查询、撤销、混合 TTL、截断、压缩指针、IPv4 options/分片以及缓存状态迁移。Rust workspace 报告 450 项（含条件跳过/辅助项）、Android 目标 filin clippy、Debug APK 构建与 JVM 测试通过。未进行无线测试，不把代码竞态证据当作现场 Finder 抖动的唯一根因。
+
+## 真实回环 TLS 与一次性接收确认（2026-10-24）
+
+新增 server_tls_tests.rs，直接运行生产 handle_tls_connection、rustls 双端、确认目录协议、CPIO/dvzip 解码和磁盘保存；监听仅 127.0.0.1 随机端口，不启动 AWDL/mDNS。测试线程清理关闭 socket，临时接收目录在退出时删除。
+
+发现并修复：
+- 以前同连接的 approved 布尔值可跳过共享 approval map 的消费，上传后仍留下一次跨连接授权；现所有 Upload 都消费同一份带期限的批准。
+- 新 Ask 在读取正文前撤销该 peer 的旧批准，拒绝或解析失败不会留下旧授权。
+- handler 过去只按路径分发，GET/PUT /Upload 也可进入保存路径；现在只接受 POST，并在 TLS 入口于 Expect/正文前返回 405。
+- TLS 入口与完整 HTTP parser 共用严格请求行解析，缺版本、多余分隔及非法版本不再造成授权门与路径分发不一致。
+
+4 项真实 TLS 回归：
+1. 同连接 Discover/Ask/Expect:100-continue/chunked Upload，等待 interim 响应后才发送，8193 字节文件逐字节匹配；随后跨连接重放在正文前 403。
+2. 已有批准后拒绝新 Ask，旧批准消失；GET/PUT/HEAD Upload 在读取正文前 405，目录为空。
+3. 使用真实 RustlsTransport 每阶段新连接，连续两次接受/上传，重复文件保存 sample.bin/1-sample.bin，原文件保持原内容。
+4. 注入过期的批准时间，Upload 在发 100 Continue 前返回 403。
+另有请求行解析负例。这里验证的是批准过期，不是等待真实 UI 45 秒的完整超时交互。
+
+仍是按 peer IP 的短期批准，不是 Apple 联系人身份验证；并发多请求的用户界面/审批排队、真实 Mac/iPhone TLS 兼容性、无线链路均未在这轮验收。不能把“Rust 客户端对 Rust 服务端的回环传输成功”写成 Apple 无线互传成功。
+
+## 上游 TLS 身份与 Ask 字段核对（2026-10-24）
+
+再次读取 [OpenDrop config.py](https://github.com/seemoo-lab/opendrop/blob/master/opendrop/config.py)、[client.py](https://github.com/seemoo-lab/opendrop/blob/master/opendrop/client.py)、[server.py](https://github.com/seemoo-lab/opendrop/blob/master/opendrop/server.py)。具体快照哈希在 build/airdrop/community-research/tls-ask-source-snapshot.json；master 是移动分支，复核以保存原文为准。
+
+确认的差异与修改：
+- 上游 get_ssl_context 加载本机证书/私钥，发送连接可响应接收端的客户端证书请求；本地原先 with_no_client_auth 显式禁用。现在 build_client_config 为发送进程生成一次自签身份并交给 rustls，整个 Discover/Ask/Upload 复用配置。新增 build_client_config_with_identity 便于显式自有身份和测试，不读取系统钥匙串、不伪造 Apple 签名。
+- 上游 send_ask 的 SenderID 是 config.service_id 字符串，默认12位十六进制。本地原来 plist Data 的依据只是不存在的文档引用及镜像测试。现内部仍保存随机6字节，序列化为小写十六进制字符串。测试直接检查字符串类型和值。
+- 发送普通文件仅携带 Files，不再带空 Items；补 FileIsDirectory=false 和 ConvertMediaFormats=false，对应上游文件请求形状。未实现 URL 传输，未声称目录支持。
+- 服务器证书的握手签名算法列表从实际 ring provider 获取，避免宣称支持 provider 不提供的 SHA1 等算法。自签证书可被接受不等于对端或 Apple 账户可信；已修正文档里的“可信 AWDL 链路”措辞。
+
+新增3项真实 rustls 协议握手回归：TLS1.2/TLS1.3 请求客户端身份时接收并验证证书；要求身份时匿名客户端失败；无需身份时不发送证书。现有实际 loopback TLS 文件收发测试继续通过。workspace 报告458项（含条件跳过/辅助项），Debug构建/JVM单测/lintDebug通过，日志 build/airdrop/apple-wire-*。
+
+限制：这里只是与已公开实现对齐，不是当代 Apple 设备必须要求客户端证书的证明；上次无线 TCP 握手尚未完成，不能把这些 TLS/Ask 差异写作其根因。身份仍为每进程临时证书，未持久化/导入 Apple 联系人认证凭证。没有部署、没有无线测试，完整 AirDrop 目标未完成。
+
+## Monitor 停止/删除静态审计（2026-10-24）
+
+固定源码来源与哈希：build/airdrop/monitor-stop-audit/sources.json；逐文件结论 audit.json。当前确认的顺序：
+
+| 阶段 | 当前行为 | 缺口 |
+| --- | --- | --- |
+| HDD close | reset DP，等待 pending UP | 没有 STOP 完成屏障 |
+| SME/vdev delete | 开始逻辑删除 | 正常 STOP 回调查找需对象有效 |
+| WMA detach | DOWN 状态机发异步 STOP | 尚未等待固件 |
+| WMA release | detach DP / 立即释放引用 | 对象可开始 DELETE |
+| target-if STOP response | 取消 STOP timer，再分发回调 | 提前 DELETE/逻辑删除妨碍迟到响应 |
+
+HDD 名为 hdd_monitor_mode_vdev_status 的函数只等待 UP event，不能作为停止屏障。target-if 的 STOP 回调先停止 response timer，再通过状态校验的对象引用调用 WMA。等待必须放在逻辑删除之前，并保持回调所需对象有效。已拒绝 0028 的 WMA 延迟引用方案曾使 DP timer 和关机泄漏进入错误顺序，不能直接重用。
+
+真正顺序修复的必要条件：在正常上下文发起停止；明确 STOP/DOWN 完成与超时/SSR 失败信号；先同步停止 DP timer，保证持有有效 vdev 引用；不阻塞处理 WMI 响应的线程；仅完成正常 DOWN 后允许逻辑删除，失败交已有 recovery 且不双释放。不以轮询 state 或吞掉 ASSERT 代替这些契约。此完整改动尚未实现，仍需当前构建树的 MLME callback/锁依赖审计。
+
+独立 0054 修复响应参数与索引：delete 回调把 > max_bssid 改为 >=；stop 回调先验证 rsp/vdev_mlme/vdev 和 ID 边界，确认 WMA 槽仍对应受引用 vdev，再分发。没有延迟引用、改结构、改 timer 或抑制原有断言，不宣称解决 STOP/DELETE。
+
+check-vdev-response-boundaries.py 在临时目录应用补丁，提取真实 C 回调编译到最小 host shim。原始源码由 ASan 捕获越界；修正版通过 ASan/UBSan 的空值、边界、对象身份及有效回调用例。该 shim 不模拟 firmware/objmgr 并发，不是内核 ABI/运行验证。远端构建环境上次检查不可达，本轮未完整编译驱动、未部署、未操作无线。
+
+### 恢复构建后的回调链核对（2026-10-24）
+
+通过 Tailscale 实际节点地址 `100.121.129.99` 重新访问原构建树。`wma_utils.c` 与 `wlan_mlme_vdev_mgr_interface.c` 的真实源码进一步确认，先前“异步 DOWN”表述不够精确：状态机事件在当前调用链推进，只有固件 STOP 响应是异步的。
+
+| 源码位置 | 实际行为及影响 |
+| --- | --- |
+| wma_utils.c:4712 / wma_mon_mlme_vdev_stop_send | 提交 STOP 后不等回复，直接递交 MLME_DOWN_REQ；STOP 发送失败也继续 |
+| wma_utils.c:4737 / wma_mon_mlme_vdev_down_send | 提交 DOWN 后立即递交 DOWN_COMPLETE；DOWN 发送失败也继续 |
+| wlan_mlme_vdev_mgr_interface.c:1984 / mon_mlme_ops | 未注册 ext_stop_rsp、stop_continue、notify_down_complete；通用 STA/AP 停止回调不适用于此表 |
+| wlan_vdev_mgr_tgt_if_rx_api.c:155 | 仅当 ext_stop_rsp 非空才调用外部停止响应；无 monitor 回调时不进入 WMA stop handler |
+
+因此状态变成 INIT 不能证明 STOP 计时器已取消或固件已停。已拒绝 0028 仅修改 WMA 和对象查找，没有补 monitor ops，其 WMA 等待收尾分支在该 monitor 响应链上不可达。这是静态可确认的缺口，不把它写成此前全部崩溃/重启的唯一根因。新修复必须同时覆盖逻辑删除前启动停止、真实 STOP 响应派发、发送失败/超时/SSR 通知、DP timer 停止及引用释放；仅恢复旧补丁或添加等待都不完整。
+
+真实源码快照 `build/airdrop/monitor-stop-audit/wma_utils-current.c` SHA256 `03be8e587083ca20c3c8415e47c88eccf74e12f22f5add0bf9be696b85a5e771`；MLME interface SHA256 `d2c5325c9ec6929abe0121006b0e9be27e2995373be10345b5d8cf78431c18b8`。0054 链接产物的回调反汇编/重定位记录在 `build/airdrop/driver/candidate-0054/`。
+
+0054 在实际 0053 树应用成功，全模块构建退出 0，候选 SHA256 `80680eaec756687e3a47464fd92b78e2749f68b84335d32821f074a440fc4855`。512/512 导入 CRC 对上实际 provider 表；取回构建源码跑 ASan/UBSan 边界回归通过。CFI/LTO 构建选项保留，但没有独立完成 CFI ABI 审核；缺 vmlinux 导致模块 BTF 未生成，浅克隆版本脚本和根 Module.symvers 警告仍在。未加载驱动、未启动无线测试；不把编译、CRC 或 host shim 当作运行验收。
+
+完整模块保留在构建机 `/home/lin/workspace/xiaomi13-airdrop/audit-0054/candidate-0054.ko`，CRC 检查在远端执行。当前 DERP 链路传回大文件未完成/超时，本地只保留完整校验记录、构建日志、源码及反汇编，已删除不完整模块/归档；取回方法及位置见本地 `ARTIFACT.txt`，后续须核对 SHA256。

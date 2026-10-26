@@ -1,0 +1,37 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] restore normal RXDMA layout after monitor filtering
+
+The actual KIWI monitor 1.0 build explicitly sets rxdma1_enable=0. Its monitor
+filter update then programs RXDMA_BUF, the normal data ring, using the monitor
+layout. Both full and other-BSS-only filter experiments lost 47/48 gateway
+responses, including after deleting the monitor until stock restoration.
+Under 0009 only and only with the shared-ring setting, reapply the existing
+architecture-specific normal RX ring configuration after monitor filter
+update/reset. Preserve the separate monitor status-ring configuration.
+This verifies whether ordinary receive can resume without dropping the STA
+association; it does not claim full monitor data reception, timeslot scheduling
+or AWDL coexistence. No new hardware ring or DMA ownership is fabricated.
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+@@ -1015,6 +1015,19 @@
+ 		return QDF_STATUS_E_FAILURE;
+ 	}
+ 
++	if (marionette_sta_monitor_enabled() &&
++	    !soc->wlan_cfg_ctx->rxdma1_enable) {
++		/* Monitor config targets RXDMA_BUF on this shared-ring device.
++		 * Reapply the normal architecture-specific RX layout/filters so
++		 * the associated STA never keeps the monitor interpretation.
++		 * The separate monitor status-ring setup above is retained. */
++		if (!soc->arch_ops.dp_rxdma_ring_sel_cfg)
++			return QDF_STATUS_E_NOSUPPORT;
++		status = soc->arch_ops.dp_rxdma_ring_sel_cfg(soc);
++		pr_info("MARIONETTE_STA_NORMAL_RX_RESTORED status=%u monitor=%u\n",
++			status, mon_pdev->monitor_configured);
++	}
++
+ 	return status;
+ }
+ 

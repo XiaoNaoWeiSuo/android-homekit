@@ -1,4 +1,7 @@
 # Built application files
+native/airdrop/target/
+native/airdrop/driver/__pycache__/
+app/src/main/jniLibs/
 *.apk
 *.ap_
 *.aab

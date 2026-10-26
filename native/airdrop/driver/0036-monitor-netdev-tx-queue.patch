@@ -1,0 +1,110 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] restart the monitor netdev's TX queues and carrier on open
+
+Static audit of the candidate-0035 result, where the injected frame finally
+stopped dying in noop_enqueue() but still never reached
+hdd_mon_awdl_start_xmit().  Nothing about the frame, the radiotap header or the
+DP exception metadata changed: the queue itself was stopped.
+
+On-device evidence, with 0035 + marionette_awdl_raw_tx=Y and awdlmon (ifindex 40)
+up:
+
+  net_dev_queue:   dev=awdlmon skbaddr=0000000017c812b4 len=97
+  qdisc_enqueue:   ifindex=40 qdisc handle=0x0 parent=0x8 skbaddr=0000000017c812b4
+  qdisc_dequeue:   ifindex=40 qdisc handle=0x0 parent=0x8 txq_state=0x1
+                   packets=0 skbaddr=0x0
+
+txq_state 0x1 is __QUEUE_STATE_DRV_XOFF in enum netdev_queue_state_t, i.e. the
+driver stopped that queue.  sch_direct_xmit() therefore never calls
+dev_hard_start_xmit() and requeues instead (qdisc mq 0: root ... requeues 1,
+backlog grows, packet count never decreases).  A kprobe on
+hdd_mon_awdl_start_xmit shows 0 hits.
+
+Source audit closes the attribution.  The driver contains exactly four
+netif_tx_stop_all_queues() call sites, all four inside
+wlan_hdd_netif_queue_control() (wlan_hdd_tx_rx.c:1187/1342 and its
+_N_CARRIER siblings), so no other code path can set that bit.  Two of them are
+reachable for a monitor adapter:
+
+1. hdd_open_adapter(), whose QDF_MONITOR_MODE case falls through to the
+   station-adapter creation branch, ends with
+
+       wlan_hdd_netif_queue_control(adapter,
+               WLAN_STOP_ALL_NETIF_QUEUE_N_CARRIER, WLAN_CONTROL_PATH);
+
+   (wlan_hdd_main.c:7490 and 7542).  The netdev is created DOWN, so
+   __hdd_mon_open() does not run and pause_map keeps the WLAN_CONTROL_PATH bit
+   while every TX queue stays in DRV_XOFF.
+
+2. hdd_stop_adapter()/hdd_stop_no_trans() re-pauses with the same reason on
+   every down.
+
+Neither is ever undone: the station has __hdd_open()'s "Enable Tx Queues only
+when we are connected" (wlan_hdd_main.c:4640), and __hdd_mon_open() had
+nothing.  0035 supplied the carrier half of the missing bring-up; this rest
+statement supplies the queue half.  WLAN_START_ALL_NETIF_QUEUE_N_CARRIER is the
+exact inverse of the creation-time pause: it restores carrier and clears the
+WLAN_CONTROL_PATH bit from pause_map, which is what finally calls
+netif_tx_start_all_queues().
+
+Ordering: apply 0035 first, then this patch.  0036's hunk context is the
+post-0035 image of __hdd_mon_open(), so it must run after 0035 has landed.
+Do not apply 0036 alone on the pristine tree.
+
+What this does NOT establish: whether the firmware accepts a TCL descriptor
+built on an unassociated monitor vdev at all.  Acceptance must still be
+marionette_awdl_submitted incrementing by exactly COUNTS under
+marionette_awdl_raw_tx=1, with marionette_awdl_rejected flat, and ultimately an
+externally observable OTA effect.  send() returning the length is not proof.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -2823,6 +2823,47 @@ static int __hdd_mon_open(struct net_device *dev)
+ 	 * dev_activate() on the carrier event too, so this also repairs a
+ 	 * monitor interface that came up before its vdev did. */
+ 	netif_carrier_on(dev);
++	/* Marionette: undo what hdd_open_adapter() inflicts on a monitor
++	 * adapter at creation time, plus what the kernel leaves behind
++	 * afterwards.  Both must be undone together or an injected frame
++	 * never reaches hdd_mon_awdl_start_xmit().
++	 *
++	 * (1) WLAN_CONTROL_PATH stays latched.  hdd_open_adapter() runs the
++	 *     monitor through the station-adapter creation branch (its
++	 *     QDF_MONITOR_MODE case falls through to it) and ends with
++	 *     wlan_hdd_netif_queue_control(adapter,
++	 *     WLAN_STOP_ALL_NETIF_QUEUE_N_CARRIER, WLAN_CONTROL_PATH).
++	 *     The netdev is created DOWN, so nothing runs __hdd_mon_open()
++	 *     to reverse it and adapter->pause_map keeps the
++	 *     WLAN_CONTROL_PATH bit.  On "ip link set awdlmon up"
++	 *     dev_activate() only installs the mq qdisc:
++	 *     transition_one_qdisc() does not clear the netdev_queue state
++	 *     bits, so every TX queue is still in __QUEUE_STATE_DRV_XOFF.
++	 *     sch_direct_xmit() then refuses dev_hard_start_xmit() and calls
++	 *     dev_requeue_skb(): every dequeue attempt requeues forever,
++	 *     backlog grows without bound, and the ndo_start_xmit entry is
++	 *     never entered at all.
++	 *
++	 * (2) No carrier, so nothing is activated.  A monitor netdev has no
++	 *     physical carrier, so dev_activate() bails at
++	 *     "if (!netif_carrier_ok(dev)) return;" before it ever runs
++	 *     transition_one_qdisc(); every tx queue keeps
++	 *     qdisc == &noop_qdisc and __dev_xmit_skb() drops the frame in
++	 *     noop_enqueue() with no counter and no log moving.
++	 *
++	 * mac80211 sets carrier when it opens an NL80211_IFTYPE_MONITOR
++	 * interface (net/mac80211/iface.c) and __hdd_open() restarts the
++	 * station's queues once it is associated; this does the same for the
++	 * monitor netdev.  WLAN_START_ALL_NETIF_QUEUE_N_CARRIER is the exact
++	 * inverse of the creation-time pause: it restores carrier and clears
++	 * the WLAN_CONTROL_PATH bit from pause_map, which is what finally
++	 * calls netif_tx_start_all_queues().  hdd_stop_adapter() re-pauses
++	 * the same way on the next down, so the pair stays symmetric.
++	 * linkwatch_do_dev() also re-runs dev_activate() on the carrier
++	 * event, so an interface that came up before its vdev is repaired
++	 * too. */
++	wlan_hdd_netif_queue_control(adapter, WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
++				     WLAN_CONTROL_PATH);
+ 	return ret;
+ }
+ 

@@ -1,0 +1,76 @@
+Marionette AirDrop driver candidate 0038 -- exception-frame contract for
+monitor data injection.
+
+Applies on top of 0037 (native/airdrop/driver/0037-monitor-vdev-tx-desc-pool.patch).
+File: qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+
+Why
+---
+0037 gave the monitor vdev a TX descriptor flow pool and the frame finally
+reached the firmware, but the firmware answered with a RAMDUMP:
+
+    cnss: MHI status cb is called with reason RDDM(4)
+    kiwi_v2: wlan_hdd_pld_uevent: Received firmware hang event
+    mhi: device ee: RAMDUMP DOWNLOAD MODE dev_state: SYS ERROR
+
+The only remaining host-side lever on this path is the
+struct cdp_tx_exception_metadata, so 0038 asks for the exception-frame
+contract instead of a plain vdev-based TCL MSDU.
+
+Effect
+------
+    metadata.is_tx_sniffer = 1  ->  dp_tx_send_exception() calls
+        dp_tx_add_tx_sniffer_meta_data(), which fills an HTT MSDU extension
+        header with SEND_AS_STANDALONE + HOST_OPAQUE_VALID and sets
+        msdu_info->exception_fw.
+    metadata.ppdu_cookie = 1    ->  required by dp_check_exc_metadata() when
+        is_tx_sniffer is set; the value is echoed back in the PPDU
+        completion, which also gives future candidates a way to observe
+        over-the-air completion.
+
+    dp_tx_prepare_desc_single() then prepends that header to the MSDU,
+    marks the descriptor TO_FW and routes it through the TQM-bypass WAR,
+    and dp_tx_send_msdu_single() sets VALID_HTT in the TCL metadata, so the
+    firmware is told the body is a complete host-built frame to send as one
+    standalone MSDU rather than something to look up a peer for.
+
+This is the same contract OCB and the mcopy/tx-sniffer paths use, and
+is_tx_sniffer/ppdu_cookie are the only two fields the HDD can set here.
+
+Result on device (2026-10-20)
+-----------------------------
+submitted=1 submitted_bytes=84 rejected=25, and the identical RDDM one frame
+after the monitor came up -- the same outcome as 0037.  See 0039 for the
+follow-up and native/airdrop/driver/ROADMAP.md section 6.
+
+@@ -774,6 +774,30 @@
+ 	metadata.tid = 0;
+ 	metadata.tx_encap_type = htt_cmn_pkt_type_raw;
+ 	metadata.sec_type = cdp_sec_type_none;
++	/* Marionette: 0037 proved the firmware will not take this frame as a
++	 * regular vdev-based TCL MSDU -- one frame reached it and it went
++	 * straight into RDDM (cnss: MHI status cb is called with reason
++	 * RDDM(4)).  Ask for the exception-frame contract instead.
++	 *
++	 * is_tx_sniffer makes dp_tx_send_exception() call
++	 * dp_tx_add_tx_sniffer_meta_data(), which fills an HTT MSDU extension
++	 * header with SEND_AS_STANDALONE and HOST_OPAQUE_VALID and sets
++	 * msdu_info->exception_fw.  dp_tx_prepare_desc_single() then prepends
++	 * that header and marks the descriptor TO_FW, and
++	 * dp_tx_send_msdu_single() sets VALID_HTT in the TCL metadata, so the
++	 * firmware is told the body is a complete host-built frame to send as
++	 * one standalone MSDU instead of something to search for a peer.
++	 * dp_tx_prepare_htt_metadata() needs no rate or tx-spec input for this
++	 * branch, which matters because a monitor vdev has neither.
++	 *
++	 * dp_check_exc_metadata() requires a non-zero ppdu_cookie when
++	 * is_tx_sniffer is set.  The cookie is echoed back to the host in the
++	 * PPDU completion and is otherwise unused here, so a constant is
++	 * enough.  This is the same contract OCB and the mcopy/tx-sniffer
++	 * paths use, and is_tx_sniffer/ppdu_cookie are the only metadata the
++	 * HDD can set on this path. */
++	metadata.is_tx_sniffer = 1;
++	metadata.ppdu_cookie = 1;
+ 	skb = cdp_tx_send_exc(soc, adapter->vdev_id, skb, &metadata);
+ 	if (skb)
+ 		goto drop;

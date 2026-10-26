@@ -1,0 +1,115 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] bounded direct monitor social-channel capture
+
+0017 captured 858 real raw frames at ROC frequencies but no action frames.
+An immediate stock global-monitor control still received 140/273 real AWDL
+frames on channels 149/6, including this Mac. Test the existing monitor vdev
+channel API during the synchronous 0015 slot, instead of the P2P scan path.
+Root input optionally accepts only 2437/5220/5745:1..200ms. Retune solely
+inside the guarded capture operation, using 20MHz social channels and existing
+regulatory/hardware-mode checks. Always request STA home channel/width restore,
+then clear capture phase and restore normal RX, including failures. No global
+monitor-mode switch, partition/firmware writes, background task or RAW TX.
+The requested dwell is bounded; existing channel-completion waits may add
+latency and must be measured. This is not an iPhone-grade scheduler yet.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -8544,10 +8544,18 @@
+ 
+ 		/* Never retune the associated STA through monitor SET_CHANNEL.
+ 		 * Future off-channel scheduling must go through normal ROC. */
+-		if (!sta || !hdd_cm_is_vdev_associated(sta) ||
+-		    freq != hdd_get_adapter_home_channel(sta) ||
+-		    bandwidth != hdd_get_adapter_width(sta))
++		if (!sta || !hdd_cm_is_vdev_associated(sta))
+ 			return -EBUSY;
++		if (freq != hdd_get_adapter_home_channel(sta) ||
++		    bandwidth != hdd_get_adapter_width(sta)) {
++			/* Only the synchronous root capture operation can request
++			 * a social-channel 20MHz monitor slot. Regulatory checks
++			 * below and restoration to the STA home channel remain. */
++			if (!marionette_sta_monitor_capture_enabled() ||
++			    bandwidth != CH_WIDTH_20MHZ ||
++			    (freq != 2437 && freq != 5220 && freq != 5745))
++				return -EBUSY;
++		}
+ 	}
+ 
+ 	/* Verify the BW before accepting this request */
+@@ -19804,10 +19812,24 @@
+ 	struct hdd_context *hdd_ctx;
+ 	struct osif_vdev_sync *sync;
+ 	ol_txrx_soc_handle soc;
+-	unsigned int duration;
+-	int ret, capture_status, restore_status;
+-
+-	ret = kstrtouint(value, 0, &duration);
++	unsigned int duration, target_freq = 0, home_freq;
++	enum phy_ch_width home_width;
++	int ret, capture_status, restore_status, tune_status = 0, home_status = 0;
++	char input[32], *duration_text, *separator;
++
++	if (strscpy(input, value, sizeof(input)) < 0)
++		return -EINVAL;
++	duration_text = strim(input);
++	separator = strchr(duration_text, ':');
++	if (separator) {
++		*separator = 0;
++		ret = kstrtouint(duration_text, 0, &target_freq);
++		if (ret || (target_freq != 2437 && target_freq != 5220 &&
++			    target_freq != 5745))
++			return -EINVAL;
++		duration_text = separator + 1;
++	}
++	ret = kstrtouint(duration_text, 0, &duration);
+ 	if (ret || !duration || duration > 200)
+ 		return -EINVAL;
+ 	if (!marionette_sta_monitor_enabled() ||
+@@ -19839,15 +19861,32 @@
+ 		ret = -EOPNOTSUPP;
+ 		goto stop;
+ 	}
++	home_freq = hdd_get_adapter_home_channel(sta);
++	home_width = hdd_get_adapter_width(sta);
++	if (!target_freq)
++		target_freq = home_freq;
+ 	WRITE_ONCE(marionette_capture_phase, true);
+ 	capture_status = marionette_monitor_refresh_filters(soc);
+-	if (QDF_IS_STATUS_SUCCESS(capture_status))
+-		msleep(duration);
++	if (QDF_IS_STATUS_SUCCESS(capture_status)) {
++		if (target_freq != home_freq)
++			tune_status = wlan_hdd_set_mon_chan(adapter, target_freq,
++							 CH_WIDTH_20MHZ);
++		if (!tune_status)
++			msleep(duration);
++	}
++	/* Restore even after a failed/partial channel request. */
++	if (target_freq != home_freq)
++		home_status = wlan_hdd_set_mon_chan(adapter, home_freq, home_width);
+ 	WRITE_ONCE(marionette_capture_phase, false);
+ 	restore_status = marionette_monitor_refresh_filters(soc);
+-	hdd_info("MARIONETTE_CAPTURE_ONCE ms=%u capture=%d restore=%d",
+-		 duration, capture_status, restore_status);
++	hdd_info("MARIONETTE_CAPTURE_ONCE freq=%u home=%u ms=%u capture=%d tune=%d home_restore=%d rx_restore=%d",
++		 target_freq, home_freq, duration, capture_status, tune_status,
++		 home_status, restore_status);
+ 	ret = qdf_status_to_os_return(restore_status);
++	if (!ret)
++		ret = home_status;
++	if (!ret)
++		ret = tune_status;
+ 	if (!ret)
+ 		ret = qdf_status_to_os_return(capture_status);
+ 	if (!ret)
+@@ -19865,7 +19904,7 @@
+ module_param_cb(marionette_awdl_capture_ms, &marionette_capture_once_ops,
+ 		&marionette_capture_ms, 0600);
+ MODULE_PARM_DESC(marionette_awdl_capture_ms,
+-                "Capture one 1..200 ms monitor RX slot, restoring normal RX before return");
++                "Capture [2437|5220|5745:]1..200 ms, restoring STA home channel and normal RX");
+ #else
+ bool marionette_sta_monitor_capture_enabled(void) { return false; }
+ #endif

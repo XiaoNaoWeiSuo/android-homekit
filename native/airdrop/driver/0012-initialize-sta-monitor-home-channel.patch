@@ -1,0 +1,43 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] initialize the monitor on the associated STA channel
+
+With 0009/0011, monitor creation/open kept the association but no packets
+reached its AF_PACKET socket and the Wi-Fi gateway lost 47/48 packets.
+The explicit monitor channel command was blocked before the driver by
+cfg80211_has_monitors_only. No completed monitor-channel initialization
+was observed. Under the default-off STA-monitor experiment only, initialize
+that monitor vdev through the existing driver function using exactly the
+associated STA primary frequency and width. Existing regulatory and width
+checks remain. No arbitrary retune, RAW TX, or cfg80211 restriction change.
+This needs a fresh bounded runtime test; firmware behavior remains unproven.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -2804,6 +2804,26 @@
+ 	if (!ret)
+ 		ret = hdd_enable_monitor_mode(dev);
+ 
++	if (!ret && marionette_sta_monitor_enabled() &&
++	    con_mode == QDF_GLOBAL_MISSION_MODE) {
++		struct hdd_adapter *sta = hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
++
++		/* cfg80211 blocks monitor SET_CHANNEL with a live STA. Initialize
++		 * the monitor vdev internally on the STA's current channel only,
++		 * retaining wlan_hdd_set_mon_chan's regulatory and width checks. */
++		if (!sta || !hdd_cm_is_vdev_associated(sta))
++			ret = -ENOTCONN;
++		else {
++			hdd_info("MARIONETTE_STA_MONITOR_INIT freq=%u width=%u",
++				 hdd_get_adapter_home_channel(sta),
++				 hdd_get_adapter_width(sta));
++			ret = wlan_hdd_set_mon_chan(adapter,
++				hdd_get_adapter_home_channel(sta),
++				hdd_get_adapter_width(sta));
++		}
++		hdd_info("MARIONETTE_STA_MONITOR_INIT_RESULT ret=%d", ret);
++	}
++
+ 	if (!ret) {
+ 		param.policy = BBM_DRIVER_MODE_POLICY;
+ 		param.policy_info.driver_mode = QDF_GLOBAL_MONITOR_MODE;

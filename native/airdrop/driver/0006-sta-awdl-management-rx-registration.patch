@@ -1,0 +1,71 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] register the AWDL vendor action prefix with STA LIM RX
+
+nl80211 REGISTER_FRAME only changes cfg80211 subscriptions here: the pinned
+public WLAN has no dynamic mgmt registration callback. Its fixed LIM list
+omits AWDL and normally drops unmatched vendor action frames before userspace.
+Register the exact category/OUI/type/version prefix for the STA vdev, paired
+with deregistration. A root-only load-time bool remains off by default.
+No monitor mode, BSSID filter relaxation, firmware patch, or data RX support.
+Registration is asynchronous; the log records queue acceptance only.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -19078,6 +19078,16 @@
+ 	return 0;
+ }
+ 
++/* Isolated STA management RX experiment. Load-time-only so registration and
++ * deregistration always see the same policy; never enables monitor mode. */
++static bool marionette_awdl_mgmt_rx;
++module_param_named(marionette_awdl_mgmt_rx, marionette_awdl_mgmt_rx, bool, 0400);
++MODULE_PARM_DESC(marionette_awdl_mgmt_rx,
++                "Experimental STA AWDL action RX registration; default off");
++static const uint8_t marionette_awdl_action_prefix[] = {
++	0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10
++};
++
+ /* This function registers for all frame which supplicant is interested in */
+ int wlan_hdd_cfg80211_register_frames(struct hdd_adapter *adapter)
+ {
+@@ -19159,8 +19169,27 @@
+ 		goto dereg_wnm_bss_action_frm;
+ 	}
+ 
++	if (marionette_awdl_mgmt_rx && adapter->device_mode == QDF_STA_MODE) {
++		/* The public driver has no dynamic mgmt registration callback.
++		 * Without this LIM drops vendor actions before cfg80211 RX. */
++		status = sme_register_mgmt_frame(mac_handle, adapter->vdev_id,
++				type, (uint8_t *)marionette_awdl_action_prefix,
++				sizeof(marionette_awdl_action_prefix));
++		if (status != QDF_STATUS_SUCCESS) {
++			hdd_err("MARIONETTE_AWDL_RX_REGISTER_FAILED vdev=%u status=%u",
++				adapter->vdev_id, status);
++			goto dereg_wnm_notification_frm;
++		}
++		hdd_info("MARIONETTE_AWDL_RX_REGISTER_QUEUED vdev=%u",
++			 adapter->vdev_id);
++	}
++
+ 	return 0;
+ 
++dereg_wnm_notification_frm:
++	sme_deregister_mgmt_frame(mac_handle, adapter->vdev_id, type,
++				  (uint8_t *) WNM_NOTIFICATION_FRAME,
++				  WNM_NOTIFICATION_FRAME_SIZE);
+ dereg_wnm_bss_action_frm:
+ 	sme_deregister_mgmt_frame(mac_handle, SME_SESSION_ID_ANY, type,
+ 				  (uint8_t *) WNM_BSS_ACTION_FRAME,
+@@ -19192,6 +19221,11 @@
+ 	uint16_t type = (SIR_MAC_MGMT_FRAME << 2) | (SIR_MAC_MGMT_ACTION << 4);
+ 
+ 	hdd_enter();
++
++	if (marionette_awdl_mgmt_rx && adapter->device_mode == QDF_STA_MODE)
++		sme_deregister_mgmt_frame(mac_handle, adapter->vdev_id, type,
++				(uint8_t *)marionette_awdl_action_prefix,
++				sizeof(marionette_awdl_action_prefix));
+ 
+ 	/* Right now we are registering these frame when driver is getting
+ 	 * initialized. Once we will move to 2.6.37 kernel, in which we have

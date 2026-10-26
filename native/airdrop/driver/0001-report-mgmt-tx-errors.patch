@@ -1,0 +1,30 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] hdd: return the actual management TX submission error
+
+The caller currently reports success even if the P2P submission returned an
+error. wlan_cfg80211_mgmt_tx already returns a Linux errno, so preserve the
+int result without converting it a second time from QDF_STATUS. This is a
+diagnostic fix, not an AWDL injection implementation. Apply only to the pinned
+WLAN source and validate in the isolated build first.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+@@ -281,7 +281,7 @@ static int __wlan_hdd_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 			      const u8 *buf, size_t len, bool no_cck,
+ 			      bool dont_wait_for_ack, u64 *cookie)
+ {
+-	QDF_STATUS status;
++	int status;
+ 	struct net_device *dev = wdev->netdev;
+ 	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+ 	struct hdd_context *hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+@@ -360,7 +360,7 @@ off_chan_tx:
+ 		  chan ? chan->center_freq : 0, wait, offchan,
+ 		  dont_wait_for_ack, status, *cookie);
+ 
+-	return 0;
++	return status;
+ }
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))

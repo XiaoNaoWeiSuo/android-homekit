@@ -1,0 +1,143 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] create the monitor vdev's TX descriptor flow pool
+
+candidate-0036 got a well-formed AWDL frame all the way into
+hdd_mon_awdl_start_xmit() for the first time: 26 frames were rejected there
+(2 negative control + 24 well-formed) instead of dying before the driver.  The
+next failure was one line in the kmsg log and nothing else:
+
+  kiwi_v2: [0:E:DP] dp_tx_send_msdu_single: Tx_desc prepare Fail vdev_id 3 vdev <redacted> queue 3
+
+"queue 3" is DP_TX_GET_DESC_POOL_ID(vdev), i.e. the monitor vdev id, so the
+missing object is soc->tx_desc[3] itself.  Under QCA_LL_TX_FLOW_CONTROL_V2 the
+TX descriptor pools are created per vdev, and dp_tx_alloc_static_pools()
+(dp_tx.c:5792) only marks every entry FLOW_POOL_INACTIVE.  dp_tx_desc_alloc()
+then refuses exactly that:
+
+	if (qdf_likely(pool->avail_desc &&
+	    pool->status != FLOW_POOL_INVALID &&
+	    pool->status != FLOW_POOL_INACTIVE)) {
+
+For a station the pool is created by the firmware's
+HTT_T2H_MSG_TYPE_FLOW_POOL_MAP event via dp_tx_flow_pool_map_handler()
+(dp_tx_flow_control.c:558), or, on the host side, by the policy manager
+calling hdd_v2_flow_pool_map() -> cdp_flow_pool_map()
+(wlan_policy_mgr_get_set_utils.c:3814).  A monitor vdev gets neither event, so
+its pool is never created and every injection fails in
+dp_tx_prepare_desc_single().
+
+dp_tx_flow_pool_map() is entirely host-local: it allocates
+wlan_cfg_get_num_tx_desc() descriptors (8192 on this target, 6 pools) into
+soc->tx_desc[vdev_id], marks it FLOW_POOL_ACTIVE_UNPAUSED and binds it to the
+vdev.  dp_tx_create_flow_pool() is idempotent: an existing pool is re-attached
+(FLOW_POOL_ACTIVE_UNPAUSED_REATTACH) rather than reallocated, so a firmware map
+for the same vdev id later on, or a monitor that is deleted and re-added, does
+not double-allocate.
+
+This adds that call for the monitor vdev only, gated by
+marionette_awdl_raw_tx, right next to the 0036 restart of its netdev queues.
+
+Result on this target (see ROADMAP.md for the full timeline): one frame was
+submitted to the firmware and it went into RAMDUMP.
+
+  submitted=1 submitted_bytes=84   (84 = 97 - 13, the frame minus its radiotap)
+  cnss: MHI status cb is called with reason RDDM(4)
+  kiwi_v2: wlan_hdd_pld_uevent: Received firmware hang event
+  mhi: device ee: RAMDUMP DOWNLOAD MODE dev_state: SYS ERROR
+
+That settles the question 0003 and 0034 both left open: the firmware does not
+accept a raw 802.11 data frame on an unassociated monitor vdev through the
+vdev-based TCL data path.  No "Tx_desc prepare Fail" appeared at all this time,
+so 0037 did what it was meant to.  The frame's content was not the variable:
+0036 rejected it before it could reach the firmware at all, so there is no run
+in which the firmware accepted the same frame.
+
+Known cost, recorded rather than fixed: the pool is bound to the vdev id and
+nothing unmaps it on monitor delete, because the unmap path is the firmware's
+HTT_T2H_MSG_TYPE_FLOW_POOL_UNMAP handler.  That is one num_tx_desc pool per
+monitor vdev id, and on this target the monitor always takes the same id, so
+it does not grow with use.
+
+What this does NOT establish: anything about over-the-air delivery.
+
+diff --git a/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h b/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
+--- a/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
++++ b/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
+@@ -95,6 +95,7 @@
+ netdev_tx_t hdd_hard_start_xmit(struct sk_buff *skb, struct net_device *dev);
+ #ifdef FEATURE_MONITOR_MODE_SUPPORT
+ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev);
++void marionette_awdl_raw_tx_pool_setup(struct hdd_adapter *adapter);
+ #endif
+ 
+ /**
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -673,6 +673,55 @@
+ module_param_cb(marionette_awdl_submitted_bytes, &marionette_awdl_counter_ops,
+ 		&marionette_awdl_submitted_bytes, 0400);
+ 
++/* Give the monitor vdev a TX descriptor pool before anything is injected.
++ *
++ * QCA_LL_TX_FLOW_CONTROL_V2 leaves every soc->tx_desc[] entry in
++ * FLOW_POOL_INACTIVE until a pool is created for a vdev, and dp_tx_desc_alloc()
++ * refuses an INACTIVE pool:
++ *
++ *	dp_tx_send_msdu_single: Tx_desc prepare Fail vdev_id 3 vdev <redacted> queue 3
++ *
++ * That message, and only that message, was produced by 24 well-formed frames on
++ * candidate 0036: the frame reached hdd_mon_awdl_start_xmit(), passed every
++ * frame-shape gate, cdp_tx_send_exc() accepted it, dp_tx_send_exception() found
++ * the vdev, and dp_tx_prepare_desc_single() could not get a descriptor.  "queue
++ * 3" is DP_TX_GET_DESC_POOL_ID(vdev), i.e. the monitor vdev id, so the pool that
++ * is missing is soc->tx_desc[vdev_id] itself.
++ *
++ * For a station the firmware's HTT_T2H_MSG_TYPE_FLOW_POOL_MAP event drives
++ * dp_tx_flow_pool_map_handler() (dp_tx_flow_control.c), and for the host-driven
++ * path the policy manager calls hdd_v2_flow_pool_map()
++ * (wlan_policy_mgr_get_set_utils.c).  Neither happens for a monitor vdev, so its
++ * pool is created here instead.
++ *
++ * dp_tx_create_flow_pool() is idempotent: a pool that already exists is
++ * re-attached (FLOW_POOL_ACTIVE_UNPAUSED_REATTACH) instead of reallocated, so a
++ * firmware map for the same vdev id later on, or a monitor that is deleted and
++ * re-added, does not double-allocate.
++ *
++ * Known cost, recorded rather than fixed: the pool is bound to the vdev id and
++ * nothing unmaps it on monitor delete, because the unmap path is the firmware's
++ * HTT_T2H_MSG_TYPE_FLOW_POOL_UNMAP handler.  That is one num_tx_desc pool per
++ * monitor vdev id, and on this target the monitor always takes the same id, so
++ * it does not grow with use.
++ */
++void marionette_awdl_raw_tx_pool_setup(struct hdd_adapter *adapter)
++{
++	ol_txrx_soc_handle soc;
++
++	if (!READ_ONCE(marionette_awdl_raw_tx) ||
++	    adapter->device_mode != QDF_MONITOR_MODE ||
++	    adapter->vdev_id == 0xff || adapter->vdev_id >= MAX_TXDESC_POOLS)
++		return;
++
++	soc = cds_get_context(QDF_MODULE_ID_SOC);
++	if (!soc)
++		return;
++
++	/* Same call the policy manager makes for an active station vdev. */
++	(void)cdp_flow_pool_map(soc, OL_TXRX_PDEV_ID, adapter->vdev_id);
++}
++
+ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	static const u8 radiotap_prefix[] = { 0, 0, 13, 0, 4, 128, 2, 0, 24, 0 };
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -2913,6 +2913,7 @@
+ 	 * too. */
+ 	wlan_hdd_netif_queue_control(adapter, WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+ 				     WLAN_CONTROL_PATH);
++	marionette_awdl_raw_tx_pool_setup(adapter);
+ 	return ret;
+ }
+ 

@@ -1,0 +1,64 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] keep normal filter-pass traffic outside monitor RX
+
+0012 completed monitor vdev channel initialization and received 27050 real
+radiotap packets, but STA gateway traffic remained 1/48. Default monitor
+filters include both normal filter-pass and other-BSS management/data. The
+actual pinned kiwi_v2 build uses monitor 1.0 (ELF symbols and object list),
+so apply to its destination and status filters, not the unused 2.0 source.
+Under the default-off 0009 experiment only, disable filter-pass capture and
+observe other-BSS management/data. No DMA ring ownership, firmware, TX,
+channel policy or normal RX path code is changed. Verify gateway traffic
+and actual monitor packets again; receiving frames alone is not coexistence.
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c
+@@ -15,6 +15,7 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include "marionette_sta_monitor.h"
+ #include <hal_api.h>
+ #include <wlan_cfg.h>
+ #include "dp_types.h"
+@@ -566,6 +567,23 @@
+ }
+ #endif /* WLAN_RX_PKT_CAPTURE_ENH */
+ 
++/* Associated STA traffic must stay on the normal filter-pass path. */
++static void marionette_mon_other_filter(struct dp_mon_filter *filter)
++{
++	if (!marionette_sta_monitor_enabled())
++		return;
++	filter->tlv_filter.enable_fp = 0;
++	filter->tlv_filter.fp_mgmt_filter = 0;
++	filter->tlv_filter.fp_ctrl_filter = 0;
++	filter->tlv_filter.fp_data_filter = 0;
++	filter->tlv_filter.enable_md = 0;
++	filter->tlv_filter.enable_mo = 1;
++	filter->tlv_filter.mo_mgmt_filter = FILTER_MGMT_ALL;
++	filter->tlv_filter.mo_data_filter = FILTER_DATA_ALL;
++	filter->tlv_filter.mo_ctrl_filter = 0;
++	dp_mon_filter_info("MARIONETTE_MON_OTHER_RX_FILTER fp=0 mo=1");
++}
++
+ #ifdef QCA_MONITOR_PKT_SUPPORT
+ static void dp_mon_filter_set_reset_mon_dest(struct dp_pdev *pdev,
+ 					     struct dp_mon_filter *pfilter)
+@@ -582,6 +600,7 @@
+ 	/* set the filter */
+ 	if (pfilter->valid) {
+ 		dp_mon_filter_set_mon_cmn(mon_pdev, pfilter);
++		marionette_mon_other_filter(pfilter);
+ 
+ 		dp_mon_filter_show_filter(mon_pdev, mode, pfilter);
+ 		mon_pdev->filter[mode][srng_type] = *pfilter;
+@@ -627,6 +646,7 @@
+ 	/* Enabled the filter */
+ 	filter.valid = true;
+ 	dp_mon_filter_set_status_cmn(mon_pdev, &filter);
++	marionette_mon_other_filter(&filter);
+ 	dp_mon_filter_show_filter(mon_pdev, mode, &filter);
+ 
+ 	/* Store the above filter */

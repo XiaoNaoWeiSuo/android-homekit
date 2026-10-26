@@ -1,0 +1,87 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] give the monitor vdev a TX lifecycle and admit mission mode
+
+Static audit of the 0003 injection prototype found two independent reasons the
+entry can never deliver a frame in the coexistence configuration:
+
+1. hdd_mon_awdl_start_xmit() required cds_get_conparam() ==
+   QDF_GLOBAL_MONITOR_MODE (4).  The device runs QDF_GLOBAL_MISSION_MODE (0),
+   which is the only mode in which the station stays associated, so the gate
+   rejected every frame before any other check ran.
+
+2. dp_vdev_attach_wifi3() returns from the monitor branch immediately after
+   dp_monitor_vdev_attach(), so dp_tx_vdev_attach() never ran and
+   vdev->htt_tcl_metadata stayed zeroed.  dp_tx_vdev_attach() is what writes
+   DP_TCL_METADATA_TYPE_VDEV_BASED and this vdev's id/pdev id into the TCL
+   metadata; without it an injected frame is described as vdev 0, i.e. the
+   station, and vdev->tx_encap_type is never set at all (dp_tx.c:1289 copies it
+   into the SW descriptor, and dp_tx.c:1699/1785/3579 branch on it).
+
+Both are host-side only.  No firmware command value, ring layout, descriptor
+format, channel, rate or retry setting is changed.  The exception path itself
+was already viable: the monitor vdev is inserted into the DP vdev id map at
+dp_main.c:7107 before the branch, dp_check_exc_metadata() accepts
+tid=0/encap=raw/sec=none, and the non-STA address-search default does not
+dereference a peer.
+
+What this does NOT establish: whether the firmware accepts a TCL descriptor
+built on an unassociated monitor vdev at all.  That is the real open question
+and the reason the parameter stays default-off.
+
+Acceptance must not be the send() return value.  Host enqueue returning NULL
+only means a descriptor was written to the TCL ring.  OTA proof requires an
+externally observable effect.
+
+diff --git a/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c b/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
+index 76bb707..3c869e4 100644
+--- a/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/dp_main.c
+@@ -7113,6 +7113,20 @@ static QDF_STATUS dp_vdev_attach_wifi3(struct cdp_soc_t *cdp_soc,
+ 
+ 	if (wlan_op_mode_monitor == vdev->opmode) {
+ 		if (dp_monitor_vdev_attach(vdev) == QDF_STATUS_SUCCESS) {
++			/*
++			 * Marionette: dp_vdev_attach_wifi3() returns here for
++			 * monitor vdevs, so dp_tx_vdev_attach() never runs and
++			 * vdev->htt_tcl_metadata stays zeroed.  An injected
++			 * frame would then be described with vdev_id 0 and the
++			 * wrong metadata type, i.e. attributed to the station.
++			 * Build the TCL metadata for this vdev and declare RAW
++			 * encapsulation so the descriptor carries an already
++			 * formed 802.11 frame instead of an Ethernet payload.
++			 * Address-search flags fall to the non-STA default,
++			 * which is what an unassociated injector needs.
++			 */
++			vdev->tx_encap_type = htt_cmn_pkt_type_raw;
++			dp_tx_vdev_attach(vdev);
+ 			dp_monitor_pdev_set_mon_vdev(vdev);
+ 			return dp_monitor_vdev_set_monitor_mode_buf_rings(pdev);
+ 		}
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+index 17a2a10..f895808 100644
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -681,6 +681,7 @@ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	struct hdd_adapter *adapter;
+ 	ol_txrx_soc_handle soc;
+ 	struct cdp_tx_exception_metadata metadata = {0};
++	enum QDF_GLOBAL_MODE con_mode;
+ 	u8 *frame;
+ 	unsigned int bytes;
+ 
+@@ -688,8 +689,14 @@ netdev_tx_t hdd_mon_awdl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+ 	/* Only filin's known radiotap layout and plain IPv6 AWDL data frames.
+ 	 * Management frames require a separate, verified WMI submission path. */
++	/* Marionette: mission mode is the only global mode in which the
++	 * station can stay associated, so the AWDL injector has to work
++	 * there. The monitor-adapter check and the frame-shape checks below
++	 * remain the real gates; global monitor mode stays accepted. */
++	con_mode = cds_get_conparam();
+ 	if (!READ_ONCE(marionette_awdl_raw_tx) ||
+-	    cds_get_conparam() != QDF_GLOBAL_MONITOR_MODE ||
++	    (con_mode != QDF_GLOBAL_MONITOR_MODE &&
++	     con_mode != QDF_GLOBAL_MISSION_MODE) ||
+ 	    adapter->device_mode != QDF_MONITOR_MODE ||
+ 	    adapter->vdev_id == 0xff || skb->len < 13 + 24 + 16 + 40 ||
+ 	    skb->len > 13 + 2304 || skb_linearize(skb) ||
