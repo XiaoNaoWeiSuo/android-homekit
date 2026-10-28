@@ -75,11 +75,15 @@ pub struct MdnsConfig {
 
 /// Build the `_airdrop._tcp` ServiceInfo for announcement.
 ///
-/// The instance name embeds the **process PID** (`<name>-<pid>`) so that, when
-/// entries appear in the Apple AirDrop picker, a fresh run is distinguishable
-/// from a stale ghost left by a crashed/killed previous run.
+/// The instance name is **stable across runs** (just the computer name). It
+/// used to embed the process PID so a human could tell a fresh run from a
+/// ghost left by a killed one — but the Apple picker shows only a few
+/// characters and, in practice, three restarts put three indistinguishable
+/// copies of the phone in Finder. A stable name makes a restart *replace* the
+/// entry instead of adding another one; the TTL=0 [`goodbye`] on shutdown
+/// still removes it when we exit cleanly.
 pub fn build_airdrop_service_info(cfg: &MdnsConfig, addr: IpAddr) -> Result<ServiceInfo> {
-    let instance = format!("{}-{}", cfg.computer_name, std::process::id());
+    let instance = cfg.computer_name.clone();
     let hostname = format!("{}.local.", cfg.computer_name);
     let mut props = HashMap::new();
     props.insert("flags".to_string(), cfg.flags.to_string());
@@ -479,17 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn service_info_instance_name_includes_pid() {
+    fn service_info_instance_name_is_stable_across_runs() {
+        let cfg = cfg();
         let info =
-            build_airdrop_service_info(&cfg(), "127.0.0.1".parse().unwrap()).expect("build info");
-        // Instance name must embed the current PID so fresh runs are
-        // distinguishable from stale ghosts in the Apple picker.
+            build_airdrop_service_info(&cfg, "127.0.0.1".parse().unwrap()).expect("build info");
+        // A stable instance name is what stops three restarts from putting
+        // three identical phones in the Apple picker: the new run refreshes
+        // the same record instead of adding another one.
         let pid = std::process::id().to_string();
+        let fullname = info.get_fullname().to_string();
         assert!(
-            info.get_fullname().contains(&pid),
-            "instance name {} must contain PID {}",
-            info.get_fullname(),
-            pid
+            fullname.starts_with(&format!("{}._airdrop._tcp.local.", cfg.computer_name)),
+            "instance name {fullname} must be the stable computer name"
+        );
+        assert!(
+            !fullname.contains(&format!("-{pid}")),
+            "instance name {fullname} must not embed the PID {pid}"
         );
     }
 

@@ -688,19 +688,30 @@ pub mod awdl {
     /// subframes. Each subframe has a 14-byte Ethernet-like header
     /// (dst, src, length-be), then `length` bytes of LLC/SNAP+AWDL-data, then
     /// padding to a 4-byte boundary.
+    /// Split an A-MSDU into its subframes (owl/src/rx.c:413).
+    ///
+    /// A truncated aggregate returns every *complete* subframe before the cut
+    /// point instead of failing outright. The monitor path hands us at most
+    /// one RX buffer, so a real Mac's multi-KB aggregate arrives with its tail
+    /// cut off; rejecting the whole frame meant we delivered nothing, ACKed
+    /// nothing, and the sender's TCP window never opened (live: the Mac sent
+    /// 1-6 frames per burst and the phone answered zero, forever). The
+    /// invariant that actually matters is preserved: a *partial* IP packet is
+    /// never handed to the host — the cut subframe is dropped, so TCP sees a
+    /// gap and retransmits it.
     pub fn decapsulate_amsdu_data_frames(body: &[u8]) -> Result<Vec<EthernetFrame>, ParseError> {
         let mut out = Vec::new();
         let mut offset = 0;
         while offset < body.len() {
             if offset + 14 > body.len() {
-                return Err(ParseError::TooShort);
+                break;
             }
             let dst: [u8; 6] = body[offset..offset + 6].try_into().unwrap();
             let src: [u8; 6] = body[offset + 6..offset + 12].try_into().unwrap();
             let sub_len = u16::from_be_bytes([body[offset + 12], body[offset + 13]]) as usize;
             offset += 14;
             if offset + sub_len > body.len() {
-                return Err(ParseError::TooShort);
+                break;
             }
             let sub_body = &body[offset..offset + sub_len];
             offset += sub_len;
@@ -7025,6 +7036,26 @@ pub mod runtime {
                                     }
                                     let ieee80211_preview =
                                         ieee80211_payload_preview(&wlan_buf[..len]);
+                                    // Everything above is per-frame noise, but a
+                                    // frame that parses as AWDL data and then
+                                    // fails to decapsulate is not noise: the
+                                    // driver handed us an upload frame and we
+                                    // dropped it, so the sender only sees
+                                    // retransmissions. That failure used to be
+                                    // trace-only, which made a stalled transfer
+                                    // look like "the Mac never sent anything".
+                                    if matches!(
+                                        data_err,
+                                        crate::data_rx::Error::Payload(_)
+                                            | crate::data_rx::Error::Fcs(_)
+                                    ) {
+                                        tracing::debug!(
+                                            ?data_err,
+                                            len,
+                                            %ieee80211_preview,
+                                            "AWDL data frame dropped before the host TAP"
+                                        );
+                                    }
                                     tracing::trace!(
                                         ?err,
                                         ?data_err,

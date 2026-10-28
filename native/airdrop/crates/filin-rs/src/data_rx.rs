@@ -194,9 +194,45 @@ mod tests {
         mac.extend(((body.len() + 1400) as u16).to_be_bytes());
         mac.extend(body);
         frame.extend(mac);
-        assert!(matches!(
-            decode(&frame, LOCAL),
-            Err(Error::Payload(awdl::ParseError::TooShort))
-        ));
+        // The cut subframe is dropped rather than delivered half-formed. It is
+        // no longer an error, because the same truncation on a *multi*-subframe
+        // aggregate must still hand over the complete ones (next test).
+        let decoded = decode(&frame, LOCAL).unwrap();
+        assert!(decoded.frames.is_empty(), "cut subframe must not be delivered");
+        assert!(!decoded.unicast);
+    }
+
+    /// A real Mac aggregates several MSDUs into one MPDU and the monitor path
+    /// truncates the tail. The complete subframes must still reach the host,
+    /// otherwise TCP never ACKs and the sender stalls forever.
+    #[test]
+    fn truncated_amsdu_still_delivers_the_complete_prefix() {
+        let mut aggregate = Vec::new();
+        for (i, dst) in [MULTICAST, LOCAL].into_iter().enumerate() {
+            let body = awdl::encapsulate_ethernet_payload(&ethernet(dst), i as u16).unwrap();
+            aggregate.extend(dst);
+            aggregate.extend(PEER);
+            aggregate.extend((body.len() as u16).to_be_bytes());
+            aggregate.extend(&body);
+            aggregate.resize((aggregate.len() + 3) & !3, 0);
+        }
+        // Append a third subframe that is cut in the middle, the way the
+        // single-buffer cap truncates a live aggregate.
+        aggregate.extend(LOCAL);
+        aggregate.extend(PEER);
+        aggregate.extend(((1448) as u16).to_be_bytes());
+        aggregate.extend([0u8; 40]);
+
+        let mut frame = vec![0, 0, 8, 0, 0, 0, 0, 0];
+        let mut mac = ieee80211::build_data_frame(LOCAL, PEER, BSSID, 0x40, &[]);
+        mac[0] = 0x88;
+        mac.extend(ieee80211::QOS_A_MSDU_PRESENT.to_le_bytes());
+        mac.extend(aggregate);
+        frame.extend(mac);
+
+        let decoded = decode(&frame, LOCAL).unwrap();
+        assert_eq!(decoded.frames.len(), 2, "complete prefix must survive");
+        assert_eq!(decoded.frames[1].bytes, ethernet(LOCAL));
+        assert!(decoded.unicast);
     }
 }

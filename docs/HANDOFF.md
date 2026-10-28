@@ -2,6 +2,45 @@
 
 更新日期：2026-10-28
 
+## 2026-10-28 大文件传输根因与修复（A-MSDU 截断；仍止步于 TCP 层）
+
+**现象**：Mac 发 40–50 MB 文件时 Mac 一直「正在发送」，手机停在「正在接收」，进度恒为 0 B。
+
+**定位过程（每个结论都有对应的反证，不要跳过）**：
+1. 曾怀疑驱动的数据帧过滤（要求 `addr3 == 00:25:00:ff:94:73`）。**已证伪**：`tcpdump -i awdlsink` 显示 Mac 的数据帧 addr3 完全匹配且已交付。
+2. 曾怀疑 `parse_ask_request` 把 `FileSize` 读成 0（无符号 plist 整数）。**已证伪并回退**：`plist::Integer` 是 `i128` 包装，`as_signed()` 对 40 MB 正常返回。`0 B` 只是「一个字节都没收到」的结果，不是解析 bug。
+3. **真正根因**：给 [`data_rx::decode`](../native/airdrop/crates/filin-rs/src/data_rx.rs) 的丢弃分支加上 `debug` 级日志后，第一条就是
+   `data_err=Payload(TooShort) len=1800`，帧头为 `88 08 … QoS 80 00（A-MSDU present）`。
+   Mac 把多个 MSDU 聚合成一个 A-MSDU，而监视器路径最多只交**一整个 RX buffer**（约 1800 字节），尾部被截断；`decapsulate_amsdu_data_frames` 一遇到被截断的子帧就 `return Err(TooShort)`，**把整帧连同前面已完整的子帧一起扔掉**。于是内核收不到任何字节 → 不回 ACK → Mac 的 TCP 窗口永远不开。
+
+**修复**：截断处改为 `break`，保留此前所有**完整**子帧。不变式保留——绝不把**半个** IP 包交给内核（被切的那一帧丢掉，交给 TCP 重传）。测试改成 `truncated_amsdu_never_delivers_a_partial_ip_packet`（不投递残缺包）+ 新增 `truncated_amsdu_still_delivers_the_complete_prefix`。
+
+**实测效果**：`dropped=0`（此前每个 A-MSDU 都被丢）；`awdl0` 从单向变成双向（10 秒 rx 43 863 B / tx 3 540 B，此前 rx 仅 425 B/s）；`unicast_acked` 正常增长。
+
+**但整条链路仍未打通，卡在更下一层（新证据，勿与上面混淆）**：
+- `/Ask` 成功后**上传体一个字节都没进来**（`luftlift` 进程 RSS `6228 KB → 6228 KB` 不变），55 秒后读超时。
+- 所有来自 Mac 的连接都停在 `FIN-WAIT-1` 且 `Send-Q=1`：我们的 FIN 一直没被 ACK。
+- 驱动层统计却是好的：`unicast_acked=147`、`unicast_no_ack=1`、`pending=0`。
+- 结论：**帧在射频层被 ACK 了（确实到了 Mac 的网卡），但 Mac 的 TCP 不认**，反方向它也不肯发上传体。下一步必须逐字段对比 [`build_data_frame`](../native/airdrop/crates/filin-rs/src/lib.rs) 生成的 seq/TID/AWDL data head 与 Mac 实际帧（抓包里 `aa aa 03 00 17 f2 08 00 03 04 …`），并确认 App 拉起 luftlift 时传的 `--http-addr off` 究竟关掉了哪个监听。
+
+**旁证：0057 的 A-MSDU 修复并未真正生效**。上机模块 SHA 与 `candidate-0057.ko` 一致（`bbfceb93…`），但监视器仍把聚合截断在 ~1800 字节，说明 `dp_rx_mon_1.0.h` 那处 `frag_len` 改动没有解决 continuation。谁接这块，先验证这一点，别再假设 0057 已修好。
+
+## 2026-10-28 mDNS 实例名带 PID 导致「三个一样的设备」
+
+**现象**：Finder 里出现三个完全相同的手机。
+
+**根因**：[`build_airdrop_service_info`](../native/airdrop/crates/luftlift-rs/src/mdns.rs) 用 `format!("{}-{}", computer_name, std::process::id())` 作实例名。每重启一次就是一条新记录（`luftlift-10725`、`luftlift-16272`、`luftlift-13423`），而被杀掉的进程不会送 TTL=0 goodbye，旧记录留在缓存里；Apple 选择器显示的是 TXT 里的 `ReceiverComputerName`（三次相同），于是看起来一模一样。
+
+**修复**：实例名改为稳定的 `cfg.computer_name`，重启只刷新同一条记录。已验证 `service=luftlift._airdrop._tcp.local.`（不再带 pid），测试改为 `service_info_instance_name_is_stable_across_runs`。旧记录会在 TTL（约 2 分钟）后过期。
+
+## 2026-10-28 其他交接事项（未修，留给下一个人）
+
+- **连接死掉后界面卡在「正在接收」**：`luftlift` 读超时关闭连接后，App 不会回到空闲；用户只能看到永久「正在接收」。应当在接收端退出/超时时回到 idle。
+- **两次自动重启**：均在 **resident** 模式运行约 1 分钟后发生（`uptime` 仅 12 秒）。`ro.boot.bootreason=reboot`（用户态请求），`/sys/fs/pstore` 为空、无 tombstone、dropbox 只有无关的 `system_server_wtf`，KernelSU 模块脚本里没有任何 `reboot`。window 模式连跑过数十分钟未重启。未取到根因，且重启前必然伴随一次 stop→start 循环（每个循环都创建一个 monitor vdev，删除即一条 QDF ASSERT），不能排除是快速开关触发。
+- **`--park` 与 ROC 共存**：`radio.sh` 传 `--park`，接收驻留固定在 master 锚信道（实测 149），STA 常驻 AP 的 52；`iw dev awdlsink set channel 149` 会被驱动以 `EINVAL` 拒绝，信道只能由驱动控制。`marionette_awdl_sink_freq` **只是 radiotap 里的装饰字段**，不控制任何调谐，不要再被它误导。
+- **驱动只放行 addr3 匹配的 AWDL 数据帧**（`marionette_monitor_post_frame`），其余一律不交给主机；调试时先确认帧是否到了 `awdlsink`，再看 TAP（`awdl0`）。
+- **调试经验**：把 `data_rx` 的丢弃原因从 `trace` 提到 `debug` 是本轮唯一找到根因的手段。以后再遇到「发送方卡住」，先看这条日志，不要猜。
+
 ## 2026-10-28 App 自包含加载补丁驱动（已实现并真机验收）
 
 **问题**：正常开机是原厂三模块，而 `radio.sh` 硬性要求补丁参数（`marionette_awdl_capture_hold`/`mgmt_tx`/sink/bmiss-mute/`sta_monitor`），KernelSU 模块 `marionette_homekit` 只起 HomeKit/sshd/mihomo、不装驱动，所以 App 点「开启」必然在 `radio.sh` 第 223 行 `fail … 9` 退出，界面显示「当前驱动缺少此实验后端需要的收发接口」。
