@@ -146,6 +146,7 @@ class AirDropService : Service() {
                 "安装包缺少 ARM64 AirDrop 后端，请先运行 build-airdrop-backend.sh"
             }
             AirDropState.onStarting("正在准备 AirDrop")
+            ensureDriver(radio)?.let { throw IllegalStateException(it) }
             var attempt = 0
             while (!stop.get()) {
                 attempt++
@@ -198,6 +199,47 @@ class AirDropService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
+    }
+
+    /**
+     * 确保已加载实验版（打了 marionette 补丁的）WLAN 驱动。
+     *
+     * 驱动不在开机镜像里，而 radio.sh 硬性要求 `marionette_awdl_*` 参数，所以在
+     * 起 radio.sh 之前，如果当前还是原厂驱动，就用随包的模块 + driver-load.sh
+     * 自行 insmod 并切换框架 Wi-Fi。已打过补丁时直接返回（快速路）。
+     *
+     * 失败时[driver-load.sh] 会回滚到原厂，Wi-Fi 仍可用，所以这里只把错误信息
+     * 抛回给界面，而不是把手机搞成没网。返回 null 表示驱动已就绪。
+     */
+    private fun ensureDriver(radio: File): String? {
+        // 快速路：补丁驱动已在位，无需再动 Wi-Fi。
+        if (File("/sys/module/kiwi_v2/parameters/marionette_awdl_capture_hold").exists()) return null
+        val dir = File(AirDropStore.base(this), "driver").apply { mkdirs() }
+        val cfg = File(dir, "cfg80211.ko")
+        val wlan = File(dir, "kiwi_v2.ko")
+        val script = File(dir, "driver-load.sh")
+        runCatching {
+            extractAsset("airdrop/marionette-cfg80211.ko", cfg)
+            extractAsset("airdrop/marionette-kiwi.ko", wlan)
+            extractAsset("airdrop/driver-load.sh", script)
+        }.onFailure { return "无法解压 AirDrop 驱动：${it.message}" }
+        AirDropState.onStarting("正在加载 AirDrop 驱动（Wi-Fi 会短暂切换，约 10 秒）")
+        val log = File(dir, "driver-load.log")
+        val cmd = listOf("/system/bin/sh", script.absolutePath, cfg.absolutePath, wlan.absolutePath)
+            .joinToString(" ", transform = AirDropStore::quote)
+        val code = runCatching {
+            ProcessBuilder("su", "-c", cmd).redirectErrorStream(true)
+                .redirectOutput(log).start().waitFor()
+        }.getOrElse { return "无法以 root 运行驱动加载：${it.message}" }
+        val out = log.takeIf { it.exists() }?.readText()?.trim().orEmpty()
+        if (code != 0) return "AirDrop 驱动加载失败：${out.takeLast(400)}"
+        return null
+    }
+
+    private fun extractAsset(name: String, target: File) {
+        target.parentFile?.mkdirs()
+        assets.open(name).use { input -> target.outputStream().use { input.copyTo(it) } }
+        runCatching { target.setExecutable(true) }
     }
 
     /** 起网卡，最多等 25 s；返回是否可用。 */

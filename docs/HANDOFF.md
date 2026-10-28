@@ -2,6 +2,33 @@
 
 更新日期：2026-10-28
 
+## 2026-10-28 App 自包含加载补丁驱动（已实现并真机验收）
+
+**问题**：正常开机是原厂三模块，而 `radio.sh` 硬性要求补丁参数（`marionette_awdl_capture_hold`/`mgmt_tx`/sink/bmiss-mute/`sta_monitor`），KernelSU 模块 `marionette_homekit` 只起 HomeKit/sshd/mihomo、不装驱动，所以 App 点「开启」必然在 `radio.sh` 第 223 行 `fail … 9` 退出，界面显示「当前驱动缺少此实验后端需要的收发接口」。
+
+**实现**（全部在 App 内，无需手工脚本）：
+- 新增 assets：`app/src/main/assets/airdrop/marionette-kiwi.ko`（24,141,304B，SHA256 `bbfceb9363a24ac8fdc8887c7fadb67dde87d1f567793d4972e9e34141f9327e`，即 **candidate-0057**，已含 A-MSDU 截断修复）、`marionette-cfg80211.ko`、`driver-load.sh`。
+- `driver-load.sh` 是 `native/airdrop/tools/awdl-stack-load.sh` 的上机精简版：幂等（参数已存在直接 exit 0）、卸载前 `svc wifi disable` 静默、任何一步失败都 `restore_stock` 回滚原厂并恢复联网。
+- `AirDropService.ensureDriver()` 在 `startRadio` 之前执行：先查 `/sys/module/kiwi_v2/parameters/marionette_awdl_capture_hold`，在则快速路直接返回（不解压、不切 Wi‑Fi）；不在则从 assets 解压到 `files/airdrop/driver/` 并以 `su` 跑 `driver-load.sh`，失败把日志抛给界面。
+
+**真机验收（原厂开机 → 直接从 App 开启）**：`install -r` 后 `am start-foreground-service …AirDropService` 走完整路径，`driver-load.log` 输出 `PATCHED_STACK_LOADED link=70:3a:73:a2:26:68`，`radio/state=listening`，界面变绿「实验中 / 停止会话」，状态「本地服务已启动」。停止后 `state=stopped`、`wlan0` 恢复 `10.12.1.48`（模块仍驻留）；再次开启走快速路（`driver-load.log` mtime 不变、无重载）直接 `listening`。**注意**：`marionette-kiwi.ko` 24MB 会进 Git；后续若要可复现构建，应改为从驱动源码产出后校验 sha 再打包。
+
+## 2026-10-28 RX A-MSDU 截断根因（yuni 源码核对，已定位）
+
+`yuni` 经直连 `ssh yuni`（不做 tailscale）可达。**构建身份已核实**：`audit-0056/candidate-0056.ko` 的 SHA256 = `bbb6e00602c6a0ce9c5f5f3222d536117356de957c0a6d63f900c12a7d4ade4e`，与上机 0056 模块 **完全一致** → 该源码树就是上机模块的真实构建。
+
+**分支激活确认**：`wlan/qcacld-3.0/configs/default_defconfig:143` 有 `CONFIG_QCA_WIFI_MONITOR_MODE_NO_MSDU_START_TLV_SUPPORT := y`；`wlan/qcacld-3.0/Kbuild:3325` 据此加 `-DQCA_WIFI_MONITOR_MODE_NO_MSDU_START_TLV_SUPPORT`；构建目录的 `*.o.cmd` 记录里确有该 `-D`。所以 `dp_rx_mon_1.0.h` 的 `#ifdef QCA_WIFI_MONITOR_MODE_NO_MSDU_START_TLV_SUPPORT` 分支**被编译进上机模块**。
+
+**根因**：该分支（`dp/wifi3.0/monitor/1.0/dp_rx_mon_1.0.h:738`）在 continuation 时计算
+`frag_len = (RX_MONITOR_BUFFER_SIZE(2048) - rx_pkt_tlv_len - l2_hdr_offset) & (RXDMA_DATA_DMA_BLOCK_SIZE(128) - 1)`。
+2048 是 128 的倍数、`DP_RX_MON_RAW_L2_HDR_PAD_BYTE=0`，所以结果 ≈ `(-(tlv)) & 127`，**恒 < 128 字节**，而不是本应约 `2048 - tlv ≈ 2000`。这个 `frag_len` 在 `dp_rx_mon_add_msdu_to_list`（行 552）里作为 RX fragment 长度直接传给 `qdf_nbuf_add_rx_frag(rx_desc_tlv, msdu_curr, tlv, frag_len + l2_hdr_offset, RX_MONITOR_BUFFER_SIZE, false)`。于是**跨多个 monitor buffer 的 A-MSDU/MSDU continuation 每片只交付 <128 字节 → 整帧截断**；单 buffer 帧走 `frag_len = msdu_len` 不受影响，正好解释“小文件传输能过、1310B 大帧间歇截断需 TCP 重传”与 `frame-814788`（136B≈120+头，首子帧声明 1466B）。
+
+**对照**：非 NO_MSDU 分支用 `dp_mon_adjust_frag_len` / `dp_rx_mon_frag_adjust_frag_len`，计算 `RX_MONITOR_BUFFER_SIZE - rx_pkt_tlv_len - l2_hdr_pad`（精确 ~2000），证明 `& 127` 是错的：该去除掩码（取精确长度），或在确需向下对齐 DMA 块时改成 `& ~(128-1)`；当前 `& 127` 取的是“余数”而非“块数×块长”。
+
+**修复（0057，已编译产出）**：已把第 738 行改为精确长度 `RX_MONITOR_BUFFER_SIZE - rx_pkt_tlv_len - *l2_hdr_offset_p`（与正常分支一致，去掉误用的 `& (RXDMA_DATA_DMA_BLOCK_SIZE - 1)`）。在 `wlan/` 树（基线 518147f + 0056 补丁）上增量 rebuild 成功（`driver/build-baseline.sh … modules`，EXIT=0），`kiwi_v2.ko` 522363512B（比 0056 +48B），`clang/bin/llvm-strip --strip-debug` 得 **`driver/candidate-0057.ko` 24,141,304B / SHA256 `bbfceb9363a24ac8fdc8887c7fadb67dde87d1f567793d4972e9e34141f9327e`**（与 0056 同尺寸、不同 sha，符合最小代码改动预期）。**未部署、未真机验证**：下一步把 candidate-0057.ko 推上机、加载后重放触发截断的 A-MSDU（app-native4 `frame-814788` 场景）确认重组完整。需按 audit-0056 流程将其固化为正式 0057 补丁包。
+
+**手机发现苹果设备诊断（0056/0057 真机）**：接收端 `receive --browse` 能 resolve 部分 `_airdrop._tcp` peer（日志 `AirDrop peer resolved 9c49f096c68b @ fe80::685e:b7ff:fe58:2465:8770`），app 也收到 `PEER 9c49f096c68b… @ fe80::685e:b7ff:fe58:2465:8770`（logcat）。但**本机 Mac（awdl `fe80::f82f:d3ff:feae:c4e3` / MAC `fa:2f:d3:ae:c4:e3`）始终没被 resolve**。即发现管线（`--browse` → `peer` 事件 → app 列表）是通的，缺的是**收不到 Mac 的 `_airdrop._tcp` mDNS**。mDNS 帧小（单 buffer），不是 A-MSDU 截断问题（0057 修的是跨 buffer 大帧，对单 buffer 小帧无影响）。下一步：抓 awdlsink/awdlmon 看 Mac 的 mDNS 是否到达、落在哪个 channel/slot，与我们的 ROC 驻留窗口对比，判定是信道/时序还是 Mac 侧未在该信道宣告。candidate-0057.ko 已推上机并 sha 校验一致（`/data/local/tmp/marionette-candidate-0057.ko`）。
+
 ## 2026-10-28 环境复查与证据修正（未新增无线实验）
 
 用户要求继续推进。本轮先只读复查环境并复核既有证据，未安装模块、未启动无线实验、未改 APK。
@@ -25,6 +52,8 @@
 **真机确认（部署后）**：用 `gradle-9.1.0-all` + Android Studio JBR(JDK25) 出包（`buildAirDropBackend` 需先把被忽略的 `src/bin/awdl-emit.rs` 从源码树拷回）并 `adb install -r` 后启动 0056 接收窗口：introspect `/status` 显示 `current_channel=52`、**`rebroadcast_counts={"149":29,"52":33}`**——新旧对比此前只有 149，现在手机确实在 home 时段于信道 52 发帧；TX `requests_accepted=281 / unicast_no_ack=0`。说明 slot-0 home 信道发送路径在真机上生效（端到端接收仍需一次 Mac 发送确认）。
 
 **端到端确认（新 build）**：在同一窗口内用户再发 `client-call-media-ui-fixes.md`，手机收到 `1-client-call-media-ui-fixes.md` **1310 字节 / SHA `ec173ca4…3901838`**，与 Mac 源逐字节一致；`transfer.log` `Ask response prepared` → `received file … bytes=1310` → `Upload complete count=2`。即带 slot-0 修复的 build **不回退** Finder→手机接收，且同时具备 52 信道重播能力（上条 `52:33`）。
+
+**2026-10-28 里程碑提交 + 下一步探路**：上述改动已 commit 为 `14f5a65`（本地，未 push），并纳入被 `.gitignore` 的 `bin/` 规则漏掉的 `src/bin/awdl-emit.rs`（构建必需；之前 `buildAirDropBackend` 因缺它失败）。`yuni`：LAN `10.12.1.67` 当前不可达（无 ARP），仅 tailnet `100.121.129.99` 可达但 SSH 走 Tailscale SSH check 模式、需浏览器批准（`https://login.tailscale.com/a/…`），本轮无法自动登录。手机→Mac 原生：用手机现装 `libmarionette_airdrop.so … send --address '[fe80::f82f:…]:8770'` 实测得到 **`Connection refused (111)`**——SYN 已到 Mac、主机主动 RST，证明 AWDL 链路通、但 Mac 侧 8770 无监听（Finder 隔空投送窗口未开）；此前 app-native4 的 `Connection reset` 同属 Mac 侧。开窗后已 `touch stop` 回退：`result=restored`、原厂、网关 3/3。**待办**：Mac 打开 Finder 隔空投送后重发验证手机→Mac；给 `yuni` 一个可用登录方式再查 RX 截断。
 
 **下一步（阻塞点）**：恢复 `yuni` 或提供内核源码以查 A-MSDU 截断根因（截断帧已在 `app-native4-20261027/frame-814788.bin` 归档）；或在用户驱动 Mac 原生 AirDrop 的前提下，用本机 0056 模块 + 最新 APK 做一次有界双向真机测试。四项 AirDrop 稳定验收仍 0/4。
 
