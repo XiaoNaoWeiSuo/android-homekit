@@ -12,6 +12,33 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
+/// Darwin restricts AWDL ingress unless the socket opts in (OpenDrop uses
+/// SO_RECV_ANYIF, 0x1104). Configure before connect so SYN/ACK is admitted too.
+#[cfg(target_os = "macos")]
+pub fn allow_awdl_ingress(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let enabled: libc::c_int = 1;
+    // SAFETY: enabled is a valid c_int for this socket option.
+    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, 0x1104,
+        (&enabled as *const libc::c_int).cast(), std::mem::size_of_val(&enabled) as libc::socklen_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn connect_tcp(peer: &SocketAddr, timeout: std::time::Duration) -> std::io::Result<std::net::TcpStream> {
+    #[cfg(target_os = "macos")]
+    if let SocketAddr::V6(v6) = peer {
+        if v6.ip().is_unicast_link_local() {
+            use std::os::fd::AsRawFd;
+            let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            allow_awdl_ingress(socket.as_raw_fd())?;
+            socket.connect_timeout(&(*peer).into(), timeout)?;
+            return Ok(socket.into());
+        }
+    }
+    std::net::TcpStream::connect_timeout(peer, timeout)
+}
+
 /// Find the first IPv6 address on the named interface (typically the
 /// link-local `fe80::` address on awdl0).
 pub fn get_ipv6_for_interface(name: &str) -> Option<Ipv6Addr> {
@@ -31,7 +58,7 @@ pub fn get_ipv6_for_interface(name: &str) -> Option<Ipv6Addr> {
             cursor = item.ifa_next;
         }
         libc::freeifaddrs(addresses);
-        return found;
+        found
     }
     #[cfg(not(unix))]
     let content = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
@@ -108,6 +135,20 @@ pub fn connect_addr_with_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn airdrop_listener_opts_in_to_awdl_ingress() {
+        use std::os::fd::AsRawFd;
+        let listener = crate::server::bind_listener(0).unwrap();
+        let mut enabled: libc::c_int = 0;
+        let mut size = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        // SAFETY: enabled and size are valid writable socket-option buffers.
+        let result = unsafe { libc::getsockopt(listener.as_raw_fd(), libc::SOL_SOCKET,
+            0x1104, (&mut enabled as *mut libc::c_int).cast(), &mut size) };
+        assert_eq!(result, 0);
+        assert_eq!(enabled, 1);
+    }
 
     #[test]
     fn parse_inet6_addr_lo() {

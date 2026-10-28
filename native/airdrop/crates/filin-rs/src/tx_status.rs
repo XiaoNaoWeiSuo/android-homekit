@@ -17,6 +17,8 @@ pub enum Event {
         cookie: u64,
         acked: bool,
     },
+    RocCookie { seq: u32, cookie: u64 },
+    Roc { ifindex: u32, cookie: u64, frequency: u32, ready: bool },
 }
 
 fn attrs(mut bytes: &[u8]) -> Option<Vec<(u16, &[u8])>> {
@@ -81,7 +83,20 @@ pub fn parse(mut bytes: &[u8], family: u16) -> Option<Vec<Event>> {
             out.push(Event::Ack { seq, error });
         } else if kind == family {
             let cmd = *body.first()?;
-            if cmd == 59 || cmd == 60 {
+            if cmd == 55 || cmd == 56 {
+                let fields = attrs(body.get(4..)?)?;
+                let cookie = u64::from_ne_bytes(field(&fields, 88)?.try_into().ok()?);
+                if let Some(index) = field(&fields, 3) {
+                    out.push(Event::Roc {
+                        ifindex: u32::from_ne_bytes(index.try_into().ok()?),
+                        cookie,
+                        frequency: u32::from_ne_bytes(field(&fields, 38)?.try_into().ok()?),
+                        ready: cmd == 55,
+                    });
+                } else if cmd == 55 {
+                    out.push(Event::RocCookie { seq, cookie });
+                }
+            } else if cmd == 59 || cmd == 60 {
                 let fields = attrs(body.get(4..)?)?;
                 let cookie = u64::from_ne_bytes(field(&fields, 88)?.try_into().ok()?);
                 if cmd == 59 {
@@ -308,6 +323,28 @@ mod tests {
         invalid_ack.extend(attr(92, &[1]));
         assert!(parse(&message(44, 0, &invalid_ack), 44).is_none());
     }
+    #[test]
+    fn roc_reply_ready_expiry_are_distinct_from_tx_status() {
+        let mut reply = vec![55, 1, 0, 0];
+        reply.extend(attr(88, &256u64.to_ne_bytes()));
+        let mut ready = reply.clone();
+        ready.extend(attr(3, &7u32.to_ne_bytes()));
+        ready.extend(attr(38, &5745u32.to_ne_bytes()));
+        let mut expired = ready.clone(); expired[0] = 56;
+        let mut bytes = message(44, 10, &reply);
+        bytes.extend(message(2, 10, &0i32.to_ne_bytes()));
+        bytes.extend(message(44, 0, &ready));
+        bytes.extend(message(44, 0, &expired));
+        assert_eq!(parse(&bytes, 44), Some(vec![
+            Event::RocCookie { seq: 10, cookie: 256 },
+            Event::Ack { seq: 10, error: 0 },
+            Event::Roc { ifindex: 7, cookie: 256, frequency: 5745, ready: true },
+            Event::Roc { ifindex: 7, cookie: 256, frequency: 5745, ready: false },
+        ]));
+        ready.extend(attr(38, &2437u32.to_ne_bytes()));
+        assert!(parse(&message(44, 0, &ready), 44).is_none());
+    }
+
     #[test]
     fn status_before_cookie_counts_once_only_after_acceptance() {
         let mut t = Tracker::new(35, true);

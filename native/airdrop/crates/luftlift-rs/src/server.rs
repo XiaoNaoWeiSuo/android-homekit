@@ -333,6 +333,7 @@ pub fn serve_forever(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Shared connection/consent state; kept explicit at the worker boundary.
 fn handle_tls_connection(
     tcp_stream: TcpStream,
     tls_config: Arc<ServerConfig>,
@@ -504,6 +505,11 @@ fn handle_tls_connection(
 pub fn bind_listener(port: u16) -> Result<TcpListener> {
     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     let listener = TcpListener::bind(addr)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        crate::netutil::allow_awdl_ingress(listener.as_raw_fd())?;
+    }
     info!(port, "HTTPS listener bound");
     Ok(listener)
 }

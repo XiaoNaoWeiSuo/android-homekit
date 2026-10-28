@@ -85,7 +85,7 @@ def main():
 
         if ftype == 0 and subtype == 13:      # action
             body = frame[24:]
-            action_hits.append((a3, frame[4:10].hex(":"), body[:40].hex(" ")))
+            action_hits.append((a3, frame[10:16].hex(":"), body[:40].hex(" ")))
             if body[:6] == AWDL_PREFIX:
                 awdl_hits.append((a3, body.hex(" ")))
 

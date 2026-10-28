@@ -1,0 +1,234 @@
+{
+  "base_commit": "518147fd7e0199758efe9bd96a22c9c2ea30bcd9",
+  "patch_sha256": "8eb5ad1eb10b63907825aa7e721433fe258bfc5a8f2c0f717fa72e930d2d5c76",
+  "files": [
+    {
+      "path": "platform/inc/cnss2.h",
+      "before_sha256": "c6dd78890886f5e6026369a6f8a642ef6652d882e763f2f23258b711fb87a012",
+      "after_sha256": "9c0c1c7c202678a673c0b3a45a29ca1dd244a93d4252f67761a0c376ba8a43bc"
+    },
+    {
+      "path": "platform/inc/marionette_awdl_rx_diagnostics.h",
+      "before_sha256": null,
+      "after_sha256": "4bb2bbb7fee0a882c617175718a9c6ba97711c00b1000faaba59dde84e800e1c"
+    },
+    {
+      "path": "platform/inc/marionette_monitor_rx_observe.h",
+      "before_sha256": null,
+      "after_sha256": "ea32bfae5d76c2b2b09450775a4b4f48d3c87835d5ecc1d11eaccc3aac96b03e"
+    },
+    {
+      "path": "platform/inc/marionette_rx_resources.h",
+      "before_sha256": null,
+      "after_sha256": "2d1851c721ce7f79fc7a90afc1b19e8c8c5b70205f5379df7c1578034adcb248"
+    },
+    {
+      "path": "platform/inc/marionette_sta_monitor.h",
+      "before_sha256": null,
+      "after_sha256": "ec9753a99c35f0ae2d876dcdeb54c49b73b2bf1be9ef9bc561c39c0e2ffba41c"
+    },
+    {
+      "path": "platform/inc/marionette_wmi_rx_filter.h",
+      "before_sha256": null,
+      "after_sha256": "94822011c534f393994046e1f8d1525a8ab3591d7813a7d2d255e5fe13db43be"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/dp_main.c",
+      "before_sha256": "3eb54469e850db4a831e91e4b6d2be2ce00f38cd5114beee64c848027ac8810e",
+      "after_sha256": "9ebd8cdcb3b3f56ef68b4f3be87f2bc8ea553b828ee2b58e412a798ae2fe532e"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/dp_tx.c",
+      "before_sha256": "86467127393fd7ca3dfb6e80f1aaaa7802ccd85cf7f455a6205a774d8337c2f7",
+      "after_sha256": "0bbbb73b9db56d22e32874aa652e997243103cfed74551f3b6cfae82fc4e7d7a"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_1.0.c",
+      "before_sha256": "6785cd18aabcfbbcc72ae0ce2bbbfcc8a310a4317265fa56a11870047efe27d2",
+      "after_sha256": "a2aef2b35f06d3087801dfb0039fbba22b75cce34aadb2cc3bc274104d26aa61"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_filter_1.0.c",
+      "before_sha256": "25828aaae7b0a871eda35c063747dbe5b31f800f4e5dba8f05888dfad5daaab0",
+      "after_sha256": "b31726e7bdf515394f48a4b84fb57b5ffb97cf76160245a1593eb852e72956d1"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_dest_1.0.c",
+      "before_sha256": "30cb34c82db180052c908f96ed216eb9491016a7f38e468a4821d4a897c51f30",
+      "after_sha256": "1d7a6d9e9a527016faec5e09734787b0e8d78205eb3a6653db37d3287f303906"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_mon.c",
+      "before_sha256": "4c0651d659763404007a03ec49ab5d07c03a8a5d1e3f35391172a7856117fb9c",
+      "after_sha256": "fce37813f49f5cd797d041ea44ecb2aeb596b34a58d8344adc719704b768cc40"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_mon.h",
+      "before_sha256": "4bf17a6785fc69a32b41ecb3ae5f6cedda12b282b2d41d439fd14e8e7425c131",
+      "after_sha256": "57dbf98ac78256924e3daff2eb3731de365d5e7c9dffc656b460c6041e8bb1f3"
+    },
+    {
+      "path": "qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c",
+      "before_sha256": "2bf1ec55811f67560a5d5826ec65226cdba0b730d7e9abf554596fb9da5e6c09",
+      "after_sha256": "0382d254b25af9297f29ff0837fe3b1b4ec99d2c594a9ab2d123378e01356852"
+    },
+    {
+      "path": "qca-wifi-host-cmn/hal/wifi3.0/hal_srng.c",
+      "before_sha256": "dcbd617687fa690dc85e27fad8a834de58b451ee3c5c5afaa6b57b9bf24004b7",
+      "after_sha256": "2211075bd5d1167a36543034473b956eabb78e73cbd64a1a9959c9c1b005c538"
+    },
+    {
+      "path": "qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.c",
+      "before_sha256": "f36768d54a64d1fcbdf8483bd2e30a46c26486b744c3627ddb9b20db5bbe3508",
+      "after_sha256": "4e78080fe5e41642c9ce17084b8b845b0f8e4420ae9c8586320533f61096a5a3"
+    },
+    {
+      "path": "qca-wifi-host-cmn/target_if/direct_buf_rx/src/target_if_direct_buf_rx_main.h",
+      "before_sha256": "f3b1283d8e330ac0118282c2941da97d5feb030f2e15bf4f7efdc62ce7a917af",
+      "after_sha256": "49cd4e7946696f18e6606004627e54da2ff4e73bc1c55d3d3812d1e4fbdeebfa"
+    },
+    {
+      "path": "qca-wifi-host-cmn/target_if/mlme/vdev_mgr/src/target_if_vdev_mgr_rx_ops.c",
+      "before_sha256": "3035c8dad28239990aacfc77199d348124d08771054e5ab3febc7ed200609c48",
+      "after_sha256": "0288c95525057bdd6dda079140c711dd5f7fc87843a4e381cbed579ce93a21d5"
+    },
+    {
+      "path": "qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/inc/wlan_vdev_mgr_tgt_if_rx_defs.h",
+      "before_sha256": "43537cc4ad73d5e59c340bc9b4265ccf8f02fac409d10e1c18e99760e355407a",
+      "after_sha256": "6973be3e02e9389898636c7ee9d81c04e8c975f17e2138d599d6a6cf9a1f80c5"
+    },
+    {
+      "path": "qca-wifi-host-cmn/umac/mlo_mgr/src/wlan_mlo_mgr_sta.c",
+      "before_sha256": "b98413d918f0e7ffb7e273b1fd7073884e26da90ded8453f984a6f95c4df44d8",
+      "after_sha256": "dc4ed80629e8f027a4b57f0cf10be91e236391b81c72a628c1a03d2bed4f6d56"
+    },
+    {
+      "path": "qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c",
+      "before_sha256": "39a899f39e8c59a3e1fc372918c0374d45be543a919bd3f8635c10200d22941e",
+      "after_sha256": "5c23933bd39b081468f8447ab1e710838185330930dd3a494fec671745195fbd"
+    },
+    {
+      "path": "qcacld-3.0/components/cmn_services/policy_mgr/src/wlan_policy_mgr_get_set_utils.c",
+      "before_sha256": "f6bcc71002af0b674a158fc9272ef29388e19f9cd18b3e3130065b72fad0784b",
+      "after_sha256": "d97d2e320a4a9cee9e901155add982c38e09df0d355c723dd3842a0f9d861bf8"
+    },
+    {
+      "path": "qcacld-3.0/components/mlme/core/src/wlan_mlme_vdev_mgr_interface.c",
+      "before_sha256": "d2c5325c9ec6929abe0121006b0e9be27e2995373be10345b5d8cf78431c18b8",
+      "after_sha256": "7bd327a8d6527773652a6015f95b0692b3a71b8107eecfd35d7a6fc59b561370"
+    },
+    {
+      "path": "qcacld-3.0/components/mlme/dispatcher/src/wlan_mlme_api.c",
+      "before_sha256": "0d062a614852090ab369e9c4fd924ca33c40d10141e40439c1ff2743a881dc23",
+      "after_sha256": "dfdcc93fe932a3af53623ac5b061b4faaf4ff298b3b85775407a90d34408a926"
+    },
+    {
+      "path": "qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.c",
+      "before_sha256": "04a85e3e5f2952fb9484ee7f3d34c36f9acc7e2baf229b677138c5d8ef6efc88",
+      "after_sha256": "bf30e00853d06fde52315572f6f26a4f5ba6137128146c6fc3c76b852ab6157a"
+    },
+    {
+      "path": "qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.h",
+      "before_sha256": "d9832567a062517aa3e49511113245bcafdc38e50ba8c5420f058a3143de9c08",
+      "after_sha256": "c391726a36a194dd74b20c1054e90f6fef90d7dc2d6363db5503db5653ff8b75"
+    },
+    {
+      "path": "qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c",
+      "before_sha256": "42fd3b8e4040494367f8cf2f0b2080688c0870e97ac6e7c6d206d52ab0d77134",
+      "after_sha256": "a77b1355d3432efec5892be19975594e02178763525b3c0c8e369d51a15eb4ab"
+    },
+    {
+      "path": "qcacld-3.0/core/dp/txrx3.0/dp_txrx.c",
+      "before_sha256": "97772ac984b786e693345383879f4d09963d8add5f0966aa8622d098079b9e6b",
+      "after_sha256": "d37b3e508f676880fc4ab8b709b601f8a97dd9d5aee4a0fb5f256951cded66db"
+    },
+    {
+      "path": "qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h",
+      "before_sha256": "3ae0c959eaacd563d6bbf7463652bb8cec4e4a93ad4139b779ff6c10dd1cada5",
+      "after_sha256": "6fc878a7ceb4aaae1d42558135763fa2345c729c9707c85a68cb9341b4d9c804"
+    },
+    {
+      "path": "qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c",
+      "before_sha256": "a51a3b68f817f37cc89b230da74e7a148522034d1df2af28e172897bf10ad415",
+      "after_sha256": "9fee2b742417f91134fee2768ff2500a92c8a52e8c7112841e0f944d81102faf"
+    },
+    {
+      "path": "qcacld-3.0/core/hdd/src/wlan_hdd_main.c",
+      "before_sha256": "c240b2bc3ed805b64159f26b113c8396eaeff395a9a887a36965e4b240615164",
+      "after_sha256": "b7628f28538f5e2e0afc181691b613e48b73b2856fad5e4648688d11b5307b76"
+    },
+    {
+      "path": "qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c",
+      "before_sha256": "f76cfdab0c618a998edcf00927129dc1dda5dd4891706ec27bbfee15da97a857",
+      "after_sha256": "e7200a5bda6e22f5e8410393c6b195c332b52851134f0322b90a3a34e323aede"
+    },
+    {
+      "path": "qcacld-3.0/core/hdd/src/wlan_hdd_power.c",
+      "before_sha256": "95ca56aa2349966fd3f8a79510e7446074c438d2161eb2f4f469ab2f7cf55596",
+      "after_sha256": "1c76ccf0f925715d75bde1a136973ff08d413660b97ff4a0fc66fef7eaad3b8c"
+    },
+    {
+      "path": "qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c",
+      "before_sha256": "987cd5f6c11c49f75986a3983e2715edfbd126acdb5133cba8fc240c247ea1f1",
+      "after_sha256": "122f16339e3d7761b4d6d6bb6600dbe63b8d5030af549a45cc3a29d776020c24"
+    },
+    {
+      "path": "qcacld-3.0/core/mac/src/pe/lim/lim_api.c",
+      "before_sha256": "162a321fe35f81a0ecb327d32d4177fd80730374de146ece242daaeee2dc5bde",
+      "after_sha256": "bed56801dc70c17bd8bbd5d93e947f912f2c0734a2958da3d103e4393a7c59a3"
+    },
+    {
+      "path": "qcacld-3.0/core/mac/src/pe/lim/lim_process_message_queue.c",
+      "before_sha256": "cfde9fa469321a635d2d851daa0b9b58b0261bb10d2620a3d5f0e473e6061c35",
+      "after_sha256": "4f041ca5c7822c3515b88936a0b69616cf8ff1739798ab066c4c61102dd6389c"
+    },
+    {
+      "path": "qcacld-3.0/core/pld/inc/pld_common.h",
+      "before_sha256": "8d590b72ce4e29fd7eaced5a394075b523c5d52927075431cec41d0d83505654",
+      "after_sha256": "23cf68aec18c35a716849fdb4305c54ba31f861a0c10bb06d1baef151418deba"
+    },
+    {
+      "path": "qcacld-3.0/core/pld/src/pld_pcie.c",
+      "before_sha256": "1803aaa0134769e48a94ad4cb996feab5a76b67b069c5d0224027318cd9bb316",
+      "after_sha256": "46fc688975e654c2280aad2a2159d3d23a8cee6e305620e190c2ad41aeac636e"
+    },
+    {
+      "path": "qcacld-3.0/core/sme/src/common/sme_api.c",
+      "before_sha256": "bd7c9f1bfecbbcf8ea929533cfa4c056c94e6d96ab811d84e186c57e1e324b8b",
+      "after_sha256": "8895f1f91b69735d78109be1444f1f5657fc10d2d9f77104785eed186010c876"
+    },
+    {
+      "path": "qcacld-3.0/core/wma/inc/wma.h",
+      "before_sha256": "a472488b4fa7e349407241057e186eb3ad723d098d33fc5ec7556c97e3276101",
+      "after_sha256": "5ae9685c0e4a6021b7971655d03eab1fe21430732bb5fbbd9040d9b29b8aeb59"
+    },
+    {
+      "path": "qcacld-3.0/core/wma/src/wma_dev_if.c",
+      "before_sha256": "ed1f5599322c55d3dfbcb6fa29c1d381a98a138029425e4a35679c6c91e750e2",
+      "after_sha256": "dc9a3f3ee50b0c6ecb013566a51c473b6e1f9a133183cf74f666a97f47a39184"
+    },
+    {
+      "path": "qcacld-3.0/core/wma/src/wma_main.c",
+      "before_sha256": "fd2de23932bdb55dfd165ea45982444854301df47be4b034ab3f90a67234e5e1",
+      "after_sha256": "7131610fab7bfb67b8f3bebff4f66216a1d0cda67d23d7c1815486934d9b215a"
+    },
+    {
+      "path": "qcacld-3.0/core/wma/src/wma_mgmt.c",
+      "before_sha256": "c6b5e4dbb87d6d59c7deb2e88808955f80cde790e61f5e0c11c09b312846e40f",
+      "after_sha256": "97a5087807066d774aaa60c07864b6297e04746e893d9f8727ea735e95161bbe"
+    },
+    {
+      "path": "qcacld-3.0/core/wma/src/wma_utils.c",
+      "before_sha256": "03be8e587083ca20c3c8415e47c88eccf74e12f22f5add0bf9be696b85a5e771",
+      "after_sha256": "d0540d057c71208ace4d2e2127344a7cc417cdf612ec4373dfc5b2e4eabd487b"
+    }
+  ],
+  "new_headers": [
+    "platform/inc/marionette_awdl_rx_diagnostics.h",
+    "platform/inc/marionette_monitor_rx_observe.h",
+    "platform/inc/marionette_rx_resources.h",
+    "platform/inc/marionette_sta_monitor.h",
+    "platform/inc/marionette_wmi_rx_filter.h"
+  ],
+  "deployed": false
+}

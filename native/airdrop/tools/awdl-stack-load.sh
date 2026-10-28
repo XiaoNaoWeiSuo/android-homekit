@@ -20,29 +20,14 @@
 set -u
 
 CFG=${2:-/data/local/tmp/marionette-cfg80211-0043.ko}
-WLAN=${3:-/data/local/tmp/marionette-candidate-0046.ko}
+WLAN=${3:-}
 STOCK=/vendor_dlkm/lib/modules/qca_cld3_kiwi_v2.ko
 STOCK_CFG=/vendor_dlkm/lib/modules/cfg80211.ko
 LOCK=/data/local/tmp/marionette-stack.lock
-# The gates the AWDL RX paths depend on.  raw_tx stays off: nothing in this
-# path uses the monitor-vdev TX contract.
-#
-# marionette_awdl_sta_monitor (patch 0009) is deliberately NOT enabled.  With
-# it on, wlan_mlme_is_sta_mon_conc_supported() returns true unconditionally, so
-# policy_mgr restricts the STA's channel set to the monitor vdev's channel and
-# every later STA connect to a *different* channel is refused in the host
-# pre-checks:
-#     Connect with <bssid> ... is FAILURE cm_reason 0 status_code 0
-# arriving 2-20 ms after "Trying to associate", i.e. before any over-the-air
-# exchange.  Stock performs the identical association in ~260 ms.  Bisected on
-# device 2026-10-22 with assoc-gate-bisect.sh: roc_rx=1 and monitor_raw_rx=1
-# alone are both fine, sta_monitor=1 alone reproduces it, all-off is fine.
-# The channel it breaks is 5220 MHz (channel 44) - the only AWDL social channel
-# this AP offers - so the gate had to go for the 0046 probe to be reproducible.
-# Patch 0009 is an [EXPERIMENTAL] attempt to keep the STA associated while a
-# monitor vdev ran; patch 0046 (resident firmware promiscuous RX) makes the
-# monitor vdev unnecessary, so the experiment is obsolete and should be
-# superseded in the driver stack the way 0045 was.
+SCAN_RESTORE=
+# The caller selects a verified candidate explicitly. STA-monitor concurrency
+# remains opt-in; the current capture implementation needs it but it can limit
+# association channels. Never silently load an obsolete default candidate.
 PARAMS="marionette_awdl_mgmt_rx=1 marionette_awdl_roc_rx=1 \
 marionette_awdl_monitor_raw_rx=1 \
 ${MARIONETTE_EXTRA_PARAMS:-}"
@@ -59,54 +44,138 @@ wait_link() {
 	return 1
 }
 
+run_bounded() {
+	/system/bin/timeout -k 2 "$@"
+}
+
+wait_wifi_disabled() {
+	attempt=0
+	quiet=0
+	quiet_required=${1:-2}
+	while [ "$attempt" -lt 40 ]; do
+		# A disabled UI switch can coexist with an active scan-only manager.
+		# Do not reload cfg80211 until the framework owns no client interface.
+		if run_bounded 2 cmd wifi status 2>/dev/null | grep -q '^Wifi is disabled' &&
+		   run_bounded 3 dumpsys wifi 2>/dev/null | grep -q '^NumActiveModeManagers: 0$'; then
+			quiet=$((quiet + 1))
+			[ "$quiet" -lt "$quiet_required" ] || return 0
+		else
+			quiet=0
+		fi
+		sleep 0.25
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
+quiesce_scan_mode() {
+	if [ -z "$SCAN_RESTORE" ]; then
+		SCAN_RESTORE=$(settings get global wifi_scan_always_enabled)
+		case "$SCAN_RESTORE" in 0|1|null) ;; *) return 1 ;; esac
+	fi
+	if [ "$SCAN_RESTORE" = 1 ]; then
+		run_bounded 8 cmd wifi set-scan-always-available disabled || return 1
+	fi
+}
+
+release_stack_lock() {
+	# Restore the user's setting on both success and failure, before unlock.
+	if [ "$SCAN_RESTORE" = 1 ]; then
+		run_bounded 8 cmd wifi set-scan-always-available enabled ||
+			echo SCAN_SETTING_RESTORE_FAILED >&2
+	fi
+	rmdir "$LOCK" 2>/dev/null
+}
+
+restart_wificond() {
+	old_pid=$(pidof wificond 2>/dev/null || true)
+	setprop ctl.restart wificond || return 1
+	attempt=0
+	while [ "$attempt" -lt 40 ]; do
+		new_pid=$(pidof wificond 2>/dev/null || true)
+		if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] &&
+		   [ "$(getprop init.svc.wificond)" = running ]; then
+			return 0
+		fi
+		sleep 0.1
+		attempt=$((attempt + 1))
+	done
+	echo WIFICOND_RESTART_TIMEOUT >&2
+	return 1
+}
+
+enable_after_reload() {
+	# ctl.restart is asynchronous. Do not let WifiService open sockets on
+	# the old wificond process/netlink family and then lose them on restart.
+	restart_wificond || return 1
+	# Binder death is processed asynchronously even after the new daemon runs.
+	# This device schedules recovery ~2 s later, or disables Wi-Fi when its
+	# recovery budget is exhausted. Drain that transition while still off.
+	run_bounded 8 svc wifi disable >/dev/null 2>&1 || return 1
+	wait_wifi_disabled 12 || return 1
+	run_bounded 8 svc wifi enable >/dev/null 2>&1 || return 1
+}
+
 reconcile_link() {
 	wait_link && return 0
-	# Reconcile framework DisabledState with wifi_on=1 after module replacement.
-	svc wifi disable >/dev/null 2>&1
-	sleep 2
-	setprop ctl.restart wificond
-	svc wifi enable >/dev/null 2>&1
+	# One bounded reconciliation, with observed framework transitions.
+	run_bounded 8 svc wifi disable >/dev/null 2>&1 || return 1
+	wait_wifi_disabled 12 || return 1
+	# The module/family and daemon have not changed. Restarting wificond here
+	# only creates another death notification and consumes recovery budget.
+	run_bounded 8 svc wifi enable >/dev/null 2>&1 || return 1
 	wait_link
 }
 
+acquire_stack_lock() {
+	mkdir "$LOCK" 2>/dev/null || { echo "another stack operation is running"; return 9; }
+	trap 'release_stack_lock' EXIT
+}
+
 unload() {
-	/system/bin/timeout -k 2 8 svc wifi disable >/dev/null 2>&1
-	/system/bin/sleep 3
+	quiesce_scan_mode || return 1
+	run_bounded 8 svc wifi disable >/dev/null 2>&1 || return 1
+	wait_wifi_disabled || { echo WIFI_DISABLE_TIMEOUT >&2; return 1; }
 	for m in kiwi_v2 mac80211 cfg80211; do
 		[ -d "/sys/module/$m" ] || continue
-		/system/bin/timeout -k 2 12 rmmod "$m" 2>/dev/null
+		run_bounded 12 rmmod "$m" || return 1
+		[ ! -d "/sys/module/$m" ] || { echo "MODULE_STILL_LOADED $m" >&2; return 1; }
 	done
 }
 
 load_common() {
-	/system/bin/timeout -k 2 12 insmod "$1" || return 1
+	run_bounded 12 insmod "$1" || return 1
 	shift
 	# shellcheck disable=SC2086
-	/system/bin/timeout -k 2 20 insmod "$1" $PARAMS || return 1
-	return 0
+	run_bounded 20 insmod "$1" $PARAMS || return 1
+}
+
+restore_stock() {
+	# Also handles a partial candidate load; never insmod over a live stack.
+	unload || return 1
+	run_bounded 12 insmod "$STOCK_CFG" || return 1
+	run_bounded 20 insmod "$STOCK" || return 1
+	enable_after_reload || return 1
+	reconcile_link || { echo "STOCK_LOADED_NO_LINK"; return 1; }
+	echo "STOCK_LOADED_LINKED"
 }
 
 case "${1:-status}" in
 load)
 	[ "$(id -u)" = 0 ] || { echo "need root"; exit 2; }
 	[ -f "$CFG" ] && [ -f "$WLAN" ] || { echo "missing module"; exit 2; }
-	mkdir "$LOCK" 2>/dev/null || { echo "another load is running"; exit 9; }
-	trap 'rmdir "$LOCK" 2>/dev/null' EXIT
-	unload
+	acquire_stack_lock || exit $?
+	unload || { echo "UNLOAD_FAILED"; exit 1; }
 	if ! load_common "$CFG" "$WLAN"; then
 		echo "LOAD_FAILED rolling back to stock"
-		rmdir "$LOCK" 2>/dev/null
-		trap - EXIT
-		/system/bin/timeout -k 2 12 insmod "$STOCK_CFG" 2>/dev/null
-		/system/bin/timeout -k 2 20 insmod "$STOCK" 2>/dev/null
-		setprop ctl.restart wificond
-		svc wifi enable >/dev/null 2>&1
+		restore_stock || echo "STOCK_RESTORE_FAILED" >&2
 		exit 1
 	fi
-	# cfg80211 was reloaded, so wificond's netlink sockets point at a dead
-	# family.  Recreate them before asking for Wi-Fi back.
-	setprop ctl.restart wificond
-	svc wifi enable >/dev/null 2>&1
+	if ! enable_after_reload; then
+		echo "FRAMEWORK_RESTART_FAILED rolling back to stock"
+		restore_stock || echo "STOCK_RESTORE_FAILED" >&2
+		exit 1
+	fi
 	# The AWDL submission gate lives in cfg80211, not in the WLAN driver, and
 	# defaults to off.  Without it cfg80211_mlme_mgmt_tx falls through to the
 	# strict check - "if (!wdev->connected) return -ENOTCONN" - and every
@@ -129,19 +198,15 @@ load)
 	if reconcile_link; then
 		echo "STACK_LOADED link=$(iw dev wlan0 link | sed -n 's/^Connected to \([^ ]*\).*/\1/p')"
 	else
-		echo "STACK_LOADED_NO_LINK"
+		echo "STACK_LOADED_NO_LINK rolling back to stock"
+		restore_stock || echo "STOCK_RESTORE_FAILED" >&2
 		exit 1
 	fi
 	;;
 stock)
 	[ "$(id -u)" = 0 ] || { echo "need root"; exit 2; }
-	unload
-	/system/bin/timeout -k 2 12 insmod "$STOCK_CFG" || exit 1
-	/system/bin/timeout -k 2 20 insmod "$STOCK" || exit 1
-	setprop ctl.restart wificond
-	svc wifi enable >/dev/null 2>&1
-	reconcile_link || { echo "STOCK_LOADED_NO_LINK"; exit 1; }
-	echo "STOCK_LOADED_LINKED"
+	acquire_stack_lock || exit $?
+	restore_stock || exit 1
 	;;
 status)
 	echo "modules: $(ls /sys/module | grep -E '^(kiwi_v2|cfg80211|mac80211)$' | tr '\n' ' ')"
@@ -160,7 +225,7 @@ status)
 	iw dev wlan0 link 2>/dev/null | head -3
 	;;
 *)
-	echo "usage: $0 load|stock|status [candidate.ko] [cfg80211.ko]"
+	echo "usage: $0 load|stock|status [cfg80211.ko] [candidate.ko]"
 	exit 2
 	;;
 esac

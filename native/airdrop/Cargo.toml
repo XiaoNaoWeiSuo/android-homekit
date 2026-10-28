@@ -4,6 +4,7 @@ members = [
     "crates/filin-rs",
     "crates/luftlift-rs",
 ]
+exclude = ["third_party/mdns-sd"]
 
 [workspace.package]
 edition = "2021"
@@ -18,3 +19,7 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+
+# Pinned 0.11.5 plus RFC 6762 send hop-limit fix; see third_party/mdns-sd/MARIONETTE.md.
+[patch.crates-io]
+mdns-sd = { path = "third_party/mdns-sd" }

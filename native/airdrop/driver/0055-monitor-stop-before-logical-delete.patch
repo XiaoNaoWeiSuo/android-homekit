@@ -1,0 +1,483 @@
+From: Marionette driver research
+Subject: [UNVALIDATED RUNTIME] monitor-stop-before-logical-delete
+
+Applies after 0054 on WLAN 518147fd7e0199758efe9bd96a22c9c2ea30bcd9.
+Compile and host fault validation do not establish firmware/runtime safety.
+
+--- a/qca-wifi-host-cmn/target_if/mlme/vdev_mgr/src/target_if_vdev_mgr_rx_ops.c
++++ b/qca-wifi-host-cmn/target_if/mlme/vdev_mgr/src/target_if_vdev_mgr_rx_ops.c
+@@ -146,6 +146,7 @@
+ 				       &vdev_rsp->rsp_status)) {
+ 		rsp_pos = STOP_RESPONSE_BIT;
+ 		stop_rsp.vdev_id = vdev_id;
++		stop_rsp.status = QDF_STATUS_E_TIMEOUT;
+ 		recovery_reason = QDF_VDEV_STOP_RESPONSE_TIMED_OUT;
+ 
+ 		target_if_vdev_mgr_rsp_timer_stop(psoc, vdev_rsp, rsp_pos);
+@@ -217,6 +218,25 @@
+ 		return QDF_STATUS_E_INVAL;
+ 	}
+ 
++	if (qdf_atomic_test_bit(STOP_RESPONSE_BIT, &vdev_rsp->rsp_status) ||
++	    qdf_atomic_test_bit(START_RESPONSE_BIT, &vdev_rsp->rsp_status) ||
++	    qdf_atomic_test_bit(RESTART_RESPONSE_BIT, &vdev_rsp->rsp_status)) {
++		struct wlan_objmgr_vdev *vdev;
++
++		vdev = wlan_objmgr_get_vdev_by_id_from_psoc(psoc,
++				vdev_rsp->vdev_id, WLAN_VDEV_TARGET_IF_ID);
++		if (vdev) {
++			bool monitor = wlan_vdev_mlme_get_opmode(vdev) == QDF_MONITOR_MODE;
++
++			wlan_objmgr_vdev_release_ref(vdev, WLAN_VDEV_TARGET_IF_ID);
++			if (monitor) {
++				/* Same owner as normal timer expiry: clears the bit,
++				 * balances its psoc ref and reports failure to MLME. */
++				target_if_vdev_mgr_rsp_timer_cb(vdev_rsp);
++				return QDF_STATUS_SUCCESS;
++			}
++		}
++	}
+ 	if (vdev_rsp->rsp_status)
+ 		wlan_objmgr_psoc_release_ref(psoc, WLAN_PSOC_TARGET_IF_ID);
+ 
+--- a/qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/inc/wlan_vdev_mgr_tgt_if_rx_defs.h
++++ b/qca-wifi-host-cmn/umac/mlme/vdev_mgr/dispatcher/inc/wlan_vdev_mgr_tgt_if_rx_defs.h
+@@ -153,6 +153,8 @@
+  */
+ struct vdev_stop_response {
+ 	uint8_t vdev_id;
++	/* Host timeout/recovery completion is not a firmware STOP ack. */
++	QDF_STATUS status;
+ };
+ 
+ /**
+--- a/qcacld-3.0/components/mlme/core/src/wlan_mlme_vdev_mgr_interface.c
++++ b/qcacld-3.0/components/mlme/core/src/wlan_mlme_vdev_mgr_interface.c
+@@ -1557,7 +1557,7 @@
+ {
+ 	mlme_legacy_debug("vdev id = %d",
+ 			  vdev_mlme->vdev->vdev_objmgr.vdev_id);
+-	return wlan_vdev_mlme_sm_deliver_evt(
++	return wlan_vdev_mlme_sm_deliver_evt_sync(
+ 				vdev_mlme->vdev,
+ 				WLAN_VDEV_SM_EV_DISCONNECT_COMPLETE,
+ 				0, NULL);
+@@ -1700,6 +1700,10 @@
+ 
+ 	mlme_legacy_debug("vdev id = %d ",
+ 			  vdev_mlme->vdev->vdev_objmgr.vdev_id);
++	/* The legacy monitor failure path only notifies LIM and does not
++	 * advance the disconnect state machine. Consume a pending close here. */
++	if (wma_mon_delete_start_response(vdev_mlme, rsp))
++		return QDF_STATUS_SUCCESS;
+ 	status =  wma_vdev_start_resp_handler(vdev_mlme, rsp);
+ 
+ 	return status;
+@@ -1987,6 +1991,8 @@
+ 	.mlme_vdev_start_continue = mon_mlme_start_continue,
+ 	.mlme_vdev_up_send = mon_mlme_vdev_up_send,
+ 	.mlme_vdev_disconnect_peers = mon_mlme_vdev_disconnect_peers,
++	.mlme_vdev_notify_down_complete = wma_mon_down_complete,
++	.mlme_vdev_ext_stop_rsp = wma_mon_stop_response,
+ 	.mlme_vdev_stop_send = mon_mlme_vdev_stop_send,
+ 	.mlme_vdev_down_send = mon_mlme_vdev_down_send,
+ 	.mlme_vdev_ext_start_rsp = vdevmgr_vdev_start_rsp_handle,
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -6223,6 +6223,7 @@
+ 	uint8_t vdev_id;
+ 	struct wlan_objmgr_vdev *vdev;
+ 	long rc;
++	uint32_t delete_timeout = SME_CMD_VDEV_CREATE_DELETE_TIMEOUT;
+ 
+ 	vdev_id = adapter->vdev_id;
+ 	hdd_nofl_debug("destroying vdev %d", vdev_id);
+@@ -6281,10 +6282,13 @@
+ 		goto send_status;
+ 	}
+ 
++	/* Monitor now completes STOP (and a pending START, if any) before DELETE. */
++	if (adapter->device_mode == QDF_MONITOR_MODE)
++		delete_timeout += START_RESPONSE_TIMER + STOP_RESPONSE_TIMER;
+ 	/* block on a completion variable until sme session is closed */
+ 	rc = wait_for_completion_timeout(
+ 			&adapter->vdev_destroy_event,
+-			msecs_to_jiffies(SME_CMD_VDEV_CREATE_DELETE_TIMEOUT));
++			msecs_to_jiffies(delete_timeout));
+ 	if (!rc) {
+ 		hdd_err("vdev %d: timed out waiting for delete", vdev_id);
+ 		clear_bit(SME_SESSION_OPENED, &adapter->event_flags);
+@@ -8109,7 +8113,7 @@
+ 		status = hdd_monitor_mode_vdev_status(adapter);
+ 		if (QDF_IS_STATUS_ERROR(status))
+ 			hdd_err_rl("stop failed montior mode");
+-		sme_delete_mon_session(mac_handle, adapter->vdev_id);
++		/* SME removes the monitor session after asynchronous STOP/DOWN. */
+ 		hdd_vdev_destroy(adapter);
+ 		break;
+ 
+--- a/qcacld-3.0/core/sme/src/common/sme_api.c
++++ b/qcacld-3.0/core/sme/src/common/sme_api.c
+@@ -4911,6 +4911,15 @@
+ 	struct del_vdev_params *del_self_peer;
+ 	bool is_pasn_peer_delete_all_required;
+ 
++	/* Stop monitor while ordinary state-checked callback lookup still works.
++	 * HDD already quiesced monitor DP and waits for our existing delete event.
++	 * The retained legacy SME/WMA references own this asynchronous interval.
++	 */
++	if (wma_mon_stop_before_delete(vdev))
++		return QDF_STATUS_SUCCESS;
++	if (wlan_vdev_mlme_get_opmode(vdev) == QDF_MONITOR_MODE)
++		sme_delete_mon_session(mac_handle, vdev_id);
++
+ 	MTRACE(qdf_trace(QDF_MODULE_ID_SME,
+ 			 TRACE_CODE_SME_RX_HDD_CLOSE_SESSION, vdev_id, 0));
+ 
+@@ -4942,18 +4951,19 @@
+ 	 * resulting in the last reference of vdev object and sending the
+ 	 * vdev_delete to firmware.
+ 	 */
++	del_self_peer = qdf_mem_malloc(sizeof(*del_self_peer));
++	if (!del_self_peer)
++		return QDF_STATUS_E_NOMEM;
++
+ 	status = wlan_objmgr_vdev_obj_delete(vdev);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		sme_nofl_err("Failed to mark vdev as logical delete %d",
+ 			     status);
++		qdf_mem_free(del_self_peer);
+ 		return status;
+ 	}
+ 
+ 	cm_utf_detach(vdev);
+-
+-	del_self_peer = qdf_mem_malloc(sizeof(*del_self_peer));
+-	if (!del_self_peer)
+-		return QDF_STATUS_E_NOMEM;
+ 
+ 	self_peer_macaddr = wlan_vdev_mlme_get_mldaddr(vdev);
+ 	if (qdf_is_macaddr_zero((struct qdf_mac_addr *)self_peer_macaddr))
+--- a/qcacld-3.0/core/wma/inc/wma.h
++++ b/qcacld-3.0/core/wma/inc/wma.h
+@@ -747,7 +747,27 @@
+ 	struct wma_invalid_peer_params invalid_peers[INVALID_PEER_MAX_NUM];
+ 	uint8_t invalid_peer_idx;
+ 	uint16_t bss_max_idle_period;
++	/* SME keeps the object live until STOP/DOWN completes. */
++	unsigned int monitor_delete_state;
++	QDF_STATUS monitor_stop_status;
+ };
++
++enum wma_monitor_delete_state {
++	WMA_MON_DELETE_IDLE,
++	WMA_MON_DELETE_WAIT,
++	WMA_MON_DELETE_READY,
++	WMA_MON_DELETE_RESUMED,
++};
++
++bool wma_mon_stop_before_delete(struct wlan_objmgr_vdev *vdev);
++void wma_mon_resume_delete(struct wlan_objmgr_vdev *vdev);
++bool wma_mon_delete_start_response(struct vdev_mlme_obj *mlme,
++				   struct vdev_start_response *rsp);
++QDF_STATUS wma_mon_stop_response(struct vdev_mlme_obj *mlme,
++				 struct vdev_stop_response *rsp);
++QDF_STATUS wma_mon_down_complete(struct vdev_mlme_obj *mlme,
++				 uint16_t data_len, void *data);
++
+ 
+ /**
+  * struct mac_ss_bw_info - hw_mode_list PHY/MAC params for each MAC
+--- a/qcacld-3.0/core/wma/src/wma_dev_if.c
++++ b/qcacld-3.0/core/wma/src/wma_dev_if.c
+@@ -488,6 +488,11 @@
+ 	struct wma_txrx_node *iface;
+ 
+ 	iface = &wma->interfaces[vdev_id];
++	/* Pre-delete monitor completion already owns STOP/DOWN. Recovery must
++	 * not submit new commands for a firmware session being torn down. */
++	if (qdf_is_recovering() ||
++	    READ_ONCE(iface->monitor_delete_state) == WMA_MON_DELETE_RESUMED)
++		return;
+ 	wlan_vdev_mlme_sm_deliver_evt(iface->vdev,
+ 				      WLAN_VDEV_SM_EV_DOWN,
+ 				      0, NULL);
+--- a/qcacld-3.0/core/wma/src/wma_utils.c
++++ b/qcacld-3.0/core/wma/src/wma_utils.c
+@@ -25,6 +25,8 @@
+ /* Header files */
+ 
+ #include "wma.h"
++#include "sme_api.h"
++#include "marionette_sta_monitor.h"
+ #include "wma_api.h"
+ #include "cds_api.h"
+ #include "wmi_unified_api.h"
+@@ -4709,28 +4711,214 @@
+ 	return status;
+ }
+ 
++/* Called only with an existing object reference. The SME legacy reference
++ * stays owned by the original delete transaction until its normal response. */
++static struct wma_txrx_node *
++wma_mon_delete_iface(struct wlan_objmgr_vdev *vdev)
++{
++	tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
++	uint8_t id;
++
++	if (!wma || !vdev ||
++	    wlan_vdev_mlme_get_opmode(vdev) != QDF_MONITOR_MODE)
++		return NULL;
++	id = wlan_vdev_get_id(vdev);
++	if (id >= wma->max_bssid || wma->interfaces[id].vdev != vdev)
++		return NULL;
++	return &wma->interfaces[id];
++}
++
++/* Run after the outer SM delivery returned, never from its nested callbacks.
++ * In this pinned build START/STOP responses and timer expiry are serialized
++ * on the MC thread (SERIALIZE_VDEV_RESP). Do not add a wait on that thread. */
++void wma_mon_resume_delete(struct wlan_objmgr_vdev *vdev)
++{
++	struct wma_txrx_node *iface = wma_mon_delete_iface(vdev);
++	mac_handle_t mac;
++	QDF_STATUS status;
++	uint8_t id;
++
++	if (!iface || cmpxchg(&iface->monitor_delete_state,
++		WMA_MON_DELETE_READY, WMA_MON_DELETE_RESUMED) !=
++		WMA_MON_DELETE_READY)
++		return;
++
++	id = wlan_vdev_get_id(vdev);
++	status = READ_ONCE(iface->monitor_stop_status);
++	wma_info("MARIONETTE_MONITOR_STOP_COMPLETE vdev=%u status=%d recovery=%u",
++		 id, status, qdf_is_recovering());
++	if (QDF_IS_STATUS_ERROR(status) && !qdf_is_recovering())
++		cds_trigger_recovery(QDF_VDEV_STOP_RESPONSE_TIMED_OUT);
++
++	mac = cds_get_context(QDF_MODULE_ID_SME);
++	if (!mac) {
++		wma_err("Monitor delete continuation has no SME vdev=%u", id);
++		return;
++	}
++	/* RESUMED bypasses the gate; no recursion into STOP. */
++	status = sme_vdev_delete(mac, vdev);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		wma_err("Monitor delete continuation failed vdev=%u status=%d", id, status);
++		if (!qdf_is_recovering())
++			cds_trigger_recovery(QDF_REASON_UNSPECIFIED);
++	}
++}
++
++bool wma_mon_stop_before_delete(struct wlan_objmgr_vdev *vdev)
++{
++	struct wma_txrx_node *iface;
++	QDF_STATUS status;
++	unsigned int state;
++
++#ifndef SERIALIZE_VDEV_RESP
++	/* The continuation can acquire the SME mutex. This build requires MC
++	 * serialization; never run it directly from a softirq timeout. */
++	return false;
++#endif
++	if (!marionette_sta_monitor_enabled())
++		return false;
++	iface = wma_mon_delete_iface(vdev);
++	if (!iface)
++		return false;
++	state = READ_ONCE(iface->monitor_delete_state);
++	if (state == WMA_MON_DELETE_RESUMED)
++		return false;
++	if (state != WMA_MON_DELETE_IDLE)
++		return true;
++	if (qdf_is_recovering() ||
++	    wlan_vdev_mlme_get_state(vdev) == WLAN_VDEV_S_INIT)
++		return false;
++
++	if (cmpxchg(&iface->monitor_delete_state, WMA_MON_DELETE_IDLE,
++		    WMA_MON_DELETE_WAIT) != WMA_MON_DELETE_IDLE)
++		return true;
++	WRITE_ONCE(iface->monitor_stop_status, QDF_STATUS_SUCCESS);
++
++	/* A synchronous failure/INIT transition can finish deletion recursively.
++	 * Keep a temporary ref until this stack has completely unwound. */
++	wlan_objmgr_vdev_get_ref(vdev, WLAN_LEGACY_WMA_ID);
++	wma_info("MARIONETTE_MONITOR_STOP_BEFORE_DELETE vdev=%u", wlan_vdev_get_id(vdev));
++	status = wlan_vdev_mlme_sm_deliver_evt(vdev, WLAN_VDEV_SM_EV_DOWN,
++					      0, NULL);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		WRITE_ONCE(iface->monitor_stop_status, status);
++		cmpxchg(&iface->monitor_delete_state,
++			WMA_MON_DELETE_WAIT, WMA_MON_DELETE_READY);
++	}
++	wma_mon_resume_delete(vdev);
++	wlan_objmgr_vdev_release_ref(vdev, WLAN_LEGACY_WMA_ID);
++	return true;
++}
++
++QDF_STATUS wma_mon_down_complete(struct vdev_mlme_obj *mlme,
++				 uint16_t data_len, void *data)
++{
++	struct wma_txrx_node *iface = wma_mon_delete_iface(mlme->vdev);
++
++	if (iface)
++		cmpxchg(&iface->monitor_delete_state,
++			WMA_MON_DELETE_WAIT, WMA_MON_DELETE_READY);
++	/* Only mark completion here: the caller still owns the SM lock. */
++	return QDF_STATUS_SUCCESS;
++}
++
++bool wma_mon_delete_start_response(struct vdev_mlme_obj *mlme,
++				   struct vdev_start_response *rsp)
++{
++	struct wma_txrx_node *iface;
++	enum wlan_vdev_sm_evt event;
++	QDF_STATUS status;
++	bool restart;
++
++	if (!mlme || !mlme->vdev || !rsp ||
++	    wlan_vdev_get_id(mlme->vdev) != rsp->vdev_id)
++		return false;
++	iface = wma_mon_delete_iface(mlme->vdev);
++	if (!iface || READ_ONCE(iface->monitor_delete_state) != WMA_MON_DELETE_WAIT)
++		return false;
++
++	restart = rsp->resp_type == WMI_VDEV_RESTART_RESP_EVENT;
++	mlme_set_chan_switch_in_progress(mlme->vdev, false);
++	if (rsp->status) {
++		WRITE_ONCE(iface->monitor_stop_status, QDF_STATUS_E_FAILURE);
++		event = restart ? WLAN_VDEV_SM_EV_RESTART_REQ_FAIL :
++				  WLAN_VDEV_SM_EV_START_REQ_FAIL;
++	} else {
++		event = restart ? WLAN_VDEV_SM_EV_RESTART_RESP :
++				  WLAN_VDEV_SM_EV_START_RESP;
++	}
++	status = wlan_vdev_mlme_sm_deliver_evt(mlme->vdev, event,
++					      sizeof(*rsp), rsp);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		WRITE_ONCE(iface->monitor_stop_status, status);
++		cmpxchg(&iface->monitor_delete_state,
++			WMA_MON_DELETE_WAIT, WMA_MON_DELETE_READY);
++	}
++	wma_mon_resume_delete(mlme->vdev);
++	return true;
++}
++
++QDF_STATUS wma_mon_stop_response(struct vdev_mlme_obj *mlme,
++				 struct vdev_stop_response *rsp)
++{
++	struct wma_txrx_node *iface;
++	QDF_STATUS status;
++
++	if (!mlme || !rsp || !mlme->vdev ||
++	    wlan_vdev_get_id(mlme->vdev) != rsp->vdev_id)
++		return QDF_STATUS_E_INVAL;
++	iface = wma_mon_delete_iface(mlme->vdev);
++	if (!iface || READ_ONCE(iface->monitor_delete_state) != WMA_MON_DELETE_WAIT)
++		return QDF_STATUS_E_INVAL;
++
++	/* target-if already cleared STOP_RESPONSE_BIT and balanced its psoc ref.
++	 * A timeout/SSR flush carries failure, not a fabricated firmware ack. */
++	if (QDF_IS_STATUS_ERROR(rsp->status))
++		WRITE_ONCE(iface->monitor_stop_status, rsp->status);
++	status = wlan_vdev_mlme_sm_deliver_evt(mlme->vdev,
++				WLAN_VDEV_SM_EV_MLME_DOWN_REQ, 0, NULL);
++	if (QDF_IS_STATUS_ERROR(status)) {
++		WRITE_ONCE(iface->monitor_stop_status, status);
++		cmpxchg(&iface->monitor_delete_state,
++			WMA_MON_DELETE_WAIT, WMA_MON_DELETE_READY);
++	}
++	wma_mon_resume_delete(mlme->vdev);
++	return status;
++}
++
+ QDF_STATUS wma_mon_mlme_vdev_stop_send(struct vdev_mlme_obj *vdev_mlme,
+ 				       uint16_t data_len, void *data)
+ {
+ 	uint8_t vdev_id;
+ 	tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
++	struct wma_txrx_node *iface;
+ 	QDF_STATUS status;
+ 
+ 	if (!wma)
+ 		return QDF_STATUS_E_INVAL;
+-
+ 	vdev_id = wlan_vdev_get_id(vdev_mlme->vdev);
+-
+-	status = wma_send_vdev_stop_to_fw(wma, vdev_id);
+-
+-	if (QDF_IS_STATUS_ERROR(status))
+-		wma_err("Failed to send vdev stop cmd: vdev %d", vdev_id);
+-
+-	wlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,
+-				      WLAN_VDEV_SM_EV_MLME_DOWN_REQ,
+-				      0,
+-				      NULL);
+-
++	iface = wma_mon_delete_iface(vdev_mlme->vdev);
++	if (!iface)
++		return QDF_STATUS_E_INVAL;
++
++	if (READ_ONCE(iface->monitor_delete_state) == WMA_MON_DELETE_WAIT &&
++	    (qdf_is_recovering() ||
++	     QDF_IS_STATUS_ERROR(READ_ONCE(iface->monitor_stop_status))))
++		status = QDF_STATUS_E_CANCELED;
++	else
++		status = wma_send_vdev_stop_to_fw(wma, vdev_id);
++	if (READ_ONCE(iface->monitor_delete_state) == WMA_MON_DELETE_WAIT) {
++		if (QDF_IS_STATUS_SUCCESS(status))
++			return status; /* Only a real response/timeout may advance DOWN. */
++		WRITE_ONCE(iface->monitor_stop_status, status);
++		/* The send-failure path already disarmed the response timer. */
++		wlan_vdev_mlme_sm_deliver_evt_sync(vdev_mlme->vdev,
++				WLAN_VDEV_SM_EV_STOP_FAIL, 0, NULL);
++	} else {
++		/* Preserve the legacy monitor mode path outside the experiment. */
++		wlan_vdev_mlme_sm_deliver_evt_sync(vdev_mlme->vdev,
++				WLAN_VDEV_SM_EV_MLME_DOWN_REQ, 0, NULL);
++	}
+ 	return status;
+ }
+ 
+@@ -4739,23 +4927,28 @@
+ {
+ 	uint8_t vdev_id;
+ 	tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
++	struct wma_txrx_node *iface;
+ 	QDF_STATUS status;
+ 
+ 	if (!wma)
+ 		return QDF_STATUS_E_INVAL;
+-
+ 	vdev_id = wlan_vdev_get_id(vdev_mlme->vdev);
+-
+-	status = wma_send_vdev_down_to_fw(wma, vdev_id);
+-
+-	if (QDF_IS_STATUS_ERROR(status))
+-		wma_err("Failed to send vdev down cmd: vdev %d", vdev_id);
+-
+-	wlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,
+-				      WLAN_VDEV_SM_EV_DOWN_COMPLETE,
+-				      0,
+-				      NULL);
+-
++	iface = wma_mon_delete_iface(vdev_mlme->vdev);
++	if (!iface)
++		return QDF_STATUS_E_INVAL;
++	if (READ_ONCE(iface->monitor_delete_state) == WMA_MON_DELETE_WAIT &&
++	    (QDF_IS_STATUS_ERROR(READ_ONCE(iface->monitor_stop_status)) ||
++	     qdf_is_recovering())) {
++		status = QDF_STATUS_E_CANCELED;
++	} else {
++		status = wma_send_vdev_down_to_fw(wma, vdev_id);
++	}
++	if (QDF_IS_STATUS_ERROR(status) &&
++	    QDF_IS_STATUS_SUCCESS(READ_ONCE(iface->monitor_stop_status)))
++		WRITE_ONCE(iface->monitor_stop_status, status);
++	wlan_vdev_mlme_sm_deliver_evt_sync(vdev_mlme->vdev,
++		QDF_IS_STATUS_SUCCESS(status) ? WLAN_VDEV_SM_EV_DOWN_COMPLETE :
++					      WLAN_VDEV_SM_EV_DOWN_FAIL, 0, NULL);
+ 	return status;
+ }
+ 

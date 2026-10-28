@@ -1,0 +1,159 @@
+From: Marionette driver research
+Subject: [UNVALIDATED RUNTIME] serialize-monitor-timer-stop-rearm
+
+Applies after 0054 on WLAN 518147fd7e0199758efe9bd96a22c9c2ea30bcd9.
+Compile and host fault validation do not establish firmware/runtime safety.
+
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_1.0.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_mon_1.0.c
+@@ -534,16 +534,17 @@
+ 	}
+ 
+ budget_done:
+-	/* A synchronous stop can race with the callback already executing.
+-	 * Do not re-arm after the stop cleared RUNNING; otherwise a delayed
+-	 * monitor teardown leaves this callback touching freed monitor state. */
+-	if (!(mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_RUNNING))
+-		return;
+-	if (yield == DP_TIMER_WORK_EXHAUST ||
+-	    yield == DP_TIMER_TIME_EXHAUST)
+-		qdf_timer_mod(&mon_soc->mon_vdev_timer, 1);
+-	else
+-		qdf_timer_mod(&mon_soc->mon_vdev_timer, DP_INTR_POLL_TIMER_MS);
++	/* Stop clears RUNNING under this same lock before sync_cancel. A test
++	 * without the lock has a check/mod race and can rearm after cancellation. */
++	qdf_spin_lock_bh(&mon_soc->mon_vdev_timer_lock);
++	if (mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_RUNNING) {
++		if (yield == DP_TIMER_WORK_EXHAUST ||
++		    yield == DP_TIMER_TIME_EXHAUST)
++			qdf_timer_mod(&mon_soc->mon_vdev_timer, 1);
++		else
++			qdf_timer_mod(&mon_soc->mon_vdev_timer, DP_INTR_POLL_TIMER_MS);
++	}
++	qdf_spin_unlock_bh(&mon_soc->mon_vdev_timer_lock);
+ }
+ 
+ /* MCL specific functions */
+@@ -669,40 +670,72 @@
+ {
+ 	struct dp_mon_soc *mon_soc = soc->monitor_soc;
+ 
+-        qdf_timer_init(soc->osdev, &mon_soc->mon_vdev_timer,
+-                       dp_mon_vdev_timer, (void *)soc,
+-                       QDF_TIMER_TYPE_WAKE_APPS);
+-        mon_soc->mon_vdev_timer_state |= MON_VDEV_TIMER_INIT;
++	qdf_spinlock_create(&mon_soc->mon_vdev_timer_lock);
++	mon_soc->mon_vdev_timer_stoppers = 0;
++	qdf_timer_init(soc->osdev, &mon_soc->mon_vdev_timer,
++		       dp_mon_vdev_timer, (void *)soc, QDF_TIMER_TYPE_WAKE_APPS);
++	WRITE_ONCE(mon_soc->mon_vdev_timer_state, MON_VDEV_TIMER_INIT);
++}
++
++static void dp_mon_vdev_timer_start(struct dp_soc *soc)
++{
++	struct dp_mon_soc *mon_soc = soc->monitor_soc;
++
++	if (!(READ_ONCE(mon_soc->mon_vdev_timer_state) & MON_VDEV_TIMER_INIT))
++		return;
++	qdf_spin_lock_bh(&mon_soc->mon_vdev_timer_lock);
++	if ((mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_INIT) &&
++	    !mon_soc->mon_vdev_timer_stoppers) {
++		mon_soc->mon_vdev_timer_state |= MON_VDEV_TIMER_RUNNING;
++		qdf_timer_mod(&mon_soc->mon_vdev_timer, DP_INTR_POLL_TIMER_MS);
++	}
++	qdf_spin_unlock_bh(&mon_soc->mon_vdev_timer_lock);
++}
++
++static bool dp_mon_vdev_timer_stop(struct dp_soc *soc)
++{
++	struct dp_mon_soc *mon_soc = soc->monitor_soc;
++	bool was_running;
++
++	if (!(READ_ONCE(mon_soc->mon_vdev_timer_state) & MON_VDEV_TIMER_INIT))
++		return false;
++	qdf_spin_lock_bh(&mon_soc->mon_vdev_timer_lock);
++	if (!(mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_INIT)) {
++		qdf_spin_unlock_bh(&mon_soc->mon_vdev_timer_lock);
++		return false;
++	}
++	was_running = !!(mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_RUNNING);
++	mon_soc->mon_vdev_timer_state &= ~MON_VDEV_TIMER_RUNNING;
++	mon_soc->mon_vdev_timer_stoppers++;
++	qdf_spin_unlock_bh(&mon_soc->mon_vdev_timer_lock);
++
++	/* Even a second concurrent stop must join any executing callback. */
++	qdf_timer_sync_cancel(&mon_soc->mon_vdev_timer);
++
++	qdf_spin_lock_bh(&mon_soc->mon_vdev_timer_lock);
++	mon_soc->mon_vdev_timer_stoppers--;
++	qdf_spin_unlock_bh(&mon_soc->mon_vdev_timer_lock);
++	return was_running;
+ }
+ 
+ static void dp_mon_vdev_timer_deinit(struct dp_soc *soc)
+ {
+ 	struct dp_mon_soc *mon_soc = soc->monitor_soc;
+-        if (mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_INIT) {
+-                qdf_timer_free(&mon_soc->mon_vdev_timer);
+-                mon_soc->mon_vdev_timer_state = 0;
+-        }
+-}
+-
+-static void dp_mon_vdev_timer_start(struct dp_soc *soc)
+-{
+-	struct dp_mon_soc *mon_soc = soc->monitor_soc;
+-        if (mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_INIT) {
+-                qdf_timer_mod(&mon_soc->mon_vdev_timer, DP_INTR_POLL_TIMER_MS);
+-                mon_soc->mon_vdev_timer_state |= MON_VDEV_TIMER_RUNNING;
+-        }
+-}
+-
+-static bool dp_mon_vdev_timer_stop(struct dp_soc *soc)
+-{
+-	struct dp_mon_soc *mon_soc = soc->monitor_soc;
+-        if (mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_RUNNING) {
+-                qdf_timer_sync_cancel(&mon_soc->mon_vdev_timer);
+-                mon_soc->mon_vdev_timer_state &= ~MON_VDEV_TIMER_RUNNING;
+-		return true;
+-        }
+-
+-	return false;
++	bool initialized;
++
++	/* Object teardown is serialized by DP detach. Close admission before
++	 * cancellation so no start or callback can enqueue another timer. */
++	if (!(READ_ONCE(mon_soc->mon_vdev_timer_state) & MON_VDEV_TIMER_INIT))
++		return;
++	qdf_spin_lock_bh(&mon_soc->mon_vdev_timer_lock);
++	initialized = !!(mon_soc->mon_vdev_timer_state & MON_VDEV_TIMER_INIT);
++	mon_soc->mon_vdev_timer_state = 0;
++	qdf_spin_unlock_bh(&mon_soc->mon_vdev_timer_lock);
++	if (initialized) {
++		qdf_timer_sync_cancel(&mon_soc->mon_vdev_timer);
++		qdf_timer_free(&mon_soc->mon_vdev_timer);
++	}
++	qdf_spinlock_destroy(&mon_soc->mon_vdev_timer_lock);
+ }
+ 
+ static void dp_mon_neighbour_peer_add_ast(struct dp_pdev *pdev,
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_mon.h
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_mon.h
+@@ -867,6 +867,9 @@
+ 
+ 	qdf_timer_t mon_vdev_timer;
+ 	uint8_t mon_vdev_timer_state;
++	/* Serialize start/rearm with stop; never hold over sync_cancel. */
++	qdf_spinlock_t mon_vdev_timer_lock;
++	uint32_t mon_vdev_timer_stoppers;
+ 
+ 	struct dp_mon_ops *mon_ops;
+ 	bool monitor_mode_v2;
+@@ -1677,7 +1680,7 @@
+ 	if (qdf_unlikely(!soc || !soc->monitor_soc))
+ 		return false;
+ 
+-	return !!(soc->monitor_soc->mon_vdev_timer_state &
++	return !!(READ_ONCE(soc->monitor_soc->mon_vdev_timer_state) &
+ 		  MON_VDEV_TIMER_RUNNING);
+ }
+ 

@@ -204,7 +204,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 server.peer_certificates().unwrap(),
-                &[identity.cert_der.clone()]
+                std::slice::from_ref(&identity.cert_der)
             );
             assert_eq!(server.protocol_version(), Some(version.version));
         }

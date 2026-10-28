@@ -24,6 +24,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+type GoodbyeCallback = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
 #[derive(Parser)]
 #[command(name = "luftlift", about = "AirDrop receiver (port of opendrop)")]
 struct Cli {
@@ -196,6 +198,7 @@ fn say(sink: &Sink, line: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receive(
     interface: &str,
     output: PathBuf,
@@ -255,7 +258,7 @@ fn receive(
     // appears or changes, checking once per second — so the receiver
     // automatically reappears in the AirDrop picker after a card bounce
     // instead of advertising a dead/old address.
-    let goodbye: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(None));
+    let goodbye: GoodbyeCallback = Arc::new(Mutex::new(None));
     {
         let interface = interface.to_string();
         let base_name = default_base_name();
@@ -315,6 +318,7 @@ fn receive(
 /// receiver can list nearby devices without a second process fighting it for
 /// UDP 5353. The browse loop is torn down and re-created together with the
 /// announcement, because both are bound to the same interface address.
+#[allow(clippy::too_many_arguments)]
 fn mdns_announce_supervisor(
     interface: &str,
     flags: u32,
@@ -322,7 +326,7 @@ fn mdns_announce_supervisor(
     receiver_name: &str,
     browse: bool,
     introspect: Arc<IntrospectState>,
-    goodbye: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
+    goodbye: GoodbyeCallback,
     sink: Arc<Sink>,
 ) {
     let mdns_cfg = mdns::MdnsConfig {

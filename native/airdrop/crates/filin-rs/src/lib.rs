@@ -1,8 +1,11 @@
 pub mod announce_template;
 pub mod frame_tx;
 pub mod data_rx;
+pub mod pending_rx;
+pub mod pending_tx;
 pub mod mdns_cache;
 pub mod tx_status;
+pub mod roc;
 
 pub mod radiotap {
     #[derive(Debug, PartialEq, Eq)]
@@ -1938,10 +1941,15 @@ pub mod schedule {
                 // hold — a held non-peer frame would block the TAP forever.
                 return DataSendDecision::Drop;
             };
-            if !same_channel_as_peer(own_seq, &peer.sequence, sync, now_us) {
-                return DataSendDecision::Hold; // peer is on a different channel
+            let peer_clock = peer.sync.as_ref().unwrap_or(sync);
+            let own_slot = usize::from(sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
+            let peer_slot = usize::from(peer_clock.current_eaw(now_us) % CHANSEQ_LEN as u16);
+            if slot_channel(own_seq, own_slot) != current_channel
+                || slot_channel(&peer.sequence, peer_slot) != current_channel {
+                return DataSendDecision::Hold;
             }
-            if can_send_in(sync, now_us, UNICAST_GUARD_TU) != 0 {
+            if can_send_in(sync, now_us, UNICAST_GUARD_TU) != 0
+                || can_send_in(peer_clock, now_us, UNICAST_GUARD_TU) != 0 {
                 return DataSendDecision::Hold; // inside unicast guard interval
             }
             DataSendDecision::Send
@@ -3398,6 +3406,8 @@ pub mod peers {
         /// encoding). `owl awdl_chan` is a 2-byte union.
         pub sequence: [[u8; 2]; CHANSEQ_LEN],
         pub sync_offset_us: u64,
+        /// Clock from this peer's own Action, independent of cluster election.
+        pub sync: Option<crate::sync::SyncState>,
         pub name: String,
         pub country_code: [u8; 3],
         pub infra_addr: [u8; 6],
@@ -3417,6 +3427,7 @@ pub mod peers {
                 election: ElectionState::new(addr),
                 sequence: [[0, 0]; CHANSEQ_LEN],
                 sync_offset_us: 0,
+                sync: None,
                 name: String::new(),
                 country_code: [b'N', b'A', 0],
                 infra_addr: [0; 6],
@@ -4548,6 +4559,7 @@ pub mod state {
         pub anchor_channel: u16,
         /// Station-owned radio: the actual RF channel cannot follow AWDL hops.
         fixed_radio_channel: Option<u8>,
+        fixed_radio_sequence: Option<[[u8; 2]; CHANSEQ_LEN]>,
         /// Own channel sequence as `(chan_num, opclass)` pairs. owl fills this
         /// with the master channel via `awdl_chanseq_init_static`. When filin
         /// syncs to a master, it adopts the master's sequence so they hop in
@@ -4579,11 +4591,14 @@ pub mod state {
         /// Drives `/status master_age_ms` (FILIN_SYNC_QUALITY.md Part A) and
         /// is bumped on every real master switch.
         pub master_adopted_at_us: u64,
-        /// Most recent sync error (TU) measured against the elected master's
-        /// sync TLV, or `None` if no sync update has been processed yet. Read
+        /// Sync error (TU) sampled by the latest apply_action, or `None` if
+        /// that frame did not provide an accepted clock update. Read
         /// by the runtime to feed `/status aw_alignment_pct`
         /// (FILIN_SYNC_QUALITY.md Part A).
         pub last_sync_error_tu: Option<i64>,
+        /// Cluster whose elected parent has actually supplied our clock.
+        /// Election alone does not establish synchronization.
+        synchronized_master: Option<[u8; 6]>,
         /// Last-seen cluster top master (election.master_addr), used by
         /// [`note_election_transitions`] to detect true cluster churn vs
         /// re-parenting. FILIN_SYNC_QUALITY.md.
@@ -4622,6 +4637,7 @@ pub mod state {
                 dev_class: AWDL_DEVCLASS_MACOS,
                 election: ElectionState::new(self_addr),
                 fixed_radio_channel: None,
+                fixed_radio_sequence: None,
                 sync: SyncState::new(now_us),
                 peers: PeerTable::new(),
                 anchor_channel,
@@ -4635,6 +4651,7 @@ pub mod state {
                 master_anchor: 0,
                 master_adopted_at_us: now_us,
                 last_sync_error_tu: None,
+                synchronized_master: None,
                 last_seen_master_addr: self_addr,
                 last_seen_sync_addr: self_addr,
                 park_channel: None,
@@ -4643,7 +4660,7 @@ pub mod state {
 
         /// Apply a received action frame: register/update the originating peer,
         /// fold every TLV into that peer's state (election, chanseq, version,
-        /// …), mark MIF, gate sync to the elected master, then re-run election.
+        /// …), mark MIF, run election, then adopt that elected parent's clock.
         /// Mirrors owl `awdl_rx_action` (owl/src/rx.c:253-320) and
         /// `awdl_handle_*_tlv`.
         pub fn apply_action(
@@ -4653,6 +4670,7 @@ pub mod state {
             tlvs: &[awdl::Tlv<'_>],
             rx_time_us: u64,
         ) {
+            self.last_sync_error_tu = None;
             // Monitor mode reflects our own injected frames back to us. owl
             // drops frames sourced from self (rx.c); filin must too, or it
             // registers its own MAC as a peer and elects itself master,
@@ -4667,7 +4685,11 @@ pub mod state {
                     match tlv.kind {
                         4 => {
                             if let Ok(p) = awdl::parse_sync_parameters(tlv.value) {
-                                sync_update = Some((p.time_to_next_aw_tu, p.aw_counter));
+                                if p.time_to_next_aw_tu <= 64 {
+                                    let clock = peer.sync.get_or_insert_with(|| crate::sync::SyncState::new(rx_time_us));
+                                    clock.update_from_master(rx_time_us, p.time_to_next_aw_tu, p.aw_counter);
+                                    sync_update = Some((p.time_to_next_aw_tu, p.aw_counter));
+                                }
                             }
                         }
                         5 if !peer.supports_v2 => apply_election_v1(peer, tlv.value),
@@ -4682,15 +4704,22 @@ pub mod state {
                     peer.sent_mif = true;
                 }
             }
-            // owl only adopts sync from the elected sync master (rx.c:39).
+            // Complete validity/election before consulting this frame's clock.
+            // Otherwise the very MIF that elects a new parent is ignored and
+            // sparse captures can leave us on our startup clock for seconds.
+            self.peers.touch(src, rx_time_us);
+            self.run_election();
+            // Only adopt sync from the elected sync master (owl rx.c:39).
             if let Some((time_to_next_aw_tu, aw_counter)) = sync_update {
-                if self.election.is_sync_master(&src) {
+                let period = u64::from(self.sync.presence_mode) * u64::from(self.sync.aw_period_tu);
+                if self.election.is_sync_master(&src) && u64::from(time_to_next_aw_tu) <= period {
                     let error_tu =
                         self.sync
                             .sync_error_tu(rx_time_us, time_to_next_aw_tu, aw_counter);
                     self.last_sync_error_tu = Some(error_tu);
                     self.sync
                         .update_from_master(rx_time_us, time_to_next_aw_tu, aw_counter);
+                    self.synchronized_master = Some(self.election.master_addr);
                     tracing::trace!(
                         error_tu,
                         aw_counter,
@@ -4699,15 +4728,26 @@ pub mod state {
                     );
                 }
             }
-            // recompute validity (owl awdl_peer_add after TLVs, rx.c:317) and
-            // run election (owl awdl_clean_peers, core.c:333).
-            self.peers.touch(src, rx_time_us);
-            self.election.run(&self.peers.election_views());
             // Adopt the elected master's channel sequence so filin hops to the
             // same channels as the peer. When filin is self-master, keep the
             // default static anchor sequence. Hysteresis (Bug B) and the
             // active-transfer pin (Bug C) gate re-adoption.
             self.sync_channel_sequence(rx_time_us);
+        }
+
+        fn run_election(&mut self) {
+            let previous = self.election.master_addr;
+            self.election.run(&self.peers.election_views());
+            if self.election.master_addr != previous {
+                self.synchronized_master = None;
+            }
+        }
+
+        /// An external election winner plus an accepted clock for its cluster.
+        /// This is not a measurement of current drift or wireless reachability.
+        pub fn has_master_sync(&self) -> bool {
+            self.election.sync_addr != self.self_addr
+                && self.synchronized_master == Some(self.election.master_addr)
         }
 
         /// If we have an elected master with a non-trivial channel sequence,
@@ -4730,9 +4770,16 @@ pub mod state {
             self.current_channel = channel;
         }
 
+        pub fn constrain_roc_schedule(&mut self, roc_channel: u8, home_channel: u8) {
+            self.constrain_radio_channel(roc_channel);
+            let sequence = crate::roc::sequence(roc_channel, home_channel);
+            self.fixed_radio_sequence = Some(sequence);
+            self.channel_sequence = sequence;
+        }
+
         fn sync_channel_sequence(&mut self, now_us: u64) {
             if let Some(channel) = self.fixed_radio_channel {
-                self.channel_sequence = [[channel, chan_opclass(u16::from(channel))]; CHANSEQ_LEN];
+                self.channel_sequence = self.fixed_radio_sequence.unwrap_or([[channel, chan_opclass(u16::from(channel))]; CHANSEQ_LEN]);
                 self.current_channel = channel;
                 self.master_anchor = self.peers.get(&self.election.sync_addr)
                     .map(|peer| crate::schedule::master_anchor_channel(&peer.sequence))
@@ -4962,13 +5009,21 @@ pub mod state {
         /// owl `awdl_clean_peers` (owl/daemon/core.c:320-336): drop stale peers
         /// then re-run election. Returns the removed peer addresses.
         pub fn clean_peers(&mut self, now_us: u64) -> Vec<[u8; 6]> {
-            // Station capture has deliberate multi-second receive gaps.
-            // Keep a peer for two 4-second capture cycles plus jitter; still
-            // evict vanished peers, and retain the dedicated-radio default.
-            let timeout = if self.fixed_radio_channel.is_some() { 10_000_000 } else { peers::PEER_TIMEOUT_US };
+            // In fixed-channel station mode Apple emits AWDL Action/MIF
+            // bursts opportunistically. A real Mac capture had a 48-second
+            // gap between two complete MIFs; the old 10-second timeout evicted
+            // the peer between its UDP packets and dropped valid data. Keep a
+            // bounded 60-second lease in this mode. Hopping mode retains the
+            // upstream short timeout because its cadence is denser.
+            const FIXED_PEER_TIMEOUT_US: u64 = 60_000_000;
+            let timeout = if self.fixed_radio_channel.is_some() {
+                FIXED_PEER_TIMEOUT_US
+            } else {
+                peers::PEER_TIMEOUT_US
+            };
             let cutoff = now_us.saturating_sub(timeout);
             let removed = self.peers.remove_stale(cutoff);
-            self.election.run(&self.peers.election_views());
+            self.run_election();
             self.sync_channel_sequence(now_us);
             removed
         }
@@ -5228,7 +5283,8 @@ pub mod state {
             let tlvs = awdl::parse_tlvs(action.tlvs).unwrap();
             let wire_seq = awdl::parse_channel_sequence(tlvs.iter().find(|t| t.kind == 18).unwrap().value).unwrap();
             assert!(wire_seq.channels.iter().all(|ch| *ch == 52));
-            assert_eq!(state.clean_peers(11_000_001), vec![master]);
+            assert!(state.clean_peers(11_000_001).is_empty());
+            assert_eq!(state.clean_peers(61_000_001), vec![master]);
         }
 
         #[test]
@@ -5254,6 +5310,68 @@ pub mod state {
                 state.channel_sequence.iter().all(|s| s[0] == 44),
                 "force-master seq must stay on the single -c anchor (44)"
             );
+        }
+
+        #[test]
+        fn first_electing_mif_supplies_clock_without_waiting_for_another_frame() {
+            let mut state = AwdlState::new([2, 0, 0, 0, 0, 1], "filin".into(), 52, 0);
+            state.constrain_radio_channel(52);
+            let master = [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let mut timing = [0; 31];
+            // From finder-20261027: first Mac MIF, AW 58434 / next 26 TU.
+            timing[1..3].copy_from_slice(&26u16.to_le_bytes());
+            timing[29..31].copy_from_slice(&58434u16.to_le_bytes());
+            state.apply_action(master, mif(), &[
+                awdl::Tlv { kind: 4, value: &timing },
+                election_v2_tlv(50, 200), version_tlv(0x34, 1),
+            ], 1_000_000);
+            assert_eq!(state.election.sync_addr, master);
+            assert!(state.has_master_sync());
+            assert_eq!(state.sync.current_aw(1_000_000), 58434);
+            assert_eq!(state.sync.next_aw_tu(1_000_000), 26);
+            assert!(state.last_sync_error_tu.is_some());
+            // An unrelated frame cannot duplicate this alignment sample.
+            let clock = state.sync;
+            state.apply_action([2, 0, 0, 0, 0, 9], mif(), &[
+                awdl::Tlv { kind: 4, value: &timing },
+            ], 1_001_000);
+            assert_eq!(state.sync, clock);
+            assert!(state.last_sync_error_tu.is_none());
+        }
+
+        #[test]
+        fn new_cluster_requires_its_own_valid_clock_and_rejects_bad_countdown() {
+            let mut state = AwdlState::new([2, 0, 0, 0, 0, 1], "filin".into(), 52, 0);
+            let first = [2, 0, 0, 0, 0, 2];
+            let second = [2, 0, 0, 0, 0, 3];
+            let mut timing = [0; 31];
+            timing[1..3].copy_from_slice(&20u16.to_le_bytes());
+            timing[29..31].copy_from_slice(&18u16.to_le_bytes());
+            state.apply_action(first, mif(), &[
+                election_v2_tlv_for(first, 50, 200), version_tlv(0x34, 1),
+                awdl::Tlv { kind: 4, value: &timing },
+            ], 1_000_000);
+            assert!(state.has_master_sync());
+            let clock = state.sync;
+            state.apply_action(second, mif(), &[
+                election_v2_tlv_for(second, 60, 200), version_tlv(0x34, 1),
+            ], 1_001_000);
+            assert_eq!(state.election.sync_addr, second);
+            assert!(!state.has_master_sync());
+            timing[1..3].copy_from_slice(&65u16.to_le_bytes());
+            state.apply_action(second, mif(), &[
+                awdl::Tlv { kind: 4, value: &timing },
+            ], 1_002_000);
+            assert_eq!(state.sync, clock);
+            assert!(!state.has_master_sync());
+            assert!(state.last_sync_error_tu.is_none());
+            timing[1..3].copy_from_slice(&20u16.to_le_bytes());
+            state.apply_action(second, mif(), &[
+                awdl::Tlv { kind: 4, value: &timing },
+            ], 1_003_000);
+            assert!(state.has_master_sync());
+            state.clean_peers(4_000_000);
+            assert!(!state.has_master_sync());
         }
 
         #[test]
@@ -5341,6 +5459,24 @@ pub mod state {
             state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
             assert!(state.peers.get(&peer_addr).is_none());
             assert_eq!(state.election.sync_addr, state.election.self_addr);
+        }
+
+        #[test]
+        fn fixed_channel_keeps_sparse_apple_peer_for_sixty_seconds() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 52, 0);
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.constrain_radio_channel(52);
+            state.apply_action(
+                peer_addr,
+                mif(),
+                &[election_v2_tlv(50, 200), version_tlv(0x34, 1)],
+                1_000,
+            );
+            assert!(state.clean_peers(48_000_000).is_empty());
+            assert!(state.peers.get(&peer_addr).is_some());
+            let removed = state.clean_peers(60_001_002);
+            assert_eq!(removed, vec![peer_addr]);
+            assert!(state.peers.get(&peer_addr).is_none());
         }
 
         #[test]
@@ -5854,6 +5990,8 @@ pub mod state {
 }
 
 pub mod runtime {
+    use crate::pending_tx::{Frame as PendingFrame, PendingTx};
+    use crate::schedule::DataSendDecision as TxOutcome;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -6326,6 +6464,111 @@ pub mod runtime {
         }
     }
 
+    /// Opt-in bounded ROC experiment; radio.sh owns the monitor lifetime,
+    /// this guard alone owns its capture filter during the runtime.
+    ///
+    /// The availability pattern is slot-aware: ROC-channel slots are served by a
+    /// bounded off-channel reservation, while the slot that uses the STA home
+    /// channel is kept on the home channel so the phone meets infrastructure
+    /// peers (which put their own channel, e.g. 52, in slot 0) during that
+    /// discovery EAW. `tick` returns the channel the radio should be treated as
+    /// being on for TX gating (home, ROC social, or 0 for the null slot).
+    struct RocCapture {
+        hold: File,
+        roc_channel: u8,
+        home_channel: u8,
+        frequency: u32,
+        home_frequency: u32,
+        sequence: [[u8; 2]; 16],
+        held: bool,
+        next_request_us: u64,
+    }
+
+    impl RocCapture {
+        fn open(tx: &Injector, home_channel: u8) -> Result<Option<Self>, Error> {
+            let Ok(value) = std::env::var("FILIN_ROC_CHANNEL") else { return Ok(None); };
+            let roc_channel: u8 = value.parse().map_err(|_| Error::Channel)?;
+            if !matches!(roc_channel, 6 | 44 | 149) { return Err(Error::Channel); }
+            let Injector::MgmtTx(tx) = tx else { return Err(Error::MgmtTx); };
+            let hold = std::fs::OpenOptions::new().write(true)
+                .open("/sys/module/kiwi_v2/parameters/marionette_awdl_capture_hold")
+                .map_err(|_| Error::Io)?;
+            tx.enable_roc();
+            let frequency = u32::from(channel::channel_to_frequency_mhz(u16::from(roc_channel)).ok_or(Error::Channel)?);
+            // Only follow a home channel we can actually radiate on; otherwise
+            // fall back to the pure ROC 3-of-4 duty.
+            let home_channel = if home_channel != 0
+                && channel::channel_to_frequency_mhz(u16::from(home_channel)).is_some()
+            {
+                home_channel
+            } else {
+                roc_channel
+            };
+            let home_frequency = u32::from(channel::channel_to_frequency_mhz(u16::from(home_channel)).unwrap_or(0));
+            let sequence = crate::roc::sequence(roc_channel, home_channel);
+            Ok(Some(Self { hold, roc_channel, home_channel, frequency, home_frequency, sequence,
+                held: false, next_request_us: 0 }))
+        }
+
+        fn set_hold(&mut self, held: bool) -> Result<(), Error> {
+            if self.held != held {
+                use std::io::{Seek, SeekFrom};
+                self.hold.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
+                self.hold.write_all(if held { b"1\n" } else { b"0\n" }).map_err(|_| Error::Io)?;
+                self.held = held;
+                tracing::debug!(held, roc_channel = self.roc_channel, home_channel = self.home_channel, "ROC capture transition");
+            }
+            Ok(())
+        }
+
+        fn tick(&mut self, injector: &Injector, sync: &crate::sync::SyncState, now_us: u64) -> Result<u8, Error> {
+            let Injector::MgmtTx(tx) = injector else { return Err(Error::MgmtTx); };
+            let slot = usize::from(sync.current_eaw(now_us) % 16);
+            let slot_channel = self.sequence[slot][0];
+            // Drop the ROC dwell as soon as the current slot is no longer the
+            // ROC social channel (home slot, null slot, or reservation expiry).
+            if tx.roc_finished() || (tx.roc_pending() && slot_channel != self.roc_channel) {
+                self.set_hold(false)?;
+                tx.cancel_roc();
+                tx.set_home_freq(None);
+                // Give STA a real home-channel interval before another dwell.
+                self.next_request_us = now_us.saturating_add(20_000);
+            }
+            if slot_channel == 0 {
+                tx.set_home_freq(None);
+                return Ok(0);
+            }
+            if slot_channel == self.home_channel {
+                // STA-owned home channel: keep capture on and permit TX there.
+                tx.set_home_freq(Some(self.home_frequency));
+                self.set_hold(true)?;
+                return Ok(self.home_channel);
+            }
+            // ROC social-channel slot.
+            tx.set_home_freq(None);
+            let remaining_us = crate::roc::remaining_slot_us(&self.sequence, sync, self.roc_channel, now_us);
+            if !tx.roc_pending() && now_us >= self.next_request_us && remaining_us > 40_000 {
+                self.set_hold(false)?;
+                if let Err(err) = tx.start_roc(self.frequency, (remaining_us / 1000).min(200) as u32) {
+                    tracing::warn!(?err, "ROC request failed");
+                    self.next_request_us = now_us.saturating_add(500_000);
+                }
+                return Ok(0);
+            }
+            let active = remaining_us > 10_000 && tx.roc_pending() && tx.roc_frequency() == Some(self.frequency);
+            self.set_hold(active)?;
+            Ok(if active { self.roc_channel } else { 0 })
+        }
+    }
+
+    impl Drop for RocCapture {
+        fn drop(&mut self) {
+            let _ = self.set_hold(false);
+            // Pending driver dwell expires within its requested 200ms.
+            // Links drops its socket on runtime exit; shell owns vdev cleanup.
+        }
+    }
+
     pub fn run(
         mut links: Links,
         introspect: std::sync::Arc<crate::introspect::Introspection>,
@@ -6357,12 +6600,16 @@ pub mod runtime {
             awdl_state.election.force_self_master(metric);
             println!("force-master enabled: advertising election metric {metric}");
         }
+        let home_channel = links.anchor_channel as u8;
+        let mut roc_capture = RocCapture::open(&links.tx, home_channel)?;
+        let roc_channel = roc_capture.as_ref().map(|r| match r.frequency { 2437 => 6, 5220 => 44, _ => 149 });
+        if let Some(ch) = roc_channel { awdl_state.constrain_roc_schedule(ch, home_channel); }
         let mut announce = AnnounceScheduler::new(host_time_us());
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
-        // owl keeps at most one pending unicast frame (`state->next`,
-        // owl/daemon/core.c:42) and retries it when the AW/guard allows.
-        let mut pending_tx: Option<PendingFrame> = None;
+        // A peer may never visit the station-owned channel. Keep bounded,
+        // independent backlogs so it cannot stop TAP discovery/other peers.
+        let mut pending_tx = PendingTx::default();
         // Multicast/broadcast frames (mDNS announce, NDP, broadcast) are
         // spread across every distinct channel of the master hop cycle so a
         // peer listening on any of those channels hears them. owl emits these
@@ -6386,6 +6633,7 @@ pub mod runtime {
         // installs a static neighbor entry so unicast awdl0 connections work
         // (without this, AirDrop's /Discover fails with "No route to host").
         let mut neighbor_table = crate::state::NeighborTable::new();
+        let mut pending_rx = crate::pending_rx::PendingRx::default();
         let host_iface = links.host_iface.clone();
 
         // --- localhost introspection HTTP server (FILIN_HTTP_INTROSPECT.md).
@@ -6523,6 +6771,14 @@ pub mod runtime {
                 }
             }
 
+            if let Some(capture) = roc_capture.as_mut() {
+                // tick returns the channel the radio is treated as being on for
+                // this EAW slot: the ROC social channel, the STA home channel,
+                // or 0 for the null slot. TX gating keys off this value.
+                let channel = capture.tick(&links.tx, &awdl_state.sync, host_time_us())?;
+                awdl_state.current_channel = channel;
+            }
+
             // --- peer table cleanup (owl awdl_clean_peers, core.c:320) ---
             if announce.clean_due(now_us) {
                 let removed = awdl_state.clean_peers(now_us);
@@ -6572,6 +6828,18 @@ pub mod runtime {
                 );
             }
 
+            // DATA can precede the Action establishing its source by a few
+            // milliseconds. Only an Action-confirmed peer releases the queue.
+            for pending in pending_rx.ready(now_us, |source| {
+                awdl_state.peers.get(source).is_some_and(|peer| peer.is_valid)
+            }) {
+                tracing::debug!(source = ?pending.delivery.source,
+                    delay_us = now_us.saturating_sub(pending.received_us),
+                    "released unicast after peer Action");
+                deliver_rx(&mut links, &mut awdl_state, &introspect,
+                    pending.delivery, pending.channel, now_us)?;
+            }
+
             // --- Part A: re-broadcast the cached mDNS announce on every
             //     social-channel visit (rate-limited ~1s/channel). Decouples
             //     discovery from luftlift's 10s cadence. Suppressed while a
@@ -6589,6 +6857,7 @@ pub mod runtime {
 
             // --- action frame TX: PSF/MIF (owl awdl_send_psf/mif) ---
             for subtype in announce.due(now_us, &awdl_state) {
+                if roc_capture.is_some() && awdl_state.current_channel == 0 { continue; }
                 let seq = awdl_state.next_data_seq();
                 let frame = build_announce_frame(subtype, &awdl_state, seq << 4, now_us);
                 match links.tx.send(&frame) {
@@ -6600,16 +6869,23 @@ pub mod runtime {
                 }
             }
 
-            // --- data TX: retry pending frame if AW allows ---
-            if let Some(frame) = pending_tx.take() {
-                match try_send_data(&links, &awdl_state, now_us, &frame, tx_retransmits) {
-                    TxOutcome::Sent => last_injected_seq = frame.seq,
-                    // still can't send — keep it pending
-                    TxOutcome::Hold => pending_tx = Some(frame),
-                    // non-peer unicast — discard so the TAP isn't blocked
-                    TxOutcome::Drop => {}
+            // Every destination gets a chance; a held peer only blocks its
+            // own FIFO. Refresh time after potentially blocking action TX.
+            let drain_started_us = host_time_us();
+            pending_tx.drain(drain_started_us, |frame| {
+                let tx_now_us = host_time_us();
+                // A slow Netlink request must not be multiplied across the
+                // whole backlog before RX gets another turn. The request's
+                // own timeout still applies to the one in progress.
+                if tx_now_us.saturating_sub(drain_started_us) >= 2_000 {
+                    return TxOutcome::Hold;
                 }
-            }
+                let outcome = try_send_data(&links, &awdl_state, tx_now_us, frame, tx_retransmits);
+                if outcome == TxOutcome::Send {
+                    last_injected_seq = frame.seq;
+                }
+                outcome
+            });
 
             let mut fds = [
                 libc::pollfd {
@@ -6623,11 +6899,8 @@ pub mod runtime {
                     revents: 0,
                 },
             ];
-            // Only poll the tap if we don't already have a pending frame.
-            if pending_tx.is_some() {
-                fds[1].events = 0;
-            }
             let poll_timeout_ms = announce.poll_timeout_ms(host_time_us());
+            let poll_timeout_ms = if roc_capture.is_some() { poll_timeout_ms.min(5) } else { poll_timeout_ms };
             // SAFETY: fds points to two valid pollfd entries for the duration of the call.
             let rc =
                 unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout_ms) };
@@ -6727,49 +7000,16 @@ pub mod runtime {
                                 } // end rssi_ok
                             }
                             Err(err) => match crate::data_rx::decode(&wlan_buf[..len], links.self_addr) {
-                                Ok(crate::data_rx::Delivery { source, frames, unicast }) => {
+                                Ok(delivery) => {
+                                    let source = delivery.source;
+                                    let channel = awdl_state.current_channel;
                                     if awdl_state.peers.get(&source).is_none() {
-                                        tracing::trace!(
-                                            ?source,
-                                            "drop data frame from non-peer"
-                                        );
+                                        let queued = pending_rx.push(delivery, channel, now_us);
+                                        tracing::trace!(?source, queued,
+                                            "unicast waiting for peer Action");
                                     } else {
-                                        for frame in &frames {
-                                            // Count mDNS (UDP/5353) frames
-                                            // delivered to awdl0 by source —
-                                            // mdns_rx_other is the direct
-                                            // "are we hearing the iPhone?"
-                                            // signal.
-                                            if let Some(is_self) =
-                                                classify_mdns(&frame.bytes, links.self_addr)
-                                            {
-                                                if is_self {
-                                                    introspect.counters.inc_mdns_rx_self();
-                                                } else {
-                                                    introspect.counters.inc_mdns_rx_other();
-                                                }
-                                            }
-                                            links
-                                                .tap
-                                                .write_all(&frame.bytes)
-                                                .map_err(|_| Error::Io)?;
-                                        }
-                                        // Bug C: arm the sticky transfer pin so
-                                        // filin holds this peer's channel and
-                                        // suppresses hopping/re-adoption for
-                                        // the duration of the bulk upload.
-                                        if unicast {
-                                            awdl_state.note_unicast_rx(
-                                                source,
-                                                awdl_state.current_channel,
-                                                now_us,
-                                            );
-                                        }
-                                        tracing::trace!(
-                                            count = frames.len(),
-                                            channel = awdl_state.current_channel,
-                                            "wrote ethernet frame(s) to tap"
-                                        );
+                                        deliver_rx(&mut links, &mut awdl_state, &introspect,
+                                            delivery, channel, now_us)?;
                                     }
                                 }
                                 Err(data_err) => {
@@ -6902,24 +7142,8 @@ pub mod runtime {
                                     );
                                 }
                             } else {
-                                match try_send_data(
-                                    &links,
-                                    &awdl_state,
-                                    host_time_us(),
-                                    &frame,
-                                    tx_retransmits,
-                                ) {
-                                    TxOutcome::Sent => last_injected_seq = seq,
-                                    TxOutcome::Hold => {
-                                        pending_tx = Some(frame);
-                                        tracing::trace!(
-                                            pending = true,
-                                            "buffered data frame for later AW-gated TX"
-                                        );
-                                    }
-                                    // non-peer unicast — discard, don't block the TAP
-                                    TxOutcome::Drop => {}
-                                }
+                                let queued = pending_tx.push(frame, host_time_us());
+                                tracing::trace!(queued, ?dst, seq, "unicast TX queue admission");
                             }
                         }
                         Err(err) => tracing::trace!(?err, len, "ignored host tap frame"),
@@ -6939,26 +7163,27 @@ pub mod runtime {
         }
     }
 
-    /// A frame waiting to be injected when the availability window allows.
-    /// owl keeps one pending unicast frame in `state->next` (owl/daemon/core.c:42).
-    struct PendingFrame {
-        radiotap_frame: Vec<u8>,
-        dst: [u8; 6],
-        /// AWDL sequence control used for this frame, tracked so the
-        /// introspection `/status master_seq` reflects the most recent
-        /// injection even after a buffered retry.
-        seq: u16,
-    }
-
-    /// Outcome of an attempt to inject a pending data frame.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TxOutcome {
-        /// Injected (or the send failed transiently) — clear the pending slot.
-        Sent,
-        /// Not sendable yet — keep the frame pending and retry next AW.
-        Hold,
-        /// Never sendable (non-peer unicast) — discard the frame.
-        Drop,
+    fn deliver_rx(
+        links: &mut Links,
+        state: &mut crate::state::AwdlState,
+        introspect: &crate::introspect::Introspection,
+        delivery: crate::data_rx::Delivery,
+        channel: u8,
+        now_us: u64,
+    ) -> Result<(), Error> {
+        for frame in &delivery.frames {
+            if let Some(is_self) = classify_mdns(&frame.bytes, links.self_addr) {
+                if is_self { introspect.counters.inc_mdns_rx_self(); }
+                else { introspect.counters.inc_mdns_rx_other(); }
+            }
+            links.tap.write_all(&frame.bytes).map_err(|_| Error::Io)?;
+        }
+        if delivery.unicast {
+            state.note_unicast_rx(delivery.source, channel, now_us);
+        }
+        tracing::trace!(count = delivery.frames.len(), channel,
+            "wrote ethernet frame(s) to tap");
+        Ok(())
     }
 
     /// owl `awdl_can_send_unicast_in` decision (owl/src/schedule.c:57-79):
@@ -7012,7 +7237,7 @@ pub mod runtime {
                         let _ = links.tx.send(&retry);
                     }
                 }
-                TxOutcome::Sent
+                TxOutcome::Send
             }
             Err(err) => {
                 // Transient send error — retry on the next AW rather than
@@ -7286,7 +7511,7 @@ pub mod runtime {
             time_to_next_aw_tu: awdl_state.sync.next_aw_tu(now_us),
             master_counter: awdl_state.election.master_counter,
         };
-        let mut frame = crate::announce_template::build(subtype, &identity, &timing)
+        let mut frame = crate::announce_template::build_link_announcement(subtype, &identity, &timing)
             .expect("embedded AWDL announce template must parse");
         crate::announce_template::apply_runtime_state(&mut frame, awdl_state)
             .expect("embedded AWDL scheduling TLVs must parse");
@@ -7431,7 +7656,7 @@ pub mod runtime {
             current_channel: state.current_channel,
             master_mac: crate::introspect::mac_string(state.election.master_addr),
             master_seq: last_injected_seq,
-            synced: state.election.sync_addr != state.self_addr,
+            synced: state.has_master_sync(),
             peer_count: state.peers.len(),
             master_anchor: state.master_anchor,
             tsf_offset_us,
@@ -7839,7 +8064,7 @@ pub mod runtime {
         }
 
         #[test]
-        fn status_snapshot_marks_synced_when_external_master_adopted() {
+        fn status_snapshot_does_not_confuse_election_with_received_clock() {
             let mut state = crate::state::AwdlState::new(
                 [0x02, 0, 0, 0, 0, 1],
                 "filin".into(),
@@ -7853,7 +8078,7 @@ pub mod runtime {
             let snapshot = build_status_snapshot(&state, 0, 0, 1_000_000);
 
             assert_eq!(snapshot.master_mac, "02:aa:bb:cc:dd:ee");
-            assert!(snapshot.synced);
+            assert!(!snapshot.synced);
         }
 
         #[test]
@@ -8801,6 +9026,11 @@ pub mod os {
             family: u16,
             ifindex: u32,
             frequency_mhz: u32,
+            roc: std::cell::RefCell<crate::roc::Reservation>,
+            roc_enabled: std::cell::Cell<bool>,
+            // When set, the radio is on the STA home channel (not an ROC dwell),
+            // so a bare frame may be submitted on it without OFFCHANNEL_TX_OK.
+            home_freq: std::cell::Cell<Option<u32>>,
             accepted: std::cell::Cell<u64>,
             rejected: std::cell::Cell<u64>,
         }
@@ -8835,9 +9065,60 @@ pub mod os {
                     family,
                     ifindex,
                     frequency_mhz,
+                    roc: std::cell::RefCell::new(crate::roc::Reservation::default()),
+                    roc_enabled: std::cell::Cell::new(false),
+                    home_freq: std::cell::Cell::new(None),
                     accepted: std::cell::Cell::new(0),
                     rejected: std::cell::Cell::new(0),
                 })
+            }
+
+            pub fn enable_roc(&self) { self.roc_enabled.set(true); }
+
+            /// Tell the injector the radio is on the STA home channel for this
+            /// slot, so [`Self::send`] may submit on it without an ROC dwell.
+            pub fn set_home_freq(&self, freq: Option<u32>) { self.home_freq.set(freq); }
+
+            pub fn roc_frequency(&self) -> Option<u32> {
+                let _ = self.tx_stats();
+                self.roc.borrow().active_frequency(self.clock.elapsed().as_micros() as u64)
+            }
+
+            pub fn roc_finished(&self) -> bool {
+                self.roc.borrow().finished(self.clock.elapsed().as_micros() as u64)
+            }
+
+            pub fn roc_pending(&self) -> bool { self.roc.borrow().pending() }
+
+            pub fn start_roc(&self, frequency: u32, duration_ms: u32) -> Result<(), Error> {
+                // Drain queued old events before a new request. Only one ROC
+                // may be outstanding; drivers may reuse the same cookie.
+                let _ = self.tx_stats();
+                let seq = self.socket.seq.get();
+                if !self.roc.borrow_mut().start(seq, self.ifindex, frequency, duration_ms,
+                    self.clock.elapsed().as_micros() as u64) { return Err(Error::Invalid); }
+                let mut payload = vec![55, 1, 0, 0];
+                push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, self.ifindex);
+                push_attr_u32(&mut payload, NL80211_ATTR_WIPHY_FREQ, frequency);
+                push_attr_u32(&mut payload, 87, duration_ms); // DURATION
+                if let Err(error) = self.request_frame(&payload) {
+                    // No TX until READY even if a timed-out request was accepted.
+                    self.cancel_roc();
+                    return Err(error);
+                }
+                Ok(())
+            }
+
+            pub fn cancel_roc(&self) {
+                let cookie = self.roc.borrow().cookie();
+                // Close the TX gate before asking the driver to cancel.
+                self.roc.borrow_mut().clear();
+                if let Some(cookie) = cookie {
+                    let mut payload = vec![56, 1, 0, 0];
+                    push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, self.ifindex);
+                    push_attr_bytes(&mut payload, 88, &cookie.to_ne_bytes(), false);
+                    let _ = self.request_frame(&payload);
+                }
             }
 
             /// Drain late statuses without waiting for the next TX request.
@@ -8852,6 +9133,7 @@ pub mod os {
                     if let Some(events) = crate::tx_status::parse(&buf[..len as usize], self.family) {
                         for event in events {
                             self.tracker.borrow_mut().event(&event, self.clock.elapsed().as_millis() as u64);
+                            self.roc.borrow_mut().event(&event, self.clock.elapsed().as_micros() as u64);
                         }
                     }
                 }
@@ -8883,7 +9165,28 @@ pub mod os {
                     self.rejected.set(self.rejected.get() + 1);
                     return Err(Error::Invalid);
                 }
-                let payload = build_frame_request(self.ifindex, self.frequency_mhz, frame);
+                // ROC dwell owns the social channel; otherwise the STA home
+                // channel may be used directly (no off-channel flag). This lets
+                // the slot-0 home visit radiate real AWDL frames where an
+                // infrastructure-anchored peer is listening on its own channel.
+                let (freq, offchannel) = if self.roc_enabled.get() {
+                    if let Some(f) =
+                        self.roc.borrow().active_frequency(self.clock.elapsed().as_micros() as u64)
+                    {
+                        (f, true)
+                    } else if let Some(home) = self.home_freq.get() {
+                        (home, false)
+                    } else {
+                        return Err(Error::Io(libc::EAGAIN));
+                    }
+                } else {
+                    (self.frequency_mhz, false)
+                };
+                let mut payload = build_frame_request(self.ifindex, freq, frame);
+                if offchannel {
+                    // The existing READY reservation owns this social channel.
+                    push_attr_bytes(&mut payload, 108, &[], false); // OFFCHANNEL_TX_OK
+                }
                 let unicast = frame[4] & 1 == 0;
                 if unicast { self.tracker.borrow_mut().begin(self.socket.seq.get()); }
                 let result = self.request_frame(&payload);
@@ -8967,6 +9270,7 @@ pub mod os {
                     let mut ack = None;
                     for event in events {
                         self.tracker.borrow_mut().event(&event, self.clock.elapsed().as_millis() as u64);
+                            self.roc.borrow_mut().event(&event, self.clock.elapsed().as_micros() as u64);
                         if let crate::tx_status::Event::Ack { seq: reply, error } = event {
                             if reply == seq { ack = Some(error); }
                         }
@@ -9907,6 +10211,14 @@ pub mod os {
         #[derive(Debug)]
         pub struct MgmtTx;
         impl MgmtTx {
+            pub fn enable_roc(&self) {}
+            pub fn set_home_freq(&self, _freq: Option<u32>) {}
+            pub fn roc_frequency(&self) -> Option<u32> { None }
+            pub fn roc_finished(&self) -> bool { false }
+            pub fn roc_pending(&self) -> bool { false }
+            pub fn start_roc(&self, _frequency: u32, _duration_ms: u32) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
+            pub fn cancel_roc(&self) {}
+
             pub fn tx_stats(&self) -> crate::tx_status::Stats { crate::tx_status::Stats::default() }
             pub fn open(_iface: &str, _frequency_mhz: u32) -> Result<Self, Error> { Err(Error::Io(UNSUPPORTED)) }
             pub fn accepted(&self) -> u64 { 0 }
@@ -11603,14 +11915,11 @@ mod announce_wire_tests {
     }
 
     #[test]
-    fn mif_announce_keeps_the_apple_service_tlvs() {
+    fn mif_announce_omits_unimplemented_pairing_service_tlvs() {
         let frame = runtime::build_announce_80211(ActionSubtype::Mif, &state(6), 0, 0);
         let k = kinds(&frame);
         assert_eq!(&k[..11], &[4, 5, 18, 24, 12, 7, 17, 33, 16, 21, 6]);
-        assert!(
-            k[11..17].iter().all(|t| *t == 2),
-            "AirDrop service TLVs must survive, or the panel never lists us"
-        );
+        assert!(!k.contains(&2), "captured pairing services have no local listener");
     }
 
     #[test]

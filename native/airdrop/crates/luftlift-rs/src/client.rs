@@ -316,7 +316,7 @@ pub fn send_files_with(
 use crate::http::{format_request, parse_response};
 use rustls::ClientConfig;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -356,7 +356,7 @@ impl AirDropTransport for RustlsTransport {
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<HttpResponse> {
         // Fresh connection per request (AirDrop sender opens new TLS each time).
-        let tcp = TcpStream::connect_timeout(&self.peer, self.connect_timeout)?;
+        let tcp = crate::netutil::connect_tcp(&self.peer, self.connect_timeout)?;
         tcp.set_read_timeout(Some(self.io_timeout))?;
         tcp.set_write_timeout(Some(self.io_timeout))?;
         let server_name = rustls::pki_types::ServerName::try_from("airdrop")?;

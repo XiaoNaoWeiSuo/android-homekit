@@ -45,6 +45,16 @@ SINK=awdlsink
 TX_IF=wlan0
 HOST_IF=awdl0
 HTTP_PORT=${MARIONETTE_AWDL_HTTP_PORT:-9930}
+# Driver-managed social-channel dwell. 0 retains the old fixed-STA experiment.
+# filin advertises two EAWs available, two null, and owns capture only after
+# a matching ROC READY; shell keeps ownership of monitor creation/cleanup.
+ROC_CHANNEL=${MARIONETTE_AWDL_ROC_CHANNEL:-149}
+case "$ROC_CHANNEL" in 0|6|44|149) ;; *) echo "invalid AWDL ROC channel" >&2; exit 2 ;; esac
+if [ "$ROC_CHANNEL" = 0 ]; then
+  unset FILIN_ROC_CHANNEL
+else
+  export FILIN_ROC_CHANNEL="$ROC_CHANNEL"
+fi
 # How long the capture filters stay on, and how long they stay off. The filters
 # admit AWDL frames but divert station traffic. Short windows limit each
 # blackout. Millisecond overrides allow bounded coexistence experiments;
@@ -448,6 +458,12 @@ while :; do
       nap 2 || break
       continue
     fi
+  fi
+  if [ "$ROC_CHANNEL" != 0 ]; then
+    # The runtime closes its TX gate before releasing filters. Do not race
+    # its READY/EXPIRED ownership with an unrelated periodic shell window.
+    nap_ms 100 || break
+    continue
   fi
   hold_on
   nap_ms "$WINDOW_MS" || { hold_off; break; }

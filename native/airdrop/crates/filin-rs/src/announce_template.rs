@@ -3,8 +3,8 @@
 //! The AWDL wire format is not documented and cannot be guessed: an Apple peer
 //! only synchronises when every TLV carries the exact fields it expects. So we
 //! captured a real Mac's PSF and MIF off the air and treat them as templates.
-//! Only the identity-bearing fields are rewritten; everything else stays
-//! byte-for-byte as macOS emits it.
+//! Identity and live scheduling fields are rewritten. Live announcements omit
+//! the captured pairing-service records: those protocols are not implemented.
 //!
 //! Provenance of `templates/*.bin`: raw 802.11 action frames lifted verbatim
 //! from `build/airdrop/driver/coexist-rx/frames-2026-10-21.log`, source
@@ -40,11 +40,12 @@
 //!
 //! # The service TLVs are identity too
 //!
-//! TLV 2 carries the AirDrop mDNS records, and those name the *template peer*:
+//! TLV 2 carries application-service pairing records naming the *template peer*:
 //! its hostname, its display name, its session id and its service-instance
 //! UUID. Leaving them alone advertises the Mac back at itself, so nothing can
 //! ever be discovered as us. `rewrite_tlv2` replaces them; the format is
-//! documented at [`rewrite_tlv2`] and in ROADMAP §17.
+//! documented at [`rewrite_tlv2`] and in ROADMAP §17. This rewrite is retained
+//! for fixture research; [`build_link_announcement`] omits TLV 2 on live TX.
 
 use crate::awdl::ActionSubtype;
 
@@ -455,7 +456,9 @@ fn arpa_value(id: &Identity) -> Option<Vec<u8>> {
     Some(value)
 }
 
-/// Build a PSF or MIF from the captured template with our identity patched in.
+/// Replay a captured PSF or MIF with identity patched in, for fixture research.
+/// Live senders must use [`build_link_announcement`]: the captured service
+/// records advertise pairing protocols and ports this implementation lacks.
 ///
 /// Returns `None` only if the embedded template is malformed or the identity
 /// cannot be encoded, which is a build error rather than a runtime condition.
@@ -537,9 +540,33 @@ pub fn build(subtype: ActionSubtype, id: &Identity, timing: &Timing) -> Option<V
     Some(frame)
 }
 
+/// Build the live link announcement without the template Mac's service records.
+/// TLV 2 contains _appsvcprepair/_applicationservicepairing on captured ports
+/// 53870/53869. Renaming these records does not implement those protocols.
+/// Our implemented AirDrop HTTPS service is announced separately over mDNS.
+pub fn build_link_announcement(
+    subtype: ActionSubtype,
+    id: &Identity,
+    timing: &Timing,
+) -> Option<Vec<u8>> {
+    let frame = build(subtype, id, timing)?;
+    let parsed = spans(&frame)?;
+    let mut out = frame[..TLV_START].to_vec();
+    let mut chain_end = TLV_START;
+    for span in parsed {
+        let end = span.value_start + span.len;
+        if span.kind != 2 {
+            out.extend_from_slice(&frame[span.value_start - 3..end]);
+        }
+        chain_end = end;
+    }
+    out.extend_from_slice(&frame[chain_end..]);
+    Some(out)
+}
+
 /// Replace the captured peer's scheduling/election values with our live state.
 /// Layout: OWL frame.h / tx.c, awdl_init_sync_params_tlv and
-/// awdl_init_election_params_v2_tlv. Service records remain template-derived.
+/// awdl_init_election_params_v2_tlv. Does not add service records.
 pub fn apply_runtime_state(frame: &mut [u8], state: &crate::state::AwdlState) -> Option<()> {
     let parsed = spans(frame)?;
     let mut sequence = [0u8; 38];
@@ -627,6 +654,36 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn live_announcements_omit_unimplemented_pairing_services() {
+        let timing = Timing {
+            seq_control: 0x120,
+            phy_tx: 42,
+            target_tx: 42,
+            aw_counter: 16,
+            time_to_next_aw_tu: 32,
+            master_counter: 1,
+        };
+        for subtype in [ActionSubtype::Psf, ActionSubtype::Mif] {
+            let replay = build(subtype, &identity(), &timing).unwrap();
+            let live = build_link_announcement(subtype, &identity(), &timing).unwrap();
+            assert_eq!(&live[..TLV_START], &replay[..TLV_START]);
+            let expected: Vec<_> = spans(&replay).unwrap().into_iter()
+                .filter(|s| s.kind != 2)
+                .map(|s| (s.kind, replay[s.value_start..s.value_start + s.len].to_vec()))
+                .collect();
+            let actual: Vec<_> = spans(&live).unwrap().into_iter()
+                .map(|s| (s.kind, live[s.value_start..s.value_start + s.len].to_vec()))
+                .collect();
+            assert_eq!(actual, expected);
+            assert!(!contains(&live, b"_appsvcprepair"));
+            assert!(!contains(&live, b"_applicationservicepairing"));
+        }
+        // Captured SRV port 0xd26e is exactly the 53870 targeted by the
+        // real Mac SYNs in the 2026-10-26 receive capture.
+        assert!(contains(MIF_TEMPLATE, &[0xd2, 0x6e]));
     }
 
     /// Recover the identity a built frame advertises, the same way a parser

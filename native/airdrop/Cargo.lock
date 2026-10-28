@@ -384,6 +384,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -401,8 +402,6 @@ dependencies = [
 [[package]]
 name = "mdns-sd"
 version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fe7c11a1eb3cfbfcf702d1601c1f5f4c102cdc8665b8a557783ef634741676e"
 dependencies = [
  "flume",
  "if-addrs",

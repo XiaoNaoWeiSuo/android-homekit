@@ -1,5 +1,26 @@
 # AirDrop 社区核对与下一阶段（2026-10-24）
 
+## 2026-10-27 续测与首次选主同步修复
+
+四轮20秒基础UDP中，200/400ms窗口的一轮首次实现双向往返（手机5/40、Mac3/39），最后新同步代码轮又因Mac无52时段而0/40。完整对照与限制见HANDOFF顶部和 `build/airdrop/ip-probe/continued-20261027.json`。不据单次最佳结果宣布稳定，也不将窗口参数与Mac自身availability变化混作一个因果。
+
+本轮修复apply_action的顺序：先完成peer有效性和选主，再从本帧刚选中的parent采用时钟。真实finder pcap重放首次同步由5.275811秒提前到第一帧；新增状态/非法倒计时回归，master变化撤销旧同步资格。同步误差每帧只记新样本，status synced不再只表示选出外部master。Android新产物已短测，但没有成功往返，仍需无线效果验证。Rust workspace/Android build/clippy通过。四次正常STOP/原厂回退/最终网关3/3，无整机重启；短测不覆盖此前line#1413故障。
+
+## 2026-10-27 基础链路：确认 TX 全局阻塞，保留固件 RDDM 现场
+
+ADB 恢复后按既定分层顺序运行了一轮独立 UDP 探针，未启动 AirDrop Discover/Ask/Upload、未安装 APK。手机开机计数78，原厂网关前置3/3；部署的是已记录的0056模块和上一轮60秒peer租约filin（SHA `15a8dbb3…`）。Mac 当前 AWDL 地址变为 `7e:4c:de:a9:3e:54`，探针使用重新读取的 IPv6。证据 `build/airdrop/ip-probe/lease-20261027/`，原始pcap及 `link-audit.json`、kernel/system日志、TAP日志、两端探针结果均保留。
+
+**实际结果与根因边界**：原始抓包114 Action、2 data；本机Mac仅1个MIF，晚于两包UDP约20ms。已有pending_rx在真机释放两包到TAP（约20.2ms），但手机探针尚未绑定39921，内核回ICMP端口不可达；不是UDP应用接收成功。Mac MIF序列为 `[149,149,149,0,0,0,0,0,6,149,149,0,0,0,0,0]`，无手机固定信道52。peer租约保住了Mac，但第一帧单播（端口不可达回复）一直Hold；原实现因此关闭整个TAP的POLLIN，后续UDP/广播也读不到。runtime只有1次buffered、0次data injected、TX_STATUS无单播提交。双方探针0请求/0回复；手机97提交/23发送错误，Mac105提交/13发送错误，含后述故障及启动阶段，不能作稳态丢包率。
+
+**固件故障**：启动探针约48秒后出现RDDM，SFR `cmnos_thread_patch.c:1170:0x8Asserted in:0x1366428:0x1c34a98, line#1413`，随后SSR回收monitor/awdlsink，未整机重启。该SFR在旧 `build/airdrop/driver/mld-owner/capture-follow/kernel-001.log` 也出现过；与0037–0040 AF_PACKET注入的line#2834不同，但相同字符串不证明相同根因。此轮没有为故障归因，也没有继续重复无线配置。自动guard正常回原厂、网关3/3、scan-always=1、boot_count78，无实验接口。正常STOP的历史6次通过不能覆盖这次运行期固件故障；0056不能视作稳定候选。
+
+**本轮实现**：新增 `pending_tx.rs` 并接入实际runtime：持续读取TAP，单播按对端保序等待；全局32包/64KiB、每对端8包、2个hop周期（约2.10秒）过期，满队列拒绝新包，重试不续期。一次drain超过2ms不再启动后续Netlink发送，避免把单次阻塞放大到整个队列；单次Netlink原有超时仍存在。保持原有信道/peer gate，不通过强行向不共同的信道发送来伪造链路可用。4项回归覆盖实测Mac序列造成的阻塞、其他对端可发送、每对端顺序、过期/容量/删除。该修复尚未上机验证，不解决缺共同信道及固件断言。
+
+探针增加 `AWDL_IP_PROBE_START_FILE`：先bind输出ready，等两端均ready后再创建各自全新gate；10秒等待上限、开启后开始计时。增加2项真实loopback/未开启gate超时回归，后续guard预算须包含这10秒；详见 `tools/BASE_LINK_TESTING.md`。避免启动先后顺序浪费仅有的接收窗口。
+
+验证：Rust workspace、Android filin release构建及Android all-targets clippy通过；探针Mac/Android严格告警编译通过；新增4项TX回归和2项探针测试通过，最终产物及hash见本轮 `filin-queue-fix` / `build-report.json`。未部署修复后的二进制。末次只读复查ADB列表为空，不推断原因；原厂/boot_count78/网关3/3是此前guard结束时的证据，断开后无法再核对。下一步先定位line#1413触发条件和共享RX/STA共存路径，再解决与Mac的共同信道/同步窗口；保留有效Action准入。稳定UDP、Apple无线TLS/双向文件、无AP及长期后台仍未验收，四项AirDrop稳定验收仍0/4。
+
+
 ## 当前问题与资料给出的边界
 
 - AWDL 本身是设备直连。项目当前必须先关联 AP，是 0009/0012 + STA 的 kiwi 固件路径限制，不是 AirDrop 必须联网。不能仅删除 radio.sh 的关联检查：monitor open 和 ROC 在未关联状态已有 ENOTCONN/EINVAL 证据。
@@ -158,3 +179,52 @@ check-vdev-response-boundaries.py 在临时目录应用补丁，提取真实 C �
 0054 在实际 0053 树应用成功，全模块构建退出 0，候选 SHA256 `80680eaec756687e3a47464fd92b78e2749f68b84335d32821f074a440fc4855`。512/512 导入 CRC 对上实际 provider 表；取回构建源码跑 ASan/UBSan 边界回归通过。CFI/LTO 构建选项保留，但没有独立完成 CFI ABI 审核；缺 vmlinux 导致模块 BTF 未生成，浅克隆版本脚本和根 Module.symvers 警告仍在。未加载驱动、未启动无线测试；不把编译、CRC 或 host shim 当作运行验收。
 
 完整模块保留在构建机 `/home/lin/workspace/xiaomi13-airdrop/audit-0054/candidate-0054.ko`，CRC 检查在远端执行。当前 DERP 链路传回大文件未完成/超时，本地只保留完整校验记录、构建日志、源码及反汇编，已删除不完整模块/归档；取回方法及位置见本地 `ARTIFACT.txt`，后续须核对 SHA256。
+
+
+## 2026-10-26 无线抓包驱动的两项修正
+
+证据目录 `build/airdrop/device-20261026/`，逐轮结论及限制见 `runtime.json` 和 `docs/HANDOFF.md`。0054完整产物已经LAN取回并匹配SHA，当前手机最终已恢复原厂及联网，boot_count78。
+
+1. **mDNS IP hop-limit**：第一轮Android TAP实际响应为1，固定mdns-sd 0.11.5源码的new_socket_bind没有设置相关socket选项。[RFC 6762 §11](https://www.rfc-editor.org/rfc/rfc6762.html#section-11)建议包括单播回复在内使用255，以兼容旧接收者的来源检查；不是所有现代Apple接收端必然丢弃1的证明。新增固定依赖副本及最小socket修正，保留许可证。独立测试检查IPv4/IPv6单播/组播实际socket选项；第二轮实际服务PTR/SRV/TXT/AAAA包hop-limit255。没有改变DNS记录TTL，也没有证明设备发现稳定。
+2. **复制服务记录引流到不存在的端口**：第二轮完整pcap177帧中6帧data全部由实际data_rx解析接受。四个Mac QoS帧是SYN，目标53870；该端口正是MIF模板TLV2中_appsvcprepair的SRV值0xd26e，另一个_applicationservicepairing为53869。现有重写只改身份，保留服务协议/端口与AirDrop TXT，实际后端仅实现独立mDNS声明的8771。这会产生未实现服务的错误宣告。真实runtime和awdl-emit改用build_link_announcement，移除TLV2，保留其他TLV和尾部；历史build函数只供模板研究。不能把重命名当成完整复刻现代application-service协议，也不能把这四个SYN写成8771握手到达。代码/构建/回归通过，新APK已装；第三轮前置STACK_LOADED_NO_LINK使其无线效果仍待验证。
+
+四个SYN到达时Mac尚未进入peer表，runtime在解析后还会丢弃未知peer的数据；稍后Mac的action才进入/退出peer表。该过滤是独立的时序问题，但放行未知peer还需要解决发送端信道调度与邻居归属，不能简单删除判断。新增rx-audit示例直接调用实际解析器重放raw frame；没有实现该准入改动。
+
+测试方法纠正：dns-sd使用IncludeAWDL，IncludeP2P-only的空结果不算AWDL发现失败。Mac OpenDrop客户端对awdl0设置SO_RECV_ANYIF(0x1104)；早期curl没有，故不能用它单独证明原生失败。第三轮准备了等效Python连接探针，未进入执行。系统sharingd的原生8771 Discover仍有SYN重试日志，hostname被隐私化，未完成服务实例到手机的唯一关联。不存在“已经打通TLS”的证据。Mac当前AirDrop包含新的application-service路径，传统TCP监听缺席也不能作为关闭状态判断。
+
+现有验收仍0/4稳定打通：无线TLS和双向文件均未成功。两轮实际启动中第一轮ACK6/未ACK3只是驱动报告的链路确认，未归属本机Mac，更不代表文件成功。第二轮自动回退曾留下Wi-Fi关闭，额外恢复后3/3；第三轮最终自动回退3/3。STOP/DELETE正常停止屏障和加载/回退框架同步仍需优先修复。
+
+
+## 0055/0056：逻辑删除前停止与定时器关闭（2026-10-26，未部署）
+
+按用户要求先完善底层，不再无线试跑。固定实际0054源码审计发现旧0028漏注册monitor STOP响应，SME已逻辑删除后再等也使状态检查引用失败；另有DP timer stop在sync_cancel之后才清RUNNING，原0030只在回调末尾无锁检查，不能关闭check/rearm竞态。
+
+0055将异步停止门放到sme_vdev_delete的逻辑删除之前，复用SME/WMA已有引用。接STOP和pending START（包括legacy monitor失败仅通知LIM的问题）；内部STOP响应携带host失败状态。WAIT→READY→RESUMED只继续一次，nested事件用已持锁SM API，READY回调不调用SME，外层返回后才继续删除。HDD删除等待加START/STOP预算，PE monitor session延后清理。正常STOP响应先由target-if清计时器/psoc引用，再由monitor响应推进DOWN；失败进入既有恢复。仅固定SERIALIZE_VDEV_RESP构建与STA-monitor实验启用时使用异步门，不在softirq直接获取SME锁。
+
+0056对timer start/rearm/stop增加共同锁；STOP先关重挂入口，在锁外sync_cancel，并用stopper计数阻止正在取消时start。重复stop均join回调，deinit关INIT/RUNNING后取消并free。HDD的DP reset原已同步stop，本补丁补足timer内部交错。生命周期锁/引用的实际内核并发仍需审查，不将host shim当成kernel lockdep/KCSAN。
+
+check-monitor-stop.py提取实际函数验证正常/快速/重复响应、START pending/failure、STOP/DOWN失败、timeout、SSR标志、对象身份与引用余额；check-monitor-timer.py提取实际rearm及起停函数，注入取消中start/rearm/二次stop及重复deinit。ASan/UBSan通过。完整候选SHA `bbb6e00602c6a0ce9c5f5f3222d536117356de957c0a6d63f900c12a7d4ade4e`，512/512导入CRC相符，CFI/LTO保留；BTF仍缺vmlinux。合并源码包含39改动文件和5新头文件，每项before/after SHA，并验证固定干净输入可完整重现，不再把散落历史补丁当可重现基线。
+
+当前明确未覆盖：scheduler分配/入队失败与shutdown queue flush交错时的SME/WMA/peer引用、SSR并行与恢复线程全部调用上下文。不能据当前shim宣称所有失败路径安全；候选未部署，继续静态与离线审查。完整通信、STA共存与无AP也尚未完成。
+
+加载器额外修正：原ctl.restart异步返回即svc enable，可能在旧wificond生命周期中操作；现在等新PID/running，关Wi-Fi也观察框架状态。load和stock共用锁，检查卸载结果，部分加载/无链路失败统一恢复原厂，移除过期默认0046。七项mock shell故障测试通过，不代表已修复实机所有HAL/framework恢复问题。未来限时guardian须计入新完整失败/回退预算，不能原样复用150秒旧脚本。
+
+
+## 分层基础验证与data先于Action（2026-10-26）
+
+用户澄清并未禁止真机，应先把基础驱动/通信验稳再做协议。本轮不运行AirDrop HTTPS/mDNS服务，先执行monitor生命周期，再运行独立固定64字节UDP探针。完整事实在HANDOFF最新项与 `build/airdrop/ip-probe/progress.json`。
+
+正常STOP累计6次成功（同一加载连续重建3次，另有一次单次生命周期、两次IP测试退出），真实STOP完成7.6–14.8ms，之后DELETE，无旧STOP/DELETE WARN，无整机重启；SSR和队列失败不在这六次覆盖内。仍保留原有DP peer状态诊断，不能写成全部内核日志无异常。
+
+加载失败的确证原因来自完整logcat：重启wificond触发Native Failure，WifiSelfRecovery因一小时两次预算耗尽发送CMD_RECOVERY_DISABLE_WIFI；新daemon已running并不代表框架death处理结束。scan-only未退出也是旧卸载条件的缺口，但单独关scan-only不足以解决延迟事件。加载器现临时关scan-always并等ActiveModeManagers=0，重启daemon后明确关Wi-Fi并等12次连续quiet观测，再启用；普通reconcile不再重启daemon。末尾恢复scan-always=1。最后三次修订后加载/回退完成，不能据此宣称所有框架故障已修复。10项新loader故障测试加4项既有测试通过。
+
+基础UDP第一次手机提交130、Mac收到11，Mac提交134、手机收到1，双方echo回复0。Mac比手机运行稍长，末尾4个No route发生在拆接口后，不能计为稳态链路证据。第二次同步启动约60秒，手机120/Mac118、双方接收/回复0。Mac当前基础Wi-Fi信道通过CoreWLAN确认为52，与手机一致。没有TCP/TLS/文件成功。
+
+原始pcap+trace确认：Mac三个单播data分别早于它的Action约23/31ms，旧runtime按未知peer丢弃；peer十秒过期后还导致TX直接丢弃。`pending_rx.rs`只暂存已通过data_rx且含本机单播的delivery，最多16包/64KiB、250ms；不创建peer、不放宽帧校验，仅在Action确认有效peer后释放。runtime统一走deliver_rx交给TAP并更新单播pin。四项测试验证匹配peer、只释放一次、超时、包数/内存边界。`pcap-peer-replay`直接调用生产parser/state/queue，原始三包分别在23452/31544/31428us释放；第二轮只有两包且没有Mac Action，离线与运行均不释放。修复了可复现的先后顺序丢包，不代表改善真实无线性能。
+
+最终手机原厂g939d76a86982、boot_count78、scan-always恢复1、网关3/3；新filin仅独立测试目录使用，未更新APK。Rust workspace报告463项，Android filin release/clippy通过。下一步保持帧/IP范围，审计Action可见性、时钟/可用窗口与peer生命周期；不通过增加上层功能掩盖当前无往返事实。
+
+
+## 固定信道peer租约修正（2026-10-27）
+
+真实pcap中Mac源`4e:2f:a9:4e:a0:4f`的两次完整MIF相隔约48秒；fixed radio原来用10秒peer timeout，导致后续UDP data到达时peer已被evict。普通跳频仍使用owl式2秒超时，固定信道模式改为上限60秒，并增加状态回归验证48秒仍保留、60秒后删除。目标是避免固定信道低频Action造成无意义的未知peer丢弃，不放宽data帧/OUI/BSSID校验，也不让未知源创建peer。新Android filin release SHA `15a8dbb318599fd43a4abcc0cdd88faca1c52acbc79f222f002d606bc30f8148`，尚未真机部署；ADB在下一轮开始前再次消失。

@@ -181,4 +181,22 @@ mod tests {
         assert_eq!(decoded.frames[1].bytes, ethernet(LOCAL));
         assert!(decoded.unicast);
     }
+
+    #[test]
+    fn truncated_amsdu_never_delivers_a_partial_ip_packet() {
+        let body = awdl::encapsulate_ethernet_payload(&ethernet(LOCAL), 3).unwrap();
+        let mut frame = vec![0, 0, 8, 0, 0, 0, 0, 0];
+        let mut mac = ieee80211::build_data_frame(LOCAL, PEER, BSSID, 0x30, &[]);
+        mac[0] = 0x88;
+        mac.extend(ieee80211::QOS_A_MSDU_PRESENT.to_le_bytes());
+        mac.extend(LOCAL);
+        mac.extend(PEER);
+        mac.extend(((body.len() + 1400) as u16).to_be_bytes());
+        mac.extend(body);
+        frame.extend(mac);
+        assert!(matches!(
+            decode(&frame, LOCAL),
+            Err(Error::Payload(awdl::ParseError::TooShort))
+        ));
+    }
 }
