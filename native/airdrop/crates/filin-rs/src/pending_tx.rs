@@ -15,10 +15,23 @@ pub struct Frame {
     pub seq: u16,
 }
 
+/// Interval counters: Send means injector acceptance, not an over-air ACK.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct Stats {
+    pub enqueued: u64,
+    pub rejected: u64,
+    pub expired: u64,
+    pub sent: u64,
+    pub dropped: u64,
+    pub queued: usize,
+    pub queued_bytes: usize,
+}
+
 #[derive(Default)]
 pub struct PendingTx {
     frames: VecDeque<(u64, Frame)>,
     bytes: usize,
+    stats: Stats,
 }
 
 impl PendingTx {
@@ -38,8 +51,10 @@ impl PendingTx {
                 .count()
                 >= MAX_PER_PEER
         {
+            self.stats.rejected += 1;
             return false;
         }
+        self.stats.enqueued += 1;
         self.bytes += size;
         self.frames.push_back((now_us, frame));
         true
@@ -51,10 +66,19 @@ impl PendingTx {
                 true
             } else {
                 self.bytes -= frame.radiotap_frame.len();
+                self.stats.expired += 1;
                 tracing::trace!(dst = ?frame.dst, seq = frame.seq, "expired queued unicast");
                 false
             }
         });
+    }
+
+    /// Reset interval counters but retain queue ownership, age and order.
+    pub fn take_stats(&mut self) -> Stats {
+        let mut stats = std::mem::take(&mut self.stats);
+        stats.queued = self.frames.len();
+        stats.queued_bytes = self.bytes;
+        stats
     }
 
     /// Visit every destination, retaining FIFO order within each destination.
@@ -65,11 +89,24 @@ impl PendingTx {
         let mut blocked = HashSet::new();
         for _ in 0..self.frames.len() {
             let (queued_us, frame) = self.frames.pop_front().unwrap();
-            if blocked.contains(&frame.dst) || send(&frame) == DataSendDecision::Hold {
-                blocked.insert(frame.dst);
-                self.frames.push_back((queued_us, frame));
+            let decision = if blocked.contains(&frame.dst) {
+                DataSendDecision::Hold
             } else {
-                self.bytes -= frame.radiotap_frame.len();
+                send(&frame)
+            };
+            match decision {
+                DataSendDecision::Hold => {
+                    blocked.insert(frame.dst);
+                    self.frames.push_back((queued_us, frame));
+                }
+                DataSendDecision::Send | DataSendDecision::Drop => {
+                    if decision == DataSendDecision::Send {
+                        self.stats.sent += 1;
+                    } else {
+                        self.stats.dropped += 1;
+                    }
+                    self.bytes -= frame.radiotap_frame.len();
+                }
             }
         }
     }
@@ -124,6 +161,50 @@ mod tests {
         assert_eq!(queue.frames.len(), 2);
         queue.drain(MAX_AGE_US, |_| panic!("expired frames must never be sent"));
         assert_eq!(queue.bytes, 0);
+    }
+
+    #[test]
+    fn interval_counters_distinguish_loss_and_do_not_reset_queue_age() {
+        let mut q = PendingTx::default();
+        assert!(!q.push(frame(1, 0, 0), 0));
+        for id in 1..=4 {
+            assert!(q.push(frame(id, id as u16, 100), 0));
+        }
+        q.drain(1, |f| match f.seq {
+            1 => DataSendDecision::Send,
+            2 => DataSendDecision::Drop,
+            _ => DataSendDecision::Hold,
+        });
+        assert_eq!(
+            q.take_stats(),
+            Stats {
+                enqueued: 4,
+                rejected: 1,
+                sent: 1,
+                dropped: 1,
+                queued: 2,
+                queued_bytes: 200,
+                ..Stats::default()
+            }
+        );
+        assert_eq!(
+            q.take_stats(),
+            Stats {
+                queued: 2,
+                queued_bytes: 200,
+                ..Stats::default()
+            }
+        );
+        q.drain(MAX_AGE_US, |_| {
+            panic!("expired frames must not be injected")
+        });
+        assert_eq!(
+            q.take_stats(),
+            Stats {
+                expired: 2,
+                ..Stats::default()
+            }
+        );
     }
 
     #[test]

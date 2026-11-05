@@ -1,11 +1,11 @@
 pub mod announce_template;
-pub mod frame_tx;
 pub mod data_rx;
+pub mod frame_tx;
+pub mod mdns_cache;
 pub mod pending_rx;
 pub mod pending_tx;
-pub mod mdns_cache;
-pub mod tx_status;
 pub mod roc;
+pub mod tx_status;
 
 pub mod radiotap {
     #[derive(Debug, PartialEq, Eq)]
@@ -704,6 +704,12 @@ pub mod awdl {
         let mut offset = 0;
         while offset < body.len() {
             if offset + 14 > body.len() {
+                tracing::debug!(
+                    offset,
+                    available = body.len() - offset,
+                    complete_subframes = out.len(),
+                    "A-MSDU truncated subframe header; delivering complete prefix only"
+                );
                 break;
             }
             let dst: [u8; 6] = body[offset..offset + 6].try_into().unwrap();
@@ -711,6 +717,13 @@ pub mod awdl {
             let sub_len = u16::from_be_bytes([body[offset + 12], body[offset + 13]]) as usize;
             offset += 14;
             if offset + sub_len > body.len() {
+                tracing::debug!(
+                    offset,
+                    declared = sub_len,
+                    available = body.len() - offset,
+                    complete_subframes = out.len(),
+                    "A-MSDU truncated subframe payload; delivering complete prefix only"
+                );
                 break;
             }
             let sub_body = &body[offset..offset + sub_len];
@@ -992,8 +1005,7 @@ pub mod awdl {
                 // flags byte is non-zero to prove we do not return it.
                 vec![0xa4, ch]
             });
-            let parsed =
-                parse_channel_sequence(&value).expect("valid LEGACY channel sequence TLV");
+            let parsed = parse_channel_sequence(&value).expect("valid LEGACY channel sequence TLV");
             assert_eq!(parsed.encoding, CHAN_ENC_LEGACY);
             assert_eq!(&parsed.channels[0..8], &[44; 8]);
             assert_eq!(&parsed.channels[8..16], &[149; 8]);
@@ -1003,11 +1015,8 @@ pub mod awdl {
         fn parses_simple_channel_sequence_tlv() {
             // AWDL_CHAN_ENC_SIMPLE (0): one byte = chan_num. filin previously
             // rejected encoding 0 outright; owl accepts it.
-            let value = chanseq_tlv(CHAN_ENC_SIMPLE, |i| {
-                vec![if i < 8 { 44u8 } else { 6u8 }]
-            });
-            let parsed =
-                parse_channel_sequence(&value).expect("valid SIMPLE channel sequence TLV");
+            let value = chanseq_tlv(CHAN_ENC_SIMPLE, |i| vec![if i < 8 { 44u8 } else { 6u8 }]);
+            let parsed = parse_channel_sequence(&value).expect("valid SIMPLE channel sequence TLV");
             assert_eq!(parsed.encoding, CHAN_ENC_SIMPLE);
             assert_eq!(&parsed.channels[0..8], &[44u16; 8]);
             assert_eq!(&parsed.channels[8..16], &[6u16; 8]);
@@ -1067,10 +1076,8 @@ pub mod awdl {
                 0x60, 0x00, 0x00, 0x00, // payload
             ];
             let sub2 = vec![
-                0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x86, 0xdd,
-                0x60, 0x00, 0x00, 0x01,
+                0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x86, 0xdd, 0x60, 0x00, 0x00, 0x01,
             ];
             let dst1 = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01u8];
             let src1 = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
@@ -1127,8 +1134,8 @@ pub mod awdl {
             assert_eq!(
                 body,
                 vec![
-                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00,
-                    0x03, 0x04, // head = AWDL_DATA_HEAD = 0x0403 little-endian
+                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00, 0x03,
+                    0x04, // head = AWDL_DATA_HEAD = 0x0403 little-endian
                     0x07, 0x00, // seq
                     0x00, 0x00, // reserved
                     0x86, 0xdd, // ethertype
@@ -1320,8 +1327,8 @@ pub mod election {
                 // rewrites those to TX-capable social channels so our announce
                 // lands in-window on 44/149/6 (the No-IR channels are where we
                 // could neither TX nor usefully RX anyway).
-                let cmp = (peer.master_counter, peer.master_metric)
-                    .cmp(&(best_counter, best_metric));
+                let cmp =
+                    (peer.master_counter, peer.master_metric).cmp(&(best_counter, best_metric));
                 match cmp {
                     std::cmp::Ordering::Less => continue, // reject: lower master
                     std::cmp::Ordering::Equal => {
@@ -1605,9 +1612,8 @@ pub mod sync {
         /// owl `awdl_sync_next_aw_us` (owl/src/sync.c:40-45): microseconds to
         /// the next availability-window boundary.
         pub fn next_aw_us(&self, now_us: u64) -> u64 {
-            let eaw_period_us = tu_to_us(
-                u64::from(self.presence_mode) * u64::from(self.aw_period_tu),
-            );
+            let eaw_period_us =
+                tu_to_us(u64::from(self.presence_mode) * u64::from(self.aw_period_tu));
             let time_since = now_us.saturating_sub(self.last_update_us);
             eaw_period_us - (time_since % eaw_period_us)
         }
@@ -1732,7 +1738,7 @@ pub mod sync {
             // code would wrap. Saturating keeps the function sane.
             let sync = SyncState::new(1_000_000); // last_update_us = 1_000_000
             let result = sync.next_aw_tu(500_000); // now < last_update
-            // Should NOT panic or return garbage; the result is a valid u16.
+                                                   // Should NOT panic or return garbage; the result is a valid u16.
             assert!(result > 0, "next_aw_tu must return a positive value");
         }
 
@@ -1956,11 +1962,13 @@ pub mod schedule {
             let own_slot = usize::from(sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
             let peer_slot = usize::from(peer_clock.current_eaw(now_us) % CHANSEQ_LEN as u16);
             if slot_channel(own_seq, own_slot) != current_channel
-                || slot_channel(&peer.sequence, peer_slot) != current_channel {
+                || slot_channel(&peer.sequence, peer_slot) != current_channel
+            {
                 return DataSendDecision::Hold;
             }
             if can_send_in(sync, now_us, UNICAST_GUARD_TU) != 0
-                || can_send_in(peer_clock, now_us, UNICAST_GUARD_TU) != 0 {
+                || can_send_in(peer_clock, now_us, UNICAST_GUARD_TU) != 0
+            {
                 return DataSendDecision::Hold; // inside unicast guard interval
             }
             DataSendDecision::Send
@@ -2012,9 +2020,9 @@ pub mod schedule {
     /// only 44 with some 6), an iPhone scanning on 149 will never discover
     /// filin.
     pub const AWDL_SOCIAL_CHANNELS: [(u8, u8); 3] = [
-        (6, 0x51),    // CHAN_OPCLASS_6
-        (44, 0x80),   // CHAN_OPCLASS_44
-        (149, 0x80),  // CHAN_OPCLASS_149
+        (6, 0x51),   // CHAN_OPCLASS_6
+        (44, 0x80),  // CHAN_OPCLASS_44
+        (149, 0x80), // CHAN_OPCLASS_149
     ];
 
     /// The distinct social-channel NUMBERS (6, 44, 149), sorted ascending.
@@ -2075,7 +2083,8 @@ pub mod schedule {
         let mut replaced = Vec::new();
         for slot in seq.iter_mut() {
             if slot[0] != 0 && crate::channel::is_no_ir_channel(slot[0]) {
-                let (ch, opclass) = AWDL_SOCIAL_CHANNELS[replaced.len() % AWDL_SOCIAL_CHANNELS.len()];
+                let (ch, opclass) =
+                    AWDL_SOCIAL_CHANNELS[replaced.len() % AWDL_SOCIAL_CHANNELS.len()];
                 replaced.push(slot[0]);
                 *slot = [ch, opclass];
             }
@@ -2374,16 +2383,10 @@ pub mod schedule {
         /// the adopted master's anchor). This makes filin adaptive: when the
         /// master anchors on e.g. 52, the cached announce is re-broadcast on
         /// 52 too, not just 6/44/149.
-        pub fn rebroadcast(
-            &mut self,
-            channel: u8,
-            now_us: u64,
-            allowed: &[u8],
-        ) -> Option<&[u8]> {
+        pub fn rebroadcast(&mut self, channel: u8, now_us: u64, allowed: &[u8]) -> Option<&[u8]> {
             // Expire stale cache so a dead receiver stops being advertised.
             // Done before borrowing self.frame below to avoid a borrow conflict.
-            if self.frame.is_some()
-                && now_us.saturating_sub(self.cached_at_us) >= self.frame_ttl_us
+            if self.frame.is_some() && now_us.saturating_sub(self.cached_at_us) >= self.frame_ttl_us
             {
                 self.frame = None;
             }
@@ -2402,9 +2405,7 @@ pub mod schedule {
 
         /// Whether the cache currently holds a non-expired frame.
         pub fn is_live(&self, now_us: u64) -> bool {
-            self.frame
-                .is_some()
-                && now_us.saturating_sub(self.cached_at_us) < self.frame_ttl_us
+            self.frame.is_some() && now_us.saturating_sub(self.cached_at_us) < self.frame_ttl_us
         }
     }
 
@@ -2414,14 +2415,11 @@ pub mod schedule {
     /// during which filin keeps the radio PINNED to that peer's channel and
     /// suppresses channel hopping + master re-adoption.
     ///
-    /// This must cover not just gaps between TCP segments of a bulk /Upload,
-    /// but the **user-interaction gap between AirDrop's `/Discover` (browsing,
-    /// fills the picker) and `/Ask` (fires when the user taps send)** — which
-    /// is seconds, not milliseconds. The original ~131 ms (2 EAW) released the
-    /// pin long before the `/Ask` arrived, so filin hopped away and the `/Ask`
-    /// connection never reached the host (observed live: `/Discover` lands,
-    /// `/Ask` never does, sender shows "declined"). 6 s holds the peer's
-    /// channel across a normal tap while still releasing promptly once idle.
+    /// Covers the normal user-interaction gap between `/Discover` and
+    /// `/Ask`, while releasing scheduling ownership promptly when idle.
+    /// A 60 s experiment did not establish a throughput improvement and was
+    /// followed by an ASK connection failure; retain the 6 s baseline until
+    /// a controlled radio-schedule comparison justifies changing this policy.
     pub const TRANSFER_IDLE_TIMEOUT_US: u64 = 6_000_000;
 
     /// Record of the most recent unicast data RX used to pin the radio to
@@ -2495,9 +2493,7 @@ pub mod schedule {
         if winner == committed_master {
             return MasterAdoption::Adopt;
         }
-        if winner == pending_master
-            && now_us.saturating_sub(pending_since_us) >= debounce_us
-        {
+        if winner == pending_master && now_us.saturating_sub(pending_since_us) >= debounce_us {
             return MasterAdoption::Adopt;
         }
         MasterAdoption::Keep
@@ -2622,14 +2618,7 @@ pub mod schedule {
             let sync = synced();
             let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
             assert_eq!(
-                data_send_decision(
-                    &[0xff; 6],
-                    44,
-                    &own_seq,
-                    &empty_peers(),
-                    &sync,
-                    1_032_768,
-                ),
+                data_send_decision(&[0xff; 6], 44, &own_seq, &empty_peers(), &sync, 1_032_768,),
                 DataSendDecision::Send,
             );
         }
@@ -2701,14 +2690,7 @@ pub mod schedule {
             let peer_addr = [0x02, 0, 0, 0, 0, 0x07];
             let peers = peer_on_channel(peer_addr, 44);
             assert_eq!(
-                data_send_decision(
-                    &peer_addr,
-                    44,
-                    &own_seq,
-                    &peers,
-                    &sync,
-                    1_032_768,
-                ),
+                data_send_decision(&peer_addr, 44, &own_seq, &peers, &sync, 1_032_768,),
                 DataSendDecision::Send,
             );
         }
@@ -2828,7 +2810,10 @@ pub mod schedule {
             assert!(set.contains(&6));
             assert!(set.contains(&44));
             assert!(set.contains(&149));
-            assert!(set.contains(&52), "anchor 52 must be in the rebroadcast set");
+            assert!(
+                set.contains(&52),
+                "anchor 52 must be in the rebroadcast set"
+            );
         }
 
         #[test]
@@ -3005,14 +2990,20 @@ pub mod schedule {
         #[test]
         fn transfer_inactive_when_no_pin_or_null_channel() {
             // No pin → not active.
-            assert_eq!(transfer_active(None, 1_000_000, TRANSFER_IDLE_TIMEOUT_US), None);
+            assert_eq!(
+                transfer_active(None, 1_000_000, TRANSFER_IDLE_TIMEOUT_US),
+                None
+            );
             // A pin on channel 0 (null) → not active.
             let pin = TransferPin {
                 peer: [0x02, 1, 2, 3, 4, 5],
                 channel: 0,
                 last_rx_us: 1_000_000,
             };
-            assert_eq!(transfer_active(Some(&pin), 1_000_000, TRANSFER_IDLE_TIMEOUT_US), None);
+            assert_eq!(
+                transfer_active(Some(&pin), 1_000_000, TRANSFER_IDLE_TIMEOUT_US),
+                None
+            );
         }
 
         // --- Bug B: master-adoption hysteresis ---
@@ -3111,7 +3102,7 @@ pub mod schedule {
             assert!(seq.iter().any(|s| s[0] == 149));
             assert!(seq.iter().any(|s| s[0] == 6));
             assert!(seq.iter().any(|s| s[0] == 44)); // 44 still there
-            // No more null slots (we filled them).
+                                                     // No more null slots (we filled them).
             assert!(!seq.iter().any(|s| s[0] == 0));
         }
 
@@ -3145,7 +3136,7 @@ pub mod schedule {
             // the only occurrence of a distinct channel.
             let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
             seq[0] = [36, 0x80]; // non-social, single occurrence
-            // 5 null slots for 6, 44, 149.
+                                 // 5 null slots for 6, 44, 149.
             let injected = ensure_social_coverage(&mut seq, 0);
             assert_eq!(injected.len(), 3);
             assert!(seq.iter().any(|s| s[0] == 36), "ch36 must survive");
@@ -3160,9 +3151,9 @@ pub mod schedule {
             // 149), so filin dwells on 149 several times per cycle.
             let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
             seq[0] = [44, 0x80]; // one real master channel
-            // 15 nulls. ensure_social_coverage injects the missing 6/149
-            // (44 already present), then fills the remaining 13 nulls
-            // round-robin 149/6/44 starting at 149.
+                                 // 15 nulls. ensure_social_coverage injects the missing 6/149
+                                 // (44 already present), then fills the remaining 13 nulls
+                                 // round-robin 149/6/44 starting at 149.
             ensure_social_coverage(&mut seq, 0);
             let count_149 = seq.iter().filter(|s| s[0] == 149).count();
             assert!(
@@ -3245,7 +3236,7 @@ pub mod schedule {
             // than any individual social channel in the filled nulls.
             let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
             seq[0] = [52, 0x80]; // anchor
-            // 15 nulls — no other master channels.
+                                 // 15 nulls — no other master channels.
             ensure_social_coverage(&mut seq, 52);
 
             let anchor_count = seq.iter().filter(|s| s[0] == 52).count();
@@ -3253,9 +3244,7 @@ pub mod schedule {
             let ch6_count = seq.iter().filter(|s| s[0] == 6).count();
             let ch44_count = seq.iter().filter(|s| s[0] == 44).count();
             assert!(
-                anchor_count > ch149_count
-                    && anchor_count > ch6_count
-                    && anchor_count > ch44_count,
+                anchor_count > ch149_count && anchor_count > ch6_count && anchor_count > ch44_count,
                 "anchor ({} slots) must dominate socials (149:{}, 6:{}, 44:{})",
                 anchor_count,
                 ch149_count,
@@ -3298,13 +3287,19 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
-            assert!(cache.rebroadcast(149, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_some());
+            assert!(cache
+                .rebroadcast(149, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS)
+                .is_some());
             assert!(
-                cache.rebroadcast(149, 1_900_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_none(),
+                cache
+                    .rebroadcast(149, 1_900_000, &AWDL_SOCIAL_CHANNEL_NUMS)
+                    .is_none(),
                 "second send within window must be suppressed"
             );
             // Past the window it fires again.
-            assert!(cache.rebroadcast(149, 2_501_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_some());
+            assert!(cache
+                .rebroadcast(149, 2_501_000, &AWDL_SOCIAL_CHANNEL_NUMS)
+                .is_some());
         }
 
         #[test]
@@ -3315,9 +3310,13 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
-            assert!(cache.rebroadcast(6, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_some());
+            assert!(cache
+                .rebroadcast(6, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS)
+                .is_some());
             assert!(
-                cache.rebroadcast(149, 1_500_001, &AWDL_SOCIAL_CHANNEL_NUMS).is_some(),
+                cache
+                    .rebroadcast(149, 1_500_001, &AWDL_SOCIAL_CHANNEL_NUMS)
+                    .is_some(),
                 "ch149 must not be rate-limited by a ch6 send"
             );
         }
@@ -3343,7 +3342,9 @@ pub mod schedule {
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
             let stale = 1_000_000 + ANNOUNCE_CACHE_TTL_US + 1;
-            assert!(cache.rebroadcast(149, stale, &AWDL_SOCIAL_CHANNEL_NUMS).is_none());
+            assert!(cache
+                .rebroadcast(149, stale, &AWDL_SOCIAL_CHANNEL_NUMS)
+                .is_none());
             assert!(!cache.is_live(stale));
         }
 
@@ -3353,7 +3354,9 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
-            assert!(cache.rebroadcast(36, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_none());
+            assert!(cache
+                .rebroadcast(36, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS)
+                .is_none());
         }
 
         #[test]
@@ -3365,7 +3368,10 @@ pub mod schedule {
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA, 0xBB], 1_000_000);
             let allowed = rebroadcast_channels(52);
-            assert_eq!(cache.rebroadcast(52, 1_500_000, &allowed), Some(&[0xAA, 0xBB][..]));
+            assert_eq!(
+                cache.rebroadcast(52, 1_500_000, &allowed),
+                Some(&[0xAA, 0xBB][..])
+            );
         }
 
         #[test]
@@ -3388,7 +3394,9 @@ pub mod schedule {
             // With no frame cached, nothing is ever re-broadcast.
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
-            assert!(cache.rebroadcast(149, 1_000_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_none());
+            assert!(cache
+                .rebroadcast(149, 1_000_000, &AWDL_SOCIAL_CHANNEL_NUMS)
+                .is_none());
         }
     }
 }
@@ -3958,7 +3966,6 @@ pub mod rx {
         rssi >= effective_threshold
     }
 
-
     #[derive(Debug, PartialEq, Eq)]
     pub struct ParsedActionFrame<'a> {
         pub rx_time_us: u64,
@@ -4082,15 +4089,28 @@ pub mod rx {
             let mut frame = vec![0, 0, 16, 0, 1, 0, 0, 0];
             frame.extend(1000u64.to_le_bytes());
             frame.extend(ieee80211::build_management_action_frame(
-                [0xff; 6], [2, 0, 0, 0, 0, 2], crate::runtime::AWDL_BSSID, 0x10, &body,
+                [0xff; 6],
+                [2, 0, 0, 0, 0, 2],
+                crate::runtime::AWDL_BSSID,
+                0x10,
+                &body,
             ));
-            for (offset, value) in [(16, 0x08), (32, 0x42), (17, 0x01),
-                                    (17, 0x04), (17, 0x40), (17, 0x80), (38, 0x11)] {
+            for (offset, value) in [
+                (16, 0x08),
+                (32, 0x42),
+                (17, 0x01),
+                (17, 0x04),
+                (17, 0x40),
+                (17, 0x80),
+                (38, 0x11),
+            ] {
                 let mut invalid = frame.clone();
                 invalid[offset] = value;
                 let mut bridge = TsftBridge::default();
-                assert_eq!(parse_action_frame(&invalid, 10_000, &mut bridge).unwrap_err(),
-                           ParseError::NotAwdlAction);
+                assert_eq!(
+                    parse_action_frame(&invalid, 10_000, &mut bridge).unwrap_err(),
+                    ParseError::NotAwdlAction
+                );
                 assert_eq!(bridge.offset_us(), None);
             }
             // Retry bit does not change the MAC header layout.
@@ -4320,7 +4340,11 @@ pub mod cli {
     }
 
     fn config_from_args(args: Args) -> Result<iface::Config, CliError> {
-        let http_addr = if args.no_http { None } else { Some(args.http_addr) };
+        let http_addr = if args.no_http {
+            None
+        } else {
+            Some(args.http_addr)
+        };
         iface::validate_config(iface::Config {
             monitor_iface: args.monitor_iface,
             host_iface: args.host_iface,
@@ -4365,7 +4389,7 @@ pub mod cli {
                     pcap_path: None,
                     http_addr: Some(iface::default_http_addr()),
                     park: false,
-                disable_rssi_filter: false,
+                    disable_rssi_filter: false,
                     // Force-master is on by default now.
                     force_master: Some(crate::election::DEFAULT_FORCE_MASTER_METRIC),
                     tx_retransmits: 0,
@@ -4403,8 +4427,7 @@ pub mod cli {
 
         #[test]
         fn http_addr_defaults_to_loopback_9930() {
-            let config = parse_config_from(["filin", "-i", "wlan0mon"])
-                .expect("valid CLI args");
+            let config = parse_config_from(["filin", "-i", "wlan0mon"]).expect("valid CLI args");
             assert_eq!(config.http_addr, Some(iface::default_http_addr()));
             let addr = config.http_addr.expect("some");
             assert!(addr.ip().is_loopback());
@@ -4413,14 +4436,9 @@ pub mod cli {
 
         #[test]
         fn http_addr_flag_overrides_the_default() {
-            let config = parse_config_from([
-                "filin",
-                "-i",
-                "wlan0mon",
-                "--http-addr",
-                "127.0.0.1:9999",
-            ])
-            .expect("valid CLI args");
+            let config =
+                parse_config_from(["filin", "-i", "wlan0mon", "--http-addr", "127.0.0.1:9999"])
+                    .expect("valid CLI args");
             let addr = config.http_addr.expect("some");
             assert!(addr.ip().is_loopback());
             assert_eq!(addr.port(), 9999);
@@ -4428,8 +4446,7 @@ pub mod cli {
 
         #[test]
         fn force_master_defaults_on() {
-            let config = parse_config_from(["filin", "-i", "wlan0mon"])
-                .expect("valid CLI args");
+            let config = parse_config_from(["filin", "-i", "wlan0mon"]).expect("valid CLI args");
             assert_eq!(
                 config.force_master,
                 Some(crate::election::DEFAULT_FORCE_MASTER_METRIC)
@@ -4445,9 +4462,8 @@ pub mod cli {
 
         #[test]
         fn explicit_force_master_overrides_opt_out() {
-            let config =
-                parse_config_from(["filin", "-i", "wlan0mon", "--no-force-master", "-M"])
-                    .expect("valid CLI args");
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "--no-force-master", "-M"])
+                .expect("valid CLI args");
             assert_eq!(
                 config.force_master,
                 Some(crate::election::DEFAULT_FORCE_MASTER_METRIC)
@@ -4456,15 +4472,19 @@ pub mod cli {
 
         #[test]
         fn force_master_metric_override_applies_by_default() {
-            let with = parse_config_from([
-                "filin", "-i", "wlan0mon", "--force-master-metric", "123456",
-            ])
-            .expect("valid CLI args");
+            let with =
+                parse_config_from(["filin", "-i", "wlan0mon", "--force-master-metric", "123456"])
+                    .expect("valid CLI args");
             assert_eq!(with.force_master, Some(123456));
 
             // Opted out: the metric override is ignored.
             let without = parse_config_from([
-                "filin", "-i", "wlan0mon", "--no-force-master", "--force-master-metric", "123456",
+                "filin",
+                "-i",
+                "wlan0mon",
+                "--no-force-master",
+                "--force-master-metric",
+                "123456",
             ])
             .expect("valid CLI args");
             assert_eq!(without.force_master, None);
@@ -4506,8 +4526,7 @@ pub mod cli {
 
         #[test]
         fn park_flag_opts_into_single_channel_mode() {
-            let config =
-                parse_config_from(["filin", "-i", "wlan0mon", "--park"]).expect("valid");
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "--park"]).expect("valid");
             assert!(config.park, "--park enables single-channel park mode");
         }
     }
@@ -4625,12 +4644,7 @@ pub mod state {
 
     impl AwdlState {
         /// owl `awdl_init_state` (owl/src/state.c:30-67).
-        pub fn new(
-            self_addr: [u8; 6],
-            name: String,
-            anchor_channel: u16,
-            now_us: u64,
-        ) -> Self {
+        pub fn new(self_addr: [u8; 6], name: String, anchor_channel: u16, now_us: u64) -> Self {
             let opclass = chan_opclass(anchor_channel);
             Self {
                 self_addr,
@@ -4697,8 +4711,14 @@ pub mod state {
                         4 => {
                             if let Ok(p) = awdl::parse_sync_parameters(tlv.value) {
                                 if p.time_to_next_aw_tu <= 64 {
-                                    let clock = peer.sync.get_or_insert_with(|| crate::sync::SyncState::new(rx_time_us));
-                                    clock.update_from_master(rx_time_us, p.time_to_next_aw_tu, p.aw_counter);
+                                    let clock = peer.sync.get_or_insert_with(|| {
+                                        crate::sync::SyncState::new(rx_time_us)
+                                    });
+                                    clock.update_from_master(
+                                        rx_time_us,
+                                        p.time_to_next_aw_tu,
+                                        p.aw_counter,
+                                    );
                                     sync_update = Some((p.time_to_next_aw_tu, p.aw_counter));
                                 }
                             }
@@ -4731,12 +4751,7 @@ pub mod state {
                     self.sync
                         .update_from_master(rx_time_us, time_to_next_aw_tu, aw_counter);
                     self.synchronized_master = Some(self.election.master_addr);
-                    tracing::trace!(
-                        error_tu,
-                        aw_counter,
-                        time_to_next_aw_tu,
-                        "sync_error"
-                    );
+                    tracing::trace!(error_tu, aw_counter, time_to_next_aw_tu, "sync_error");
                 }
             }
             // Adopt the elected master's channel sequence so filin hops to the
@@ -4781,18 +4796,60 @@ pub mod state {
             self.current_channel = channel;
         }
 
-        pub fn constrain_roc_schedule(&mut self, roc_channel: u8, home_channel: u8) {
+        /// Constrain the advertised availability to the ROC social channel.
+        ///
+        /// The advertised sequence is deliberately all-social: the kiwi_v2
+        /// ROC handshake costs about 100 ms between the cookie and the
+        /// driver's READY event, longer than one 64 TU EAW. A slot-0 home
+        /// visit tears the dwell down and forces a fresh reservation before
+        /// the next social slot; measured on 2026-11-05 that produced ~700
+        /// hold transitions per minute and the sender's /Ask body never
+        /// arrived. A station-owned radio without ROC keeps its home visit
+        /// through [`Self::constrain_radio_channel`].
+        pub fn constrain_roc_schedule(&mut self, roc_channel: u8) {
             self.constrain_radio_channel(roc_channel);
-            let sequence = crate::roc::sequence(roc_channel, home_channel);
+            let sequence = crate::roc::sequence(roc_channel, roc_channel);
             self.fixed_radio_sequence = Some(sequence);
             self.channel_sequence = sequence;
         }
 
+        /// Effective local TX availability for ROC only. Current channel is
+        /// granted by RocCapture after reservation/READY validation. Preserve
+        /// the advertised sequence for announcements and peer interpretation.
+        pub fn tx_channel_sequence(&self) -> [[u8; 2]; CHANSEQ_LEN] {
+            match (self.fixed_radio_sequence, self.fixed_radio_channel) {
+                (Some(_), Some(roc)) => {
+                    crate::roc::tx_sequence(&self.channel_sequence, roc, self.current_channel)
+                }
+                _ => self.channel_sequence,
+            }
+        }
+
+        fn refresh_roc_schedule(&mut self) {
+            let Some(current) = self.fixed_radio_sequence else {
+                return;
+            };
+            // Slots 1/2 identify the reserved social channel. Keep the whole
+            // sequence social: hopping to a home slot costs a full ROC
+            // re-acquisition (see [`Self::constrain_roc_schedule`]).
+            let roc = current[1][0];
+            let next = crate::roc::sequence(roc, roc);
+            if next != current {
+                self.fixed_radio_sequence = Some(next);
+                self.channel_sequence = next;
+            }
+        }
+
         fn sync_channel_sequence(&mut self, now_us: u64) {
             if let Some(channel) = self.fixed_radio_channel {
-                self.channel_sequence = self.fixed_radio_sequence.unwrap_or([[channel, chan_opclass(u16::from(channel))]; CHANSEQ_LEN]);
+                self.refresh_roc_schedule();
+                self.channel_sequence = self
+                    .fixed_radio_sequence
+                    .unwrap_or([[channel, chan_opclass(u16::from(channel))]; CHANSEQ_LEN]);
                 self.current_channel = channel;
-                self.master_anchor = self.peers.get(&self.election.sync_addr)
+                self.master_anchor = self
+                    .peers
+                    .get(&self.election.sync_addr)
                     .map(|peer| crate::schedule::master_anchor_channel(&peer.sequence))
                     .unwrap_or(0);
                 return;
@@ -4813,9 +4870,7 @@ pub mod state {
             // SWITCHING between two real external masters. The first adoption
             // (self → real master) and master loss (real master → self) are
             // immediate: neither is a flip-flop, so neither is debounced.
-            let decision = if self.committed_master == self.self_addr
-                || winner == self.self_addr
-            {
+            let decision = if self.committed_master == self.self_addr || winner == self.self_addr {
                 crate::schedule::MasterAdoption::Adopt
             } else {
                 crate::schedule::master_adoption_decision(
@@ -4864,37 +4919,28 @@ pub mod state {
                 }
             } else if let Some(peer) = self.peers.get(&master) {
                 // adopted master: copy its sequence if it has any non-null slots
-                if peer.sequence.iter().any(|s| s[0] != 0)
-                    && self.channel_sequence != peer.sequence
+                if peer.sequence.iter().any(|s| s[0] != 0) && self.channel_sequence != peer.sequence
                 {
-                    let decoded: Vec<u8> =
-                        peer.sequence.iter().map(|s| s[0]).collect();
+                    let decoded: Vec<u8> = peer.sequence.iter().map(|s| s[0]).collect();
                     self.channel_sequence = peer.sequence;
                     // We adopt this master for AW *timing*, but the carl9170
                     // can't TX/RX on its No-IR/DFS slots — rewrite those to
                     // TX-capable social channels so the monitor never tunes
                     // there and our announce still lands in-window.
-                    let no_ir = crate::schedule::replace_no_ir_slots(
-                        &mut self.channel_sequence,
-                    );
+                    let no_ir = crate::schedule::replace_no_ir_slots(&mut self.channel_sequence);
                     // Extract the master's anchor (slot-0 / dominant channel)
                     // so filin can re-broadcast + dwell on it adaptively. Taken
                     // AFTER No-IR rewrite so the anchor is always TX-capable.
-                    let anchor = crate::schedule::master_anchor_channel(
-                        &self.channel_sequence,
-                    );
+                    let anchor = crate::schedule::master_anchor_channel(&self.channel_sequence);
                     self.master_anchor = anchor;
                     // Ensure filin visits ALL AWDL social channels (6, 44,
                     // 149) even if the master omits some — e.g. a master in
                     // an active data session may advertise only 44/6, but
                     // iPhones scan 149 for AirDrop discovery. Also bias null
                     // fills toward the anchor (FILIN_ANCHOR_REBROADCAST.md).
-                    let injected = crate::schedule::ensure_social_coverage(
-                        &mut self.channel_sequence,
-                        anchor,
-                    );
-                    let final_seq: Vec<u8> =
-                        self.channel_sequence.iter().map(|s| s[0]).collect();
+                    let injected =
+                        crate::schedule::ensure_social_coverage(&mut self.channel_sequence, anchor);
+                    let final_seq: Vec<u8> = self.channel_sequence.iter().map(|s| s[0]).collect();
                     tracing::info!(
                         master = ?master,
                         decoded = ?decoded,
@@ -5121,7 +5167,10 @@ pub mod state {
             let mut out = Vec::with_capacity(to_remove.len());
             for mac in to_remove {
                 self.known.remove(&mac);
-                out.push(NeighborChange::Remove(mac, crate::awdl::link_local_ipv6(mac)));
+                out.push(NeighborChange::Remove(
+                    mac,
+                    crate::awdl::link_local_ipv6(mac),
+                ));
             }
             out
         }
@@ -5219,6 +5268,43 @@ pub mod state {
     mod tests {
         use super::*;
 
+        #[test]
+        fn roc_advertisement_is_initialized_before_first_peer_action() {
+            let mut state = AwdlState::new([2, 0, 0, 0, 0, 1], "roc-test".into(), 52, 0);
+            state.constrain_roc_schedule(149);
+            // The whole sequence is social: a home slot would cost a full ROC
+            // re-acquisition (about 100 ms, longer than one EAW).
+            assert_eq!(state.channel_sequence, crate::roc::sequence(149, 149));
+            for slot in [0, 1, 3, 15] {
+                assert_eq!(
+                    crate::roc::capture_channel(&state.channel_sequence, slot, 149, 52),
+                    149
+                );
+            }
+        }
+
+        #[test]
+        fn roc_schedule_stays_all_social_across_pin_and_peer_home_changes() {
+            use crate::runtime::host_time_us;
+            let now = host_time_us();
+            let mut state = AwdlState::new([2, 0, 0, 0, 0, 1], "roc-test".into(), 52, now);
+            state.constrain_roc_schedule(149);
+
+            // A peer with a station home channel (52) and an active transfer
+            // pin must not pull the advertised schedule into a home visit.
+            let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
+            state.peers.touch(mac, now);
+            state.peers.get_mut(&mac).unwrap().sequence = crate::roc::sequence(149, 52);
+            state.note_unicast_rx(mac, 149, now);
+            state.sync_channel_sequence(now);
+            assert_eq!(state.channel_sequence, crate::roc::sequence(149, 149));
+
+            // And it still stays social after the pin clears.
+            state.transfer = None;
+            state.sync_channel_sequence(now);
+            assert_eq!(state.channel_sequence, crate::roc::sequence(149, 149));
+        }
+
         fn mif() -> awdl::ActionSubtype {
             awdl::ActionSubtype::Mif
         }
@@ -5239,7 +5325,10 @@ pub mod state {
             value[20..24].copy_from_slice(&metric.to_le_bytes());
             value[24..28].copy_from_slice(&metric.to_le_bytes());
             value[36..40].copy_from_slice(&0u32.to_le_bytes());
-            awdl::Tlv { kind: 24, value: value.leak() }
+            awdl::Tlv {
+                kind: 24,
+                value: value.leak(),
+            }
         }
 
         /// Like [`election_v2_tlv`] but with a configurable peer address, so
@@ -5257,7 +5346,10 @@ pub mod state {
             value[20..24].copy_from_slice(&metric.to_le_bytes());
             value[24..28].copy_from_slice(&metric.to_le_bytes());
             value[36..40].copy_from_slice(&0u32.to_le_bytes());
-            awdl::Tlv { kind: 24, value: value.leak() }
+            awdl::Tlv {
+                kind: 24,
+                value: value.leak(),
+            }
         }
 
         /// Build a chanseq TLV value (OPCLASS encoding) filled with `chan`.
@@ -5276,14 +5368,26 @@ pub mod state {
             state.constrain_radio_channel(52);
             let master = [2, 0, 0, 0, 0, 2];
             let seq = chanseq_value_all(149);
-            state.apply_action(master, mif(), &[
-                election_v2_tlv(50, 200), version_tlv(0x34, 1),
-                awdl::Tlv { kind: 18, value: &seq },
-            ], 1_000_000);
+            state.apply_action(
+                master,
+                mif(),
+                &[
+                    election_v2_tlv(50, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &seq,
+                    },
+                ],
+                1_000_000,
+            );
             state.enable_park(149); // even an unrelated park preference cannot retune STA
             assert_eq!(state.election.sync_addr, master);
             assert_eq!(state.master_anchor, 149);
-            assert!(state.channel_sequence.iter().all(|slot| *slot == [52, 0x76]));
+            assert!(state
+                .channel_sequence
+                .iter()
+                .all(|slot| *slot == [52, 0x76]));
             for now in [1_000_000, 3_500_000, 5_000_000] {
                 assert_eq!(state.desired_channel(now), 52);
                 assert!(state.clean_peers(now).is_empty());
@@ -5292,7 +5396,9 @@ pub mod state {
             let mac = crate::ieee80211::parse_mac_header(&frame).unwrap();
             let action = awdl::parse_action_frame(mac.body).unwrap();
             let tlvs = awdl::parse_tlvs(action.tlvs).unwrap();
-            let wire_seq = awdl::parse_channel_sequence(tlvs.iter().find(|t| t.kind == 18).unwrap().value).unwrap();
+            let wire_seq =
+                awdl::parse_channel_sequence(tlvs.iter().find(|t| t.kind == 18).unwrap().value)
+                    .unwrap();
             assert!(wire_seq.channels.iter().all(|ch| *ch == 52));
             assert!(state.clean_peers(11_000_001).is_empty());
             assert_eq!(state.clean_peers(61_000_001), vec![master]);
@@ -5302,7 +5408,10 @@ pub mod state {
         fn state_inits_self_master_and_static_chanseq() {
             let state = AwdlState::new([0x02, 1, 2, 3, 4, 5], "filin".into(), 44, 0);
             assert_eq!(state.election.master_addr, [0x02, 1, 2, 3, 4, 5]);
-            assert_eq!(state.election.master_metric, ElectionState::new([0; 6]).master_metric);
+            assert_eq!(
+                state.election.master_metric,
+                ElectionState::new([0; 6]).master_metric
+            );
             assert_eq!(state.channel_sequence[0], [44, 0x80]);
             assert_eq!(state.version, AWDL_VERSION);
             assert_eq!(state.dev_class, AWDL_DEVCLASS_MACOS);
@@ -5314,7 +5423,9 @@ pub mod state {
             // 6/44/149 rotation was tried and made AirDrop worse — staying
             // parked on the anchor keeps a stronger presence where peers meet).
             let mut state = AwdlState::new([0x02, 1, 2, 3, 4, 5], "filin".into(), 44, 0);
-            state.election.force_self_master(crate::election::DEFAULT_FORCE_MASTER_METRIC);
+            state
+                .election
+                .force_self_master(crate::election::DEFAULT_FORCE_MASTER_METRIC);
             // Trigger sync_channel_sequence (runs inside clean_peers).
             state.clean_peers(0);
             assert!(
@@ -5332,10 +5443,19 @@ pub mod state {
             // From finder-20261027: first Mac MIF, AW 58434 / next 26 TU.
             timing[1..3].copy_from_slice(&26u16.to_le_bytes());
             timing[29..31].copy_from_slice(&58434u16.to_le_bytes());
-            state.apply_action(master, mif(), &[
-                awdl::Tlv { kind: 4, value: &timing },
-                election_v2_tlv(50, 200), version_tlv(0x34, 1),
-            ], 1_000_000);
+            state.apply_action(
+                master,
+                mif(),
+                &[
+                    awdl::Tlv {
+                        kind: 4,
+                        value: &timing,
+                    },
+                    election_v2_tlv(50, 200),
+                    version_tlv(0x34, 1),
+                ],
+                1_000_000,
+            );
             assert_eq!(state.election.sync_addr, master);
             assert!(state.has_master_sync());
             assert_eq!(state.sync.current_aw(1_000_000), 58434);
@@ -5343,9 +5463,15 @@ pub mod state {
             assert!(state.last_sync_error_tu.is_some());
             // An unrelated frame cannot duplicate this alignment sample.
             let clock = state.sync;
-            state.apply_action([2, 0, 0, 0, 0, 9], mif(), &[
-                awdl::Tlv { kind: 4, value: &timing },
-            ], 1_001_000);
+            state.apply_action(
+                [2, 0, 0, 0, 0, 9],
+                mif(),
+                &[awdl::Tlv {
+                    kind: 4,
+                    value: &timing,
+                }],
+                1_001_000,
+            );
             assert_eq!(state.sync, clock);
             assert!(state.last_sync_error_tu.is_none());
         }
@@ -5358,28 +5484,52 @@ pub mod state {
             let mut timing = [0; 31];
             timing[1..3].copy_from_slice(&20u16.to_le_bytes());
             timing[29..31].copy_from_slice(&18u16.to_le_bytes());
-            state.apply_action(first, mif(), &[
-                election_v2_tlv_for(first, 50, 200), version_tlv(0x34, 1),
-                awdl::Tlv { kind: 4, value: &timing },
-            ], 1_000_000);
+            state.apply_action(
+                first,
+                mif(),
+                &[
+                    election_v2_tlv_for(first, 50, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv {
+                        kind: 4,
+                        value: &timing,
+                    },
+                ],
+                1_000_000,
+            );
             assert!(state.has_master_sync());
             let clock = state.sync;
-            state.apply_action(second, mif(), &[
-                election_v2_tlv_for(second, 60, 200), version_tlv(0x34, 1),
-            ], 1_001_000);
+            state.apply_action(
+                second,
+                mif(),
+                &[election_v2_tlv_for(second, 60, 200), version_tlv(0x34, 1)],
+                1_001_000,
+            );
             assert_eq!(state.election.sync_addr, second);
             assert!(!state.has_master_sync());
             timing[1..3].copy_from_slice(&65u16.to_le_bytes());
-            state.apply_action(second, mif(), &[
-                awdl::Tlv { kind: 4, value: &timing },
-            ], 1_002_000);
+            state.apply_action(
+                second,
+                mif(),
+                &[awdl::Tlv {
+                    kind: 4,
+                    value: &timing,
+                }],
+                1_002_000,
+            );
             assert_eq!(state.sync, clock);
             assert!(!state.has_master_sync());
             assert!(state.last_sync_error_tu.is_none());
             timing[1..3].copy_from_slice(&20u16.to_le_bytes());
-            state.apply_action(second, mif(), &[
-                awdl::Tlv { kind: 4, value: &timing },
-            ], 1_003_000);
+            state.apply_action(
+                second,
+                mif(),
+                &[awdl::Tlv {
+                    kind: 4,
+                    value: &timing,
+                }],
+                1_003_000,
+            );
             assert!(state.has_master_sync());
             state.clean_peers(4_000_000);
             assert!(!state.has_master_sync());
@@ -5391,10 +5541,7 @@ pub mod state {
             let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
             // peer advertises a high master counter; needs version+devclass+mif
             // to become valid before election will adopt it.
-            let tlvs = vec![
-                election_v2_tlv(50, 200),
-                version_tlv(0x34, 1),
-            ];
+            let tlvs = vec![election_v2_tlv(50, 200), version_tlv(0x34, 1)];
             state.apply_action(peer_addr, mif(), &tlvs, 1_100_000);
 
             let peer = state.peers.get(&peer_addr).unwrap();
@@ -5448,9 +5595,20 @@ pub mod state {
             let mut sync_val = vec![0u8; 31];
             sync_val[1..3].copy_from_slice(&10u16.to_le_bytes());
             sync_val[29..31].copy_from_slice(&16u16.to_le_bytes());
-            let non_master_tlv = awdl::Tlv { kind: 4, value: sync_val.leak() };
-            state.apply_action(other_addr, mif(), std::slice::from_ref(&non_master_tlv), 1_200_000);
-            assert_eq!(state.sync.aw_counter, aw_counter_before, "non-master must not move sync");
+            let non_master_tlv = awdl::Tlv {
+                kind: 4,
+                value: sync_val.leak(),
+            };
+            state.apply_action(
+                other_addr,
+                mif(),
+                std::slice::from_ref(&non_master_tlv),
+                1_200_000,
+            );
+            assert_eq!(
+                state.sync.aw_counter, aw_counter_before,
+                "non-master must not move sync"
+            );
         }
 
         #[test]
@@ -5508,15 +5666,17 @@ pub mod state {
             let tlvs = vec![
                 election_v2_tlv(50, 200),
                 version_tlv(0x34, 1),
-                awdl::Tlv { kind: 18, value: &chanseq_val },
+                awdl::Tlv {
+                    kind: 18,
+                    value: &chanseq_val,
+                },
             ];
             state.apply_action(peer_addr, mif(), &tlvs, 1_000);
 
             // filin should have adopted the master's sequence. The master
             // advertised 8x149 + 8x6; social coverage injected the missing
             // social channel 44. All three social channels are present.
-            let chans: Vec<u8> =
-                state.channel_sequence.iter().map(|s| s[0]).collect();
+            let chans: Vec<u8> = state.channel_sequence.iter().map(|s| s[0]).collect();
             assert!(chans.contains(&149), "149 from master");
             assert!(chans.contains(&6), "6 from master");
             assert!(chans.contains(&44), "44 injected by social coverage");
@@ -5536,7 +5696,10 @@ pub mod state {
             let tlvs = vec![
                 election_v2_tlv(50, 200),
                 version_tlv(0x34, 1),
-                awdl::Tlv { kind: 18, value: &chanseq_val },
+                awdl::Tlv {
+                    kind: 18,
+                    value: &chanseq_val,
+                },
             ];
             state.apply_action(peer_addr, mif(), &tlvs, 1_000);
             // 149 present after adoption (social coverage injects 6/44 but
@@ -5568,7 +5731,10 @@ pub mod state {
             let tlvs = vec![
                 election_v2_tlv(50, 200),
                 version_tlv(0x34, 1),
-                awdl::Tlv { kind: 18, value: &chanseq_val },
+                awdl::Tlv {
+                    kind: 18,
+                    value: &chanseq_val,
+                },
             ];
             state.apply_action(peer_addr, mif(), &tlvs, 1_000);
             // Real channels — NOT the 0xa4 flags byte (164) — and all three
@@ -5576,8 +5742,7 @@ pub mod state {
             for slot in &state.channel_sequence {
                 assert_ne!(slot[0], 0xa4, "no flags bytes in channel sequence");
             }
-            let chans: Vec<u8> =
-                state.channel_sequence.iter().map(|s| s[0]).collect();
+            let chans: Vec<u8> = state.channel_sequence.iter().map(|s| s[0]).collect();
             assert!(chans.contains(&44));
             assert!(chans.contains(&149));
             assert!(chans.contains(&6));
@@ -5601,7 +5766,10 @@ pub mod state {
                 &[
                     election_v2_tlv_for(peer_a, 50, 200),
                     version_tlv(0x34, 1),
-                    awdl::Tlv { kind: 18, value: &chan_a },
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &chan_a,
+                    },
                 ],
                 1_000,
             );
@@ -5609,7 +5777,12 @@ pub mod state {
             // A's chanseq (16x149 → social coverage injects 6/44); 149
             // remains dominant (14 slots).
             assert!(
-                state.channel_sequence.iter().filter(|s| s[0] == 149).count() >= 14,
+                state
+                    .channel_sequence
+                    .iter()
+                    .filter(|s| s[0] == 149)
+                    .count()
+                    >= 14,
                 "A's chanseq must be in place"
             );
 
@@ -5622,13 +5795,21 @@ pub mod state {
                 &[
                     election_v2_tlv_for(peer_b, 60, 200),
                     version_tlv(0x34, 1),
-                    awdl::Tlv { kind: 18, value: &chan_b },
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &chan_b,
+                    },
                 ],
                 2_000,
             );
             assert_eq!(state.committed_master, peer_a, "single frame must not flip");
             assert!(
-                state.channel_sequence.iter().filter(|s| s[0] == 149).count() >= 14,
+                state
+                    .channel_sequence
+                    .iter()
+                    .filter(|s| s[0] == 149)
+                    .count()
+                    >= 14,
                 "chanseq must stay A's"
             );
 
@@ -5640,7 +5821,10 @@ pub mod state {
                 &[
                     election_v2_tlv_for(peer_b, 60, 200),
                     version_tlv(0x34, 1),
-                    awdl::Tlv { kind: 18, value: &chan_b },
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &chan_b,
+                    },
                 ],
                 now,
             );
@@ -5672,7 +5856,10 @@ pub mod state {
                 &[
                     election_v2_tlv_for(peer_a, 50, 200),
                     version_tlv(0x34, 1),
-                    awdl::Tlv { kind: 18, value: &chan_a },
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &chan_a,
+                    },
                 ],
                 1_000,
             );
@@ -5696,7 +5883,10 @@ pub mod state {
                 &[
                     election_v2_tlv_for(peer_b, 60, 200),
                     version_tlv(0x34, 1),
-                    awdl::Tlv { kind: 18, value: &chan_b },
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &chan_b,
+                    },
                 ],
                 1_100,
             );
@@ -5787,7 +5977,10 @@ pub mod state {
                 peer.sequence[0] = [52, 0x80]; // No-IR anchor
             }
             let ch = state.park_channel();
-            assert!(!crate::channel::is_no_ir_channel(ch), "must not park on No-IR ch{ch}");
+            assert!(
+                !crate::channel::is_no_ir_channel(ch),
+                "must not park on No-IR ch{ch}"
+            );
             assert_eq!(ch, 44); // falls back to the TX-capable configured anchor
         }
 
@@ -5831,7 +6024,10 @@ pub mod state {
             v[20..24].copy_from_slice(&200u32.to_le_bytes());
             v[24..28].copy_from_slice(&200u32.to_le_bytes());
             v[36..40].copy_from_slice(&0u32.to_le_bytes());
-            awdl::Tlv { kind: 24, value: v.leak() }
+            awdl::Tlv {
+                kind: 24,
+                value: v.leak(),
+            }
         }
 
         fn chanseq_tlv(slot0: u8) -> awdl::Tlv<'static> {
@@ -5840,7 +6036,10 @@ pub mod state {
             for _ in 0..16 {
                 v.extend_from_slice(&[slot0, 0x80]);
             }
-            awdl::Tlv { kind: 18, value: v.leak() }
+            awdl::Tlv {
+                kind: 18,
+                value: v.leak(),
+            }
         }
 
         #[test]
@@ -5895,7 +6094,11 @@ pub mod state {
             // after social coverage), not 149. If the sequence were frozen at
             // A's, 149 would dominate instead — that's the regression.
             let count_6 = state.channel_sequence.iter().filter(|s| s[0] == 6).count();
-            let count_149 = state.channel_sequence.iter().filter(|s| s[0] == 149).count();
+            let count_149 = state
+                .channel_sequence
+                .iter()
+                .filter(|s| s[0] == 149)
+                .count();
             assert!(
                 count_6 > count_149,
                 "6 must dominate after re-adopting B (6:{} vs 149:{}), \
@@ -5932,7 +6135,10 @@ pub mod state {
             // master_addr stable.
             state.election.sync_addr = [0x02, 0xdd, 0, 0, 0, 2]; // parent B
             let t2 = state.note_election_transitions();
-            assert!(!t2.master_addr_changed, "top master stable across re-parent");
+            assert!(
+                !t2.master_addr_changed,
+                "top master stable across re-parent"
+            );
             assert!(t2.sync_addr_changed, "parent changed on re-parent");
         }
 
@@ -6231,7 +6437,11 @@ pub mod runtime {
                 "nmcli 'managed no' non-zero (NetworkManager may be absent)"
             ),
             Err(e) => {
-                tracing::debug!(iface, ?e, "could not run nmcli (NetworkManager not installed?)")
+                tracing::debug!(
+                    iface,
+                    ?e,
+                    "could not run nmcli (NetworkManager not installed?)"
+                )
             }
         }
     }
@@ -6490,22 +6700,30 @@ pub mod runtime {
         home_channel: u8,
         frequency: u32,
         home_frequency: u32,
-        sequence: [[u8; 2]; 16],
         held: bool,
         next_request_us: u64,
     }
 
     impl RocCapture {
         fn open(tx: &Injector, home_channel: u8) -> Result<Option<Self>, Error> {
-            let Ok(value) = std::env::var("FILIN_ROC_CHANNEL") else { return Ok(None); };
+            let Ok(value) = std::env::var("FILIN_ROC_CHANNEL") else {
+                return Ok(None);
+            };
             let roc_channel: u8 = value.parse().map_err(|_| Error::Channel)?;
-            if !matches!(roc_channel, 6 | 44 | 149) { return Err(Error::Channel); }
-            let Injector::MgmtTx(tx) = tx else { return Err(Error::MgmtTx); };
-            let hold = std::fs::OpenOptions::new().write(true)
+            if !matches!(roc_channel, 6 | 44 | 149) {
+                return Err(Error::Channel);
+            }
+            let Injector::MgmtTx(tx) = tx else {
+                return Err(Error::MgmtTx);
+            };
+            let hold = std::fs::OpenOptions::new()
+                .write(true)
                 .open("/sys/module/kiwi_v2/parameters/marionette_awdl_capture_hold")
                 .map_err(|_| Error::Io)?;
             tx.enable_roc();
-            let frequency = u32::from(channel::channel_to_frequency_mhz(u16::from(roc_channel)).ok_or(Error::Channel)?);
+            let frequency = u32::from(
+                channel::channel_to_frequency_mhz(u16::from(roc_channel)).ok_or(Error::Channel)?,
+            );
             // Only follow a home channel we can actually radiate on; otherwise
             // fall back to the pure ROC 3-of-4 duty.
             let home_channel = if home_channel != 0
@@ -6515,41 +6733,68 @@ pub mod runtime {
             } else {
                 roc_channel
             };
-            let home_frequency = u32::from(channel::channel_to_frequency_mhz(u16::from(home_channel)).unwrap_or(0));
-            let sequence = crate::roc::sequence(roc_channel, home_channel);
-            Ok(Some(Self { hold, roc_channel, home_channel, frequency, home_frequency, sequence,
-                held: false, next_request_us: 0 }))
+            let home_frequency =
+                u32::from(channel::channel_to_frequency_mhz(u16::from(home_channel)).unwrap_or(0));
+            Ok(Some(Self {
+                hold,
+                roc_channel,
+                home_channel,
+                frequency,
+                home_frequency,
+                held: false,
+                next_request_us: 0,
+            }))
         }
 
         fn set_hold(&mut self, held: bool) -> Result<(), Error> {
             if self.held != held {
                 use std::io::{Seek, SeekFrom};
                 self.hold.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
-                self.hold.write_all(if held { b"1\n" } else { b"0\n" }).map_err(|_| Error::Io)?;
+                self.hold
+                    .write_all(if held { b"1\n" } else { b"0\n" })
+                    .map_err(|_| Error::Io)?;
                 self.held = held;
-                tracing::debug!(held, roc_channel = self.roc_channel, home_channel = self.home_channel, "ROC capture transition");
+                tracing::debug!(
+                    held,
+                    roc_channel = self.roc_channel,
+                    home_channel = self.home_channel,
+                    "ROC capture transition"
+                );
             }
             Ok(())
         }
 
-        fn tick(&mut self, injector: &Injector, sync: &crate::sync::SyncState, now_us: u64) -> Result<u8, Error> {
-            let Injector::MgmtTx(tx) = injector else { return Err(Error::MgmtTx); };
+        fn tick(
+            &mut self,
+            injector: &Injector,
+            sync: &crate::sync::SyncState,
+            sequence: &[[u8; 2]; 16],
+            now_us: u64,
+        ) -> Result<u8, Error> {
+            let Injector::MgmtTx(tx) = injector else {
+                return Err(Error::MgmtTx);
+            };
             let slot = usize::from(sync.current_eaw(now_us) % 16);
-            let slot_channel = self.sequence[slot][0];
+            let slot_channel =
+                crate::roc::capture_channel(sequence, slot, self.roc_channel, self.home_channel);
             // Drop the ROC dwell as soon as the current slot is no longer the
             // ROC social channel (home slot, null slot, or reservation expiry).
             if tx.roc_finished() || (tx.roc_pending() && slot_channel != self.roc_channel) {
                 self.set_hold(false)?;
                 tx.cancel_roc();
                 tx.set_home_freq(None);
-                // Give STA a real home-channel interval before another dwell.
-                self.next_request_us = now_us.saturating_add(20_000);
+                // Re-acquire immediately: every millisecond outside the ROC
+                // is a frame the peer may have to retransmit.
+                self.next_request_us = now_us;
             }
             if slot_channel == 0 {
+                // An unavailable/null slot must not grant TX permission.
+                // All-social null continuation was resolved above, and still
+                // goes through reservation/READY validation below.
                 tx.set_home_freq(None);
                 return Ok(0);
             }
-            if slot_channel == self.home_channel {
+            if slot_channel == self.home_channel && slot_channel != self.roc_channel {
                 // STA-owned home channel: keep capture on and permit TX there.
                 tx.set_home_freq(Some(self.home_frequency));
                 self.set_hold(true)?;
@@ -6557,16 +6802,32 @@ pub mod runtime {
             }
             // ROC social-channel slot.
             tx.set_home_freq(None);
-            let remaining_us = crate::roc::remaining_slot_us(&self.sequence, sync, self.roc_channel, now_us);
-            if !tx.roc_pending() && now_us >= self.next_request_us && remaining_us > 40_000 {
+            if !tx.roc_pending() && now_us >= self.next_request_us {
                 self.set_hold(false)?;
-                if let Err(err) = tx.start_roc(self.frequency, (remaining_us / 1000).min(200) as u32) {
+                // Request a long dwell. The driver needs about 100-120 ms
+                // from the request to its READY event, which is longer than
+                // the 65 ms EAW; a dwell sized to the current slot run expires
+                // just as capture begins and the re-acquisition leaves the
+                // radio deaf for most of every cycle (measured 2026-11-05:
+                // ~9 hold transitions/s, sender /Ask body never arrived).
+                //
+                // The 200 ms clamp was our own driver code, not a firmware
+                // limit: wiphy advertises 2000 ms and the 0045 experiment
+                // measured a 2 s station ROC with 0 % packet loss (latency
+                // 14 ms -> 52 ms). Driver 0059 raises that clamp to 2000 ms;
+                // ask for 1800 ms to stay under the wiphy maximum.
+                if let Err(err) = tx.start_roc(self.frequency, 1800) {
                     tracing::warn!(?err, "ROC request failed");
                     self.next_request_us = now_us.saturating_add(500_000);
                 }
                 return Ok(0);
             }
-            let active = remaining_us > 10_000 && tx.roc_pending() && tx.roc_frequency() == Some(self.frequency);
+            // Hold capture for as long as the reservation is actually valid.
+            // Do not re-derive this from the slot-run deadline: that expires
+            // early and releases the radio while the ROC is still usable.
+            let active = tx.roc_pending()
+                && !tx.roc_finished()
+                && tx.roc_frequency() == Some(self.frequency);
             self.set_hold(active)?;
             Ok(if active { self.roc_channel } else { 0 })
         }
@@ -6613,10 +6874,17 @@ pub mod runtime {
         }
         let home_channel = links.anchor_channel as u8;
         let mut roc_capture = RocCapture::open(&links.tx, home_channel)?;
-        let roc_channel = roc_capture.as_ref().map(|r| match r.frequency { 2437 => 6, 5220 => 44, _ => 149 });
-        if let Some(ch) = roc_channel { awdl_state.constrain_roc_schedule(ch, home_channel); }
+        let roc_channel = roc_capture.as_ref().map(|r| match r.frequency {
+            2437 => 6,
+            5220 => 44,
+            _ => 149,
+        });
+        if let Some(ch) = roc_channel {
+            awdl_state.constrain_roc_schedule(ch);
+        }
         let mut announce = AnnounceScheduler::new(host_time_us());
-        let mut wlan_buf = vec![0u8; 4096];
+        // The sink can deliver a full non-linear MPDU, plus radiotap.
+        let mut wlan_buf = vec![0u8; 65535 + 256];
         let mut tap_buf = vec![0u8; 2048];
         // A peer may never visit the station-owned channel. Keep bounded,
         // independent backlogs so it cannot stop TAP discovery/other peers.
@@ -6682,6 +6950,7 @@ pub mod runtime {
         // write happens at most every 100 ms — cheap, never blocks the loop.
         let mut last_refresh_us: u64 = 0;
         const REFRESH_PERIOD_US: u64 = 100_000;
+        let mut last_tx_queue_report_us = host_time_us();
 
         // Consecutive iterations the monitor socket has reported POLLERR/POLLHUP
         // without POLLIN. Reset to 0 on any successful POLLIN read; used to
@@ -6728,7 +6997,8 @@ pub mod runtime {
             //     anchor) on the throttled cadence; update_channel below then
             //     only fires when it actually changes. AW timing is kept so
             //     announces still transmit during availability windows. ---
-            if park && links.owns_radio && now_us.wrapping_sub(last_refresh_us) >= REFRESH_PERIOD_US {
+            if park && links.owns_radio && now_us.wrapping_sub(last_refresh_us) >= REFRESH_PERIOD_US
+            {
                 let desired_park = awdl_state.park_channel();
                 if current_park != Some(desired_park) {
                     tracing::info!(park_channel = desired_park, "park channel (re)selected");
@@ -6745,8 +7015,12 @@ pub mod runtime {
                     }
                 }
                 let tsf_offset_us = bridge.offset_us().unwrap_or(0);
-                introspect
-                    .set_status(build_status_snapshot(&awdl_state, last_injected_seq, tsf_offset_us, now_us));
+                introspect.set_status(build_status_snapshot(
+                    &awdl_state,
+                    last_injected_seq,
+                    tsf_offset_us,
+                    now_us,
+                ));
                 introspect.set_peers(build_peer_views(&awdl_state, now_us));
                 last_refresh_us = now_us;
             }
@@ -6772,11 +7046,9 @@ pub mod runtime {
                                 slot = awdl_state.sync.current_eaw(now_us) % 16,
                                 "switched monitor channel"
                             ),
-                            Err(err) => tracing::warn!(
-                                ?err,
-                                channel,
-                                "failed to switch monitor channel"
-                            ),
+                            Err(err) => {
+                                tracing::warn!(?err, channel, "failed to switch monitor channel")
+                            }
                         }
                     }
                 }
@@ -6786,7 +7058,12 @@ pub mod runtime {
                 // tick returns the channel the radio is treated as being on for
                 // this EAW slot: the ROC social channel, the STA home channel,
                 // or 0 for the null slot. TX gating keys off this value.
-                let channel = capture.tick(&links.tx, &awdl_state.sync, host_time_us())?;
+                let channel = capture.tick(
+                    &links.tx,
+                    &awdl_state.sync,
+                    &awdl_state.channel_sequence,
+                    host_time_us(),
+                )?;
                 awdl_state.current_channel = channel;
             }
 
@@ -6803,8 +7080,7 @@ pub mod runtime {
                 // FILIN_NEIGHBOR_TABLE.md: evict neighbor entries for peers
                 // no longer in the table. `removed` is the MACs dropped this
                 // cycle; live_macs is everyone still present.
-                let live_macs: Vec<[u8; 6]> =
-                    awdl_state.peers.iter().map(|p| p.addr).collect();
+                let live_macs: Vec<[u8; 6]> = awdl_state.peers.iter().map(|p| p.addr).collect();
                 for change in neighbor_table.evict_stale(&live_macs) {
                     if let crate::state::NeighborChange::Remove(mac, ipv6) = change {
                         if let Err(err) = os::rtnl::remove_neighbor(&host_iface, ipv6) {
@@ -6830,25 +7106,28 @@ pub mod runtime {
             //     distinct channel as filin hops through the master cycle
             //     (owl awdl_send_multicast, core.c:246-277, extended). ---
             if !mcast_spread.is_empty() {
-                drain_mcast_spread(
-                    &links,
-                    &awdl_state,
-                    &mut mcast_spread,
-                    now_us,
-                    &introspect,
-                );
+                drain_mcast_spread(&links, &awdl_state, &mut mcast_spread, now_us, &introspect);
             }
 
             // DATA can precede the Action establishing its source by a few
             // milliseconds. Only an Action-confirmed peer releases the queue.
             for pending in pending_rx.ready(now_us, |source| {
-                awdl_state.peers.get(source).is_some_and(|peer| peer.is_valid)
+                awdl_state
+                    .peers
+                    .get(source)
+                    .is_some_and(|peer| peer.is_valid)
             }) {
                 tracing::debug!(source = ?pending.delivery.source,
                     delay_us = now_us.saturating_sub(pending.received_us),
                     "released unicast after peer Action");
-                deliver_rx(&mut links, &mut awdl_state, &introspect,
-                    pending.delivery, pending.channel, now_us)?;
+                deliver_rx(
+                    &mut links,
+                    &mut awdl_state,
+                    &introspect,
+                    pending.delivery,
+                    pending.channel,
+                    now_us,
+                )?;
             }
 
             // --- Part A: re-broadcast the cached mDNS announce on every
@@ -6863,12 +7142,20 @@ pub mod runtime {
                 )
                 .is_none()
             {
-                rebroadcast_announce(&links, &awdl_state, &mut announce_cache, now_us, &introspect);
+                rebroadcast_announce(
+                    &links,
+                    &awdl_state,
+                    &mut announce_cache,
+                    now_us,
+                    &introspect,
+                );
             }
 
             // --- action frame TX: PSF/MIF (owl awdl_send_psf/mif) ---
             for subtype in announce.due(now_us, &awdl_state) {
-                if roc_capture.is_some() && awdl_state.current_channel == 0 { continue; }
+                if roc_capture.is_some() && awdl_state.current_channel == 0 {
+                    continue;
+                }
                 let seq = awdl_state.next_data_seq();
                 let frame = build_announce_frame(subtype, &awdl_state, seq << 4, now_us);
                 match links.tx.send(&frame) {
@@ -6898,6 +7185,25 @@ pub mod runtime {
                 outcome
             });
 
+            let report_now = host_time_us();
+            if report_now.saturating_sub(last_tx_queue_report_us) >= 5_000_000 {
+                let stats = pending_tx.take_stats();
+                if stats.enqueued > 0
+                    || stats.rejected > 0
+                    || stats.expired > 0
+                    || stats.sent > 0
+                    || stats.dropped > 0
+                    || stats.queued > 0
+                {
+                    tracing::debug!(
+                        ?stats,
+                        channel = awdl_state.current_channel,
+                        "unicast TX queue interval (sent means injector acceptance, not OTA ACK)"
+                    );
+                }
+                last_tx_queue_report_us = report_now;
+            }
+
             let mut fds = [
                 libc::pollfd {
                     fd: links.packet.as_raw_fd(),
@@ -6911,7 +7217,11 @@ pub mod runtime {
                 },
             ];
             let poll_timeout_ms = announce.poll_timeout_ms(host_time_us());
-            let poll_timeout_ms = if roc_capture.is_some() { poll_timeout_ms.min(5) } else { poll_timeout_ms };
+            let poll_timeout_ms = if roc_capture.is_some() {
+                poll_timeout_ms.min(5)
+            } else {
+                poll_timeout_ms
+            };
             // SAFETY: fds points to two valid pollfd entries for the duration of the call.
             let rc =
                 unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout_ms) };
@@ -6948,122 +7258,133 @@ pub mod runtime {
                                 };
                                 if rssi_ok && src != links.self_addr {
                                     awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
-                                // FILIN_NEIGHBOR_TABLE.md: install a static
-                                // neighbor entry for this peer so unicast
-                                // awdl0 connections work. AWDL does not use
-                                // NDP — derive IPv6 from MAC (RFC 4291) and
-                                // add to the kernel neighbor table. (Self-sourced
-                                // monitor reflections are excluded above so we
-                                // never install a neighbor for our own MAC.)
-                                match neighbor_table.note_peer_seen(&src) {
-                                    crate::state::NeighborChange::Add(mac, ipv6) => {
-                                        if let Err(err) =
-                                            os::rtnl::add_neighbor(&host_iface, ipv6, mac)
-                                        {
-                                            tracing::warn!(
+                                    // FILIN_NEIGHBOR_TABLE.md: install a static
+                                    // neighbor entry for this peer so unicast
+                                    // awdl0 connections work. AWDL does not use
+                                    // NDP — derive IPv6 from MAC (RFC 4291) and
+                                    // add to the kernel neighbor table. (Self-sourced
+                                    // monitor reflections are excluded above so we
+                                    // never install a neighbor for our own MAC.)
+                                    match neighbor_table.note_peer_seen(&src) {
+                                        crate::state::NeighborChange::Add(mac, ipv6) => {
+                                            if let Err(err) =
+                                                os::rtnl::add_neighbor(&host_iface, ipv6, mac)
+                                            {
+                                                tracing::warn!(
                                                 ?err,
                                                 ?mac,
                                                 "neighbor add failed; unicast to this peer may fail"
                                             );
-                                        } else {
-                                            tracing::debug!(
-                                                mac = %crate::introspect::mac_string(mac),
-                                                "installed neighbor entry for peer"
-                                            );
+                                            } else {
+                                                tracing::debug!(
+                                                    mac = %crate::introspect::mac_string(mac),
+                                                    "installed neighbor entry for peer"
+                                                );
+                                            }
                                         }
+                                        crate::state::NeighborChange::NoChange => {}
+                                        crate::state::NeighborChange::Remove(_, _) => {}
                                     }
-                                    crate::state::NeighborChange::NoChange => {}
-                                    crate::state::NeighborChange::Remove(_, _) => {}
-                                }
-                                // FILIN_SYNC_QUALITY.md Part A: detect
-                                // master_addr vs sync_addr transitions so
-                                // /status can prove whether the cluster top
-                                // master is stable while we re-parent.
-                                let t = awdl_state.note_election_transitions();
-                                if t.master_addr_changed {
-                                    introspect.counters.inc_master_addr_change();
-                                    introspect
-                                        .counters
-                                        .push_master_mac(crate::introspect::mac_string(
-                                            awdl_state.election.master_addr,
-                                        ));
-                                }
-                                if t.sync_addr_changed {
-                                    introspect.counters.inc_sync_addr_change();
-                                    introspect.counters.inc_master_change();
-                                }
-                                // AW alignment sample: aligned iff the last
-                                // sync error was within ~1 EAW guard band.
-                                if let Some(err_tu) = awdl_state.last_sync_error_tu {
-                                    introspect
-                                        .counters
-                                        .record_aw_check(err_tu.abs() <= AW_ALIGN_TOLERANCE_TU);
-                                }
-                                tracing::trace!(
-                                    rx_time_us,
-                                    rssi_dbm,
-                                    tlv_count,
-                                    master = ?awdl_state.election.master_addr,
-                                    peers = awdl_state.peers.len(),
-                                    channel = awdl_state.current_channel,
-                                    "rx awdl action frame"
-                                );
-                                } // end rssi_ok
-                            }
-                            Err(err) => match crate::data_rx::decode(&wlan_buf[..len], links.self_addr) {
-                                Ok(delivery) => {
-                                    let source = delivery.source;
-                                    let channel = awdl_state.current_channel;
-                                    if awdl_state.peers.get(&source).is_none() {
-                                        let queued = pending_rx.push(delivery, channel, now_us);
-                                        tracing::trace!(?source, queued,
-                                            "unicast waiting for peer Action");
-                                    } else {
-                                        deliver_rx(&mut links, &mut awdl_state, &introspect,
-                                            delivery, channel, now_us)?;
-                                    }
-                                }
-                                Err(data_err) => {
-                                    if let Some(pcap) = links.pcap.as_mut() {
-                                        if let Err(err) =
-                                            pcap.write_packet(now_us, &wlan_buf[..len])
-                                        {
-                                            tracing::trace!(
-                                                ?err,
-                                                "pcap ignored-frame write failed"
-                                            );
-                                        }
-                                    }
-                                    let ieee80211_preview =
-                                        ieee80211_payload_preview(&wlan_buf[..len]);
-                                    // Everything above is per-frame noise, but a
-                                    // frame that parses as AWDL data and then
-                                    // fails to decapsulate is not noise: the
-                                    // driver handed us an upload frame and we
-                                    // dropped it, so the sender only sees
-                                    // retransmissions. That failure used to be
-                                    // trace-only, which made a stalled transfer
-                                    // look like "the Mac never sent anything".
-                                    if matches!(
-                                        data_err,
-                                        crate::data_rx::Error::Payload(_)
-                                            | crate::data_rx::Error::Fcs(_)
-                                    ) {
-                                        tracing::debug!(
-                                            ?data_err,
-                                            len,
-                                            %ieee80211_preview,
-                                            "AWDL data frame dropped before the host TAP"
+                                    // FILIN_SYNC_QUALITY.md Part A: detect
+                                    // master_addr vs sync_addr transitions so
+                                    // /status can prove whether the cluster top
+                                    // master is stable while we re-parent.
+                                    let t = awdl_state.note_election_transitions();
+                                    if t.master_addr_changed {
+                                        introspect.counters.inc_master_addr_change();
+                                        introspect.counters.push_master_mac(
+                                            crate::introspect::mac_string(
+                                                awdl_state.election.master_addr,
+                                            ),
                                         );
                                     }
+                                    if t.sync_addr_changed {
+                                        introspect.counters.inc_sync_addr_change();
+                                        introspect.counters.inc_master_change();
+                                    }
+                                    // AW alignment sample: aligned iff the last
+                                    // sync error was within ~1 EAW guard band.
+                                    if let Some(err_tu) = awdl_state.last_sync_error_tu {
+                                        introspect
+                                            .counters
+                                            .record_aw_check(err_tu.abs() <= AW_ALIGN_TOLERANCE_TU);
+                                    }
                                     tracing::trace!(
-                                        ?err,
-                                        ?data_err,
-                                        %ieee80211_preview,
-                                        "ignored wlan frame"
+                                        rx_time_us,
+                                        rssi_dbm,
+                                        tlv_count,
+                                        master = ?awdl_state.election.master_addr,
+                                        peers = awdl_state.peers.len(),
+                                        channel = awdl_state.current_channel,
+                                        "rx awdl action frame"
                                     );
+                                } // end rssi_ok
+                            }
+                            Err(err) => {
+                                match crate::data_rx::decode(&wlan_buf[..len], links.self_addr) {
+                                    Ok(delivery) => {
+                                        let source = delivery.source;
+                                        let channel = awdl_state.current_channel;
+                                        if awdl_state.peers.get(&source).is_none() {
+                                            let queued = pending_rx.push(delivery, channel, now_us);
+                                            tracing::trace!(
+                                                ?source,
+                                                queued,
+                                                "unicast waiting for peer Action"
+                                            );
+                                        } else {
+                                            deliver_rx(
+                                                &mut links,
+                                                &mut awdl_state,
+                                                &introspect,
+                                                delivery,
+                                                channel,
+                                                now_us,
+                                            )?;
+                                        }
+                                    }
+                                    Err(data_err) => {
+                                        if let Some(pcap) = links.pcap.as_mut() {
+                                            if let Err(err) =
+                                                pcap.write_packet(now_us, &wlan_buf[..len])
+                                            {
+                                                tracing::trace!(
+                                                    ?err,
+                                                    "pcap ignored-frame write failed"
+                                                );
+                                            }
+                                        }
+                                        let ieee80211_preview =
+                                            ieee80211_payload_preview(&wlan_buf[..len]);
+                                        // Everything above is per-frame noise, but a
+                                        // frame that parses as AWDL data and then
+                                        // fails to decapsulate is not noise: the
+                                        // driver handed us an upload frame and we
+                                        // dropped it, so the sender only sees
+                                        // retransmissions. That failure used to be
+                                        // trace-only, which made a stalled transfer
+                                        // look like "the Mac never sent anything".
+                                        if matches!(
+                                            data_err,
+                                            crate::data_rx::Error::Payload(_)
+                                                | crate::data_rx::Error::Fcs(_)
+                                        ) {
+                                            tracing::debug!(
+                                                ?data_err,
+                                                len,
+                                                %ieee80211_preview,
+                                                "AWDL data frame dropped before the host TAP"
+                                            );
+                                        }
+                                        tracing::trace!(
+                                            ?err,
+                                            ?data_err,
+                                            %ieee80211_preview,
+                                            "ignored wlan frame"
+                                        );
+                                    }
                                 }
-                            },
+                            }
                         }
                     }
                     Err(err) => tracing::trace!(?err, "packet recv failed"),
@@ -7204,16 +7525,22 @@ pub mod runtime {
     ) -> Result<(), Error> {
         for frame in &delivery.frames {
             if let Some(is_self) = classify_mdns(&frame.bytes, links.self_addr) {
-                if is_self { introspect.counters.inc_mdns_rx_self(); }
-                else { introspect.counters.inc_mdns_rx_other(); }
+                if is_self {
+                    introspect.counters.inc_mdns_rx_self();
+                } else {
+                    introspect.counters.inc_mdns_rx_other();
+                }
             }
             links.tap.write_all(&frame.bytes).map_err(|_| Error::Io)?;
         }
         if delivery.unicast {
             state.note_unicast_rx(delivery.source, channel, now_us);
         }
-        tracing::trace!(count = delivery.frames.len(), channel,
-            "wrote ethernet frame(s) to tap");
+        tracing::trace!(
+            count = delivery.frames.len(),
+            channel,
+            "wrote ethernet frame(s) to tap"
+        );
         Ok(())
     }
 
@@ -7232,7 +7559,7 @@ pub mod runtime {
         let decision = crate::schedule::data_send_decision(
             &frame.dst,
             awdl_state.current_channel,
-            &awdl_state.channel_sequence,
+            &awdl_state.tx_channel_sequence(),
             &awdl_state.peers,
             &awdl_state.sync,
             now_us,
@@ -7319,7 +7646,8 @@ pub mod runtime {
             &awdl_state.sync,
             now_us,
             crate::schedule::MULTICAST_GUARD_TU,
-        ) != 0 {
+        ) != 0
+        {
             return; // inside multicast guard; retry next iteration
         }
         for frame in spread.drain_for_channel(channel, now_us) {
@@ -7357,7 +7685,8 @@ pub mod runtime {
             &awdl_state.sync,
             now_us,
             crate::schedule::MULTICAST_GUARD_TU,
-        ) != 0 {
+        ) != 0
+        {
             return; // inside multicast guard; retry next iteration
         }
         // Adaptive allowed set: social channels PLUS the adopted master's
@@ -7469,8 +7798,7 @@ pub mod runtime {
         ) -> Vec<awdl::ActionSubtype> {
             let mut due = Vec::new();
             if now_us >= self.next_mif_us {
-                let slot =
-                    usize::from(awdl_state.sync.current_eaw(now_us) % 16);
+                let slot = usize::from(awdl_state.sync.current_eaw(now_us) % 16);
                 let channel = crate::schedule::slot_channel(&awdl_state.channel_sequence, slot);
                 if channel > 0 {
                     due.push(awdl::ActionSubtype::Mif);
@@ -7542,8 +7870,9 @@ pub mod runtime {
             time_to_next_aw_tu: awdl_state.sync.next_aw_tu(now_us),
             master_counter: awdl_state.election.master_counter,
         };
-        let mut frame = crate::announce_template::build_link_announcement(subtype, &identity, &timing)
-            .expect("embedded AWDL announce template must parse");
+        let mut frame =
+            crate::announce_template::build_link_announcement(subtype, &identity, &timing)
+                .expect("embedded AWDL announce template must parse");
         crate::announce_template::apply_runtime_state(&mut frame, awdl_state)
             .expect("embedded AWDL scheduling TLVs must parse");
         frame
@@ -7742,10 +8071,7 @@ pub mod runtime {
                     return None;
                 }
                 let udp_start = 14 + ihl;
-                u16::from_be_bytes([
-                    *frame.get(udp_start + 2)?,
-                    *frame.get(udp_start + 3)?,
-                ])
+                u16::from_be_bytes([*frame.get(udp_start + 2)?, *frame.get(udp_start + 3)?])
             }
             0x86dd => {
                 // IPv6: next header at offset 20, fixed 40-byte header.
@@ -7754,10 +8080,7 @@ pub mod runtime {
                     return None;
                 }
                 let udp_start = 14 + 40;
-                u16::from_be_bytes([
-                    *frame.get(udp_start + 2)?,
-                    *frame.get(udp_start + 3)?,
-                ])
+                u16::from_be_bytes([*frame.get(udp_start + 2)?, *frame.get(udp_start + 3)?])
             }
             _ => return None,
         };
@@ -7824,7 +8147,10 @@ pub mod runtime {
             // Error bits combined with POLLIN still count as an error.
             assert!(poll_revents_is_error(libc::POLLIN | libc::POLLERR));
             // POLL_ERR_BITS is exactly the union of the three error bits.
-            assert_eq!(POLL_ERR_BITS, libc::POLLERR | libc::POLLHUP | libc::POLLNVAL);
+            assert_eq!(
+                POLL_ERR_BITS,
+                libc::POLLERR | libc::POLLHUP | libc::POLLNVAL
+            );
         }
 
         #[test]
@@ -7858,9 +8184,15 @@ pub mod runtime {
 
             // MIF fires immediately; next MIF lands at mid next-EAW:
             //   next_aw(65536) + eaw_len/2(32768) = 98304 us after start.
-            assert_eq!(scheduler.due(1_000_000, &state), vec![awdl::ActionSubtype::Mif]);
+            assert_eq!(
+                scheduler.due(1_000_000, &state),
+                vec![awdl::ActionSubtype::Mif]
+            );
             assert!(scheduler.due(1_050_000, &state).is_empty());
-            assert_eq!(scheduler.due(1_098_304, &state), vec![awdl::ActionSubtype::Mif]);
+            assert_eq!(
+                scheduler.due(1_098_304, &state),
+                vec![awdl::ActionSubtype::Mif]
+            );
             // PSF lands at 1_000_000 + 110*1024 = 1_112_640.
             let due = scheduler.due(1_112_640, &state);
             assert!(due.contains(&awdl::ActionSubtype::Psf));
@@ -7891,20 +8223,31 @@ pub mod runtime {
             let later = build_announce_80211(awdl::ActionSubtype::Psf, &state, 0, t0 + 4 * aw_us);
 
             let phy = |f: &[u8]| u32::from_le_bytes([f[32], f[33], f[34], f[35]]);
-            assert_eq!(phy(&first), t0 as u32, "phy_tx is the low 32 bits of the epoch");
+            assert_eq!(
+                phy(&first),
+                t0 as u32,
+                "phy_tx is the low 32 bits of the epoch"
+            );
             assert_eq!(phy(&later), (t0 + 4 * aw_us) as u32);
 
             let aw_counter = |f: &[u8]| {
                 let mac = ieee80211::parse_mac_header(f).expect("valid action header");
                 let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
                 let tlvs = awdl::parse_tlvs(action.tlvs).expect("valid announce TLVs");
-                let tlv = tlvs.iter().find(|t| t.kind == 4).expect("TLV 4 sync params");
+                let tlv = tlvs
+                    .iter()
+                    .find(|t| t.kind == 4)
+                    .expect("TLV 4 sync params");
                 u16::from_le_bytes([tlv.value[29], tlv.value[30]])
             };
             let a = aw_counter(&first);
             let b = aw_counter(&later);
             assert_ne!(a, b, "aw_counter must advance with the epoch, not restart");
-            assert_eq!(b, a.wrapping_add(4), "one count per 16 TU availability window");
+            assert_eq!(
+                b,
+                a.wrapping_add(4),
+                "one count per 16 TU availability window"
+            );
         }
 
         #[test]
@@ -7962,10 +8305,15 @@ pub mod runtime {
                     assert_eq!(sync[3], 44);
                     let channels = tlvs.iter().find(|t| t.kind == 18).unwrap().value;
                     assert_eq!(&sync[33..71], &channels[..38]);
-                    assert!(awdl::parse_channel_sequence(channels).unwrap().channels.iter()
+                    assert!(awdl::parse_channel_sequence(channels)
+                        .unwrap()
+                        .channels
+                        .iter()
                         .all(|c| *c == 44));
                     let election = awdl::parse_election_parameters_v2(
-                        tlvs.iter().find(|t| t.kind == 24).unwrap().value).unwrap();
+                        tlvs.iter().find(|t| t.kind == 24).unwrap().value,
+                    )
+                    .unwrap();
                     assert_eq!(election.distance_to_master, 0);
                     assert_eq!(election.master_metric, 12345);
                     assert_eq!(election.self_counter, 12345);
@@ -7973,7 +8321,10 @@ pub mod runtime {
                     receiver.update_from_master(now, parsed.time_to_next_aw_tu, parsed.aw_counter);
                     // A real peer must find a sendable interval within one EAW.
                     assert!((0..64).any(|tu| crate::schedule::can_send_in(
-                        &receiver, now + tu * 1024, crate::schedule::MULTICAST_GUARD_TU) == 0));
+                        &receiver,
+                        now + tu * 1024,
+                        crate::schedule::MULTICAST_GUARD_TU
+                    ) == 0));
                 }
             }
         }
@@ -7998,7 +8349,9 @@ pub mod runtime {
             assert_eq!(parsed.time_to_next_aw_tu, state.sync.next_aw_tu(now));
             assert_eq!(sync[3], 149);
             let election = awdl::parse_election_parameters_v2(
-                tlvs.iter().find(|t| t.kind == 24).unwrap().value).unwrap();
+                tlvs.iter().find(|t| t.kind == 24).unwrap().value,
+            )
+            .unwrap();
             assert_eq!(election.master_addr, master);
             assert_eq!(election.sync_addr, parent);
             assert_eq!(election.distance_to_master, 2);
@@ -8017,9 +8370,20 @@ pub mod runtime {
             v2[20..24].copy_from_slice(&333u32.to_le_bytes());
             v2[24..28].copy_from_slice(&60u32.to_le_bytes());
             v2[36..40].copy_from_slice(&5u32.to_le_bytes());
-            let version = awdl::Tlv { kind: 21, value: &[0x34, 1] };
-            let v2_tlv = awdl::Tlv { kind: 24, value: &v2 };
-            state.apply_action(peer_addr, awdl::ActionSubtype::Mif, &[version, v2_tlv], 1_100_000);
+            let version = awdl::Tlv {
+                kind: 21,
+                value: &[0x34, 1],
+            };
+            let v2_tlv = awdl::Tlv {
+                kind: 24,
+                value: &v2,
+            };
+            state.apply_action(
+                peer_addr,
+                awdl::ActionSubtype::Mif,
+                &[version, v2_tlv],
+                1_100_000,
+            );
 
             let frame = build_announce_frame(awdl::ActionSubtype::Psf, &state, 0, 1_200_000);
             let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap");
@@ -8034,7 +8398,8 @@ pub mod runtime {
             let ev2 = tlvs.iter().find(|t| t.kind == 24).unwrap().value;
             assert_eq!(&ev2[0..6], &peer_addr); // master_addr
             assert_eq!(&ev2[6..12], &peer_addr); // sync_addr
-            assert_eq!(u32::from_le_bytes(ev2[12..16].try_into().unwrap()), 77); // master_counter
+            assert_eq!(u32::from_le_bytes(ev2[12..16].try_into().unwrap()), 77);
+            // master_counter
         }
 
         #[test]
@@ -8073,14 +8438,12 @@ pub mod runtime {
 
         #[test]
         fn status_snapshot_carries_state_and_last_injected_seq() {
-            let mut state = crate::state::AwdlState::new(
-                [0x02, 0, 0, 0, 0, 1],
-                "filin".into(),
-                44,
-                1_000_000,
-            );
+            let mut state =
+                crate::state::AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 1_000_000);
             state.current_channel = 44;
-            state.peers.touch([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee], 1_000_000);
+            state
+                .peers
+                .touch([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee], 1_000_000);
 
             let snapshot = build_status_snapshot(&state, 17, 500, 1_500_000);
 
@@ -8096,12 +8459,8 @@ pub mod runtime {
 
         #[test]
         fn status_snapshot_does_not_confuse_election_with_received_clock() {
-            let mut state = crate::state::AwdlState::new(
-                [0x02, 0, 0, 0, 0, 1],
-                "filin".into(),
-                44,
-                1_000_000,
-            );
+            let mut state =
+                crate::state::AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 1_000_000);
             // pretend an external master was elected
             state.election.sync_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
             state.election.master_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
@@ -8114,12 +8473,8 @@ pub mod runtime {
 
         #[test]
         fn peer_views_carry_chanseq_chan_ms_ago() {
-            let mut state = crate::state::AwdlState::new(
-                [0x02, 0, 0, 0, 0, 1],
-                "filin".into(),
-                44,
-                1_000_000,
-            );
+            let mut state =
+                crate::state::AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 1_000_000);
             let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
             state.peers.touch(peer_addr, 1_000_000);
             {
@@ -8146,7 +8501,7 @@ pub mod runtime {
             f.extend_from_slice(&[0xff; 6]); // dst broadcast
             f.extend_from_slice(&src_mac);
             f.extend_from_slice(&0x0800u16.to_be_bytes()); // ethertype IPv4
-            // IPv4 header (20 bytes)
+                                                           // IPv4 header (20 bytes)
             f.push(0x45); // ver=4, IHL=5
             f.push(0x00); // DSCP/ECN
             f.extend_from_slice(&0u16.to_be_bytes()); // total length
@@ -8157,7 +8512,7 @@ pub mod runtime {
             f.extend_from_slice(&0u16.to_be_bytes()); // checksum
             f.extend_from_slice(&[224, 0, 0, 251]); // src IP
             f.extend_from_slice(&[224, 0, 0, 251]); // dst IP
-            // UDP header
+                                                    // UDP header
             f.extend_from_slice(&5353u16.to_be_bytes()); // src port
             f.extend_from_slice(&dst_port.to_be_bytes()); // dst port
             f.extend_from_slice(&0u16.to_be_bytes()); // length
@@ -8173,14 +8528,14 @@ pub mod runtime {
             f.extend_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0xfb]); // IPv6 mcast dst
             f.extend_from_slice(&src_mac);
             f.extend_from_slice(&0x86ddu16.to_be_bytes()); // ethertype IPv6
-            // IPv6 header (40 bytes)
+                                                           // IPv6 header (40 bytes)
             f.extend_from_slice(&0x60u32.to_be_bytes()); // version=6, TC=0, FL=0
             f.extend_from_slice(&0u16.to_be_bytes()); // payload length
             f.extend_from_slice(&[0]); // next header placeholder (set below at offset 20)
             f.push(64); // hop limit
             f.extend_from_slice(&[0xfe; 16]); // src IP
             f.extend_from_slice(&[0xff; 16]); // dst IP (ff02::fb)
-            // fix next header at offset 20 (14+6) to UDP (17)
+                                              // fix next header at offset 20 (14+6) to UDP (17)
             f[20] = 17;
             // UDP header
             f.extend_from_slice(&5353u16.to_be_bytes()); // src port
@@ -8216,8 +8571,14 @@ pub mod runtime {
                 Some(false)
             );
             // Not mDNS port → None
-            assert_eq!(classify_mdns(&ipv4_udp_frame(other_mac, 1234), self_mac), None);
-            assert_eq!(classify_mdns(&ipv6_udp_frame(other_mac, 1234), self_mac), None);
+            assert_eq!(
+                classify_mdns(&ipv4_udp_frame(other_mac, 1234), self_mac),
+                None
+            );
+            assert_eq!(
+                classify_mdns(&ipv6_udp_frame(other_mac, 1234), self_mac),
+                None
+            );
         }
 
         #[test]
@@ -8226,9 +8587,8 @@ pub mod runtime {
 
             // ARP (non-IP)
             let mut arp = vec![
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0x02, 0, 0, 0, 0, 1,
-                0x08, 0x06, // ethertype ARP
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08,
+                0x06, // ethertype ARP
             ];
             arp.extend_from_slice(&[0u8; 20]);
             assert_eq!(classify_mdns(&arp, self_mac), None);
@@ -8633,7 +8993,11 @@ pub mod os {
             };
             // SAFETY: request is a valid ifreq-compatible buffer for SIOCGIFFLAGS.
             let rc = unsafe {
-                libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request as *mut IfReqFlags)
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFFLAGS as _,
+                    &mut request as *mut IfReqFlags,
+                )
             };
             if rc < 0 {
                 return false;
@@ -8649,7 +9013,11 @@ pub mod os {
             let mut request = IfReqFlags::new(iface, 0)?;
             // SAFETY: request is a valid ifreq-compatible buffer for SIOCGIFFLAGS.
             let rc = unsafe {
-                libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request as *mut IfReqFlags)
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFFLAGS as _,
+                    &mut request as *mut IfReqFlags,
+                )
             };
             if rc < 0 {
                 return Err(last_errno());
@@ -8657,7 +9025,11 @@ pub mod os {
             request.flags = down_flags(request.flags);
             // SAFETY: request is a valid ifreq-compatible buffer for SIOCSIFFLAGS.
             let rc = unsafe {
-                libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS as _, &mut request as *mut IfReqFlags)
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCSIFFLAGS as _,
+                    &mut request as *mut IfReqFlags,
+                )
             };
             if rc < 0 {
                 return Err(last_errno());
@@ -8870,8 +9242,7 @@ pub mod os {
             let family_id = socket.resolve_family("nl80211")?;
             let mut payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0];
             push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, ifindex);
-            let response =
-                socket.request_big(family_id, libc::NLM_F_REQUEST as u16, &payload)?;
+            let response = socket.request_big(family_id, libc::NLM_F_REQUEST as u16, &payload)?;
             Ok(parse_supported_iftypes(&response))
         }
 
@@ -9000,8 +9371,7 @@ pub mod os {
             // `GET_INTERFACE` echoes the whole interface description (channels,
             // station info, MLO links …). On a 6 GHz-capable card that easily
             // crosses the default 8 KiB receive buffer, so use the big one.
-            let response =
-                socket.request_big(family_id, libc::NLM_F_REQUEST as u16, &payload)?;
+            let response = socket.request_big(family_id, libc::NLM_F_REQUEST as u16, &payload)?;
             parse_attr_u32(&response, NL80211_ATTR_WIPHY_FREQ).ok_or(Error::Protocol)
         }
 
@@ -9019,9 +9389,7 @@ pub mod os {
                     break;
                 }
                 if attr_kind == kind && len >= 8 {
-                    return Some(u32::from_ne_bytes([
-                        attrs[4], attrs[5], attrs[6], attrs[7],
-                    ]));
+                    return Some(u32::from_ne_bytes([attrs[4], attrs[5], attrs[6], attrs[7]]));
                 }
                 let aligned = align4(len);
                 if aligned == 0 || aligned > attrs.len() {
@@ -9081,16 +9449,29 @@ pub mod os {
                 let family = socket.resolve_family("nl80211")?;
                 let mut group_query = vec![CTRL_CMD_GETFAMILY, 1, 0, 0];
                 push_attr_bytes(&mut group_query, CTRL_ATTR_FAMILY_NAME, b"nl80211", true);
-                let subscribed = socket.request_big(GENL_ID_CTRL, libc::NLM_F_REQUEST as u16, &group_query)
-                    .ok().and_then(|p| crate::tx_status::mlme_group(&p))
+                let subscribed = socket
+                    .request_big(GENL_ID_CTRL, libc::NLM_F_REQUEST as u16, &group_query)
+                    .ok()
+                    .and_then(|p| crate::tx_status::mlme_group(&p))
                     .is_some_and(|group| {
                         // SAFETY: group points to a valid 32-bit group ID.
-                        unsafe { libc::setsockopt(socket.fd.as_raw_fd(), libc::SOL_NETLINK,
-                            libc::NETLINK_ADD_MEMBERSHIP, (&group as *const u32).cast(), 4) == 0 }
+                        unsafe {
+                            libc::setsockopt(
+                                socket.fd.as_raw_fd(),
+                                libc::SOL_NETLINK,
+                                libc::NETLINK_ADD_MEMBERSHIP,
+                                (&group as *const u32).cast(),
+                                4,
+                            ) == 0
+                        }
                     });
-                if !subscribed { tracing::warn!("TX_STATUS subscription unavailable"); }
+                if !subscribed {
+                    tracing::warn!("TX_STATUS subscription unavailable");
+                }
                 Ok(Self {
-                    tracker: std::cell::RefCell::new(Box::new(crate::tx_status::Tracker::new(ifindex, subscribed))),
+                    tracker: std::cell::RefCell::new(Box::new(crate::tx_status::Tracker::new(
+                        ifindex, subscribed,
+                    ))),
                     clock: std::time::Instant::now(),
                     socket,
                     family,
@@ -9104,30 +9485,47 @@ pub mod os {
                 })
             }
 
-            pub fn enable_roc(&self) { self.roc_enabled.set(true); }
+            pub fn enable_roc(&self) {
+                self.roc_enabled.set(true);
+            }
 
             /// Tell the injector the radio is on the STA home channel for this
             /// slot, so [`Self::send`] may submit on it without an ROC dwell.
-            pub fn set_home_freq(&self, freq: Option<u32>) { self.home_freq.set(freq); }
+            pub fn set_home_freq(&self, freq: Option<u32>) {
+                self.home_freq.set(freq);
+            }
 
             pub fn roc_frequency(&self) -> Option<u32> {
                 let _ = self.tx_stats();
-                self.roc.borrow().active_frequency(self.clock.elapsed().as_micros() as u64)
+                self.roc
+                    .borrow()
+                    .active_frequency(self.clock.elapsed().as_micros() as u64)
             }
 
             pub fn roc_finished(&self) -> bool {
-                self.roc.borrow().finished(self.clock.elapsed().as_micros() as u64)
+                self.roc
+                    .borrow()
+                    .finished(self.clock.elapsed().as_micros() as u64)
             }
 
-            pub fn roc_pending(&self) -> bool { self.roc.borrow().pending() }
+            pub fn roc_pending(&self) -> bool {
+                self.roc.borrow().pending()
+            }
 
             pub fn start_roc(&self, frequency: u32, duration_ms: u32) -> Result<(), Error> {
                 // Drain queued old events before a new request. Only one ROC
                 // may be outstanding; drivers may reuse the same cookie.
                 let _ = self.tx_stats();
                 let seq = self.socket.seq.get();
-                if !self.roc.borrow_mut().start(seq, self.ifindex, frequency, duration_ms,
-                    self.clock.elapsed().as_micros() as u64) { return Err(Error::Invalid); }
+                if !self.roc.borrow_mut().start(
+                    seq,
+                    self.ifindex,
+                    frequency,
+                    duration_ms,
+                    self.clock.elapsed().as_micros() as u64,
+                ) {
+                    return Err(Error::Invalid);
+                }
                 let mut payload = vec![55, 1, 0, 0];
                 push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, self.ifindex);
                 push_attr_u32(&mut payload, NL80211_ATTR_WIPHY_FREQ, frequency);
@@ -9157,18 +9555,45 @@ pub mod os {
                 let mut buf = [0u8; 8192];
                 for _ in 0..32 {
                     // SAFETY: buffer is writable; MSG_DONTWAIT bounds hot-loop work.
-                    let len = unsafe { libc::recv(self.socket.fd.as_raw_fd(),
-                        buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT | libc::MSG_TRUNC) };
-                    if len <= 0 { break; }
-                    if len as usize > buf.len() { continue; }
-                    if let Some(events) = crate::tx_status::parse(&buf[..len as usize], self.family) {
+                    let len = unsafe {
+                        libc::recv(
+                            self.socket.fd.as_raw_fd(),
+                            buf.as_mut_ptr().cast(),
+                            buf.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        )
+                    };
+                    if len <= 0 {
+                        break;
+                    }
+                    if len as usize > buf.len() {
+                        continue;
+                    }
+                    if let Some(events) = crate::tx_status::parse(&buf[..len as usize], self.family)
+                    {
                         for event in events {
-                            self.tracker.borrow_mut().event(&event, self.clock.elapsed().as_millis() as u64);
-                            self.roc.borrow_mut().event(&event, self.clock.elapsed().as_micros() as u64);
+                            if let crate::tx_status::Event::Ack { error, .. } = &event {
+                                if *error != 0 {
+                                    self.rejected.set(self.rejected.get() + 1);
+                                    tracing::debug!(
+                                        error = *error,
+                                        "async NL80211_CMD_FRAME refusal"
+                                    );
+                                }
+                            }
+                            self.tracker
+                                .borrow_mut()
+                                .event(&event, self.clock.elapsed().as_millis() as u64);
+                            self.roc
+                                .borrow_mut()
+                                .event(&event, self.clock.elapsed().as_micros() as u64);
                         }
                     }
                 }
-                let mut stats = self.tracker.borrow_mut().snapshot(self.clock.elapsed().as_millis() as u64);
+                let mut stats = self
+                    .tracker
+                    .borrow_mut()
+                    .snapshot(self.clock.elapsed().as_millis() as u64);
                 stats.requests_accepted = self.accepted.get();
                 stats.requests_failed = self.rejected.get();
                 stats
@@ -9201,8 +9626,10 @@ pub mod os {
                 // the slot-0 home visit radiate real AWDL frames where an
                 // infrastructure-anchored peer is listening on its own channel.
                 let (freq, offchannel) = if self.roc_enabled.get() {
-                    if let Some(f) =
-                        self.roc.borrow().active_frequency(self.clock.elapsed().as_micros() as u64)
+                    if let Some(f) = self
+                        .roc
+                        .borrow()
+                        .active_frequency(self.clock.elapsed().as_micros() as u64)
                     {
                         (f, true)
                     } else if let Some(home) = self.home_freq.get() {
@@ -9218,10 +9645,12 @@ pub mod os {
                     // The existing READY reservation owns this social channel.
                     push_attr_bytes(&mut payload, 108, &[], false); // OFFCHANNEL_TX_OK
                 }
-                let unicast = frame[4] & 1 == 0;
-                if unicast { self.tracker.borrow_mut().begin(self.socket.seq.get()); }
-                let result = self.request_frame(&payload);
-                if unicast { self.tracker.borrow_mut().finish(result.is_ok(), self.clock.elapsed().as_millis() as u64); }
+                // Fire-and-forget submission. Waiting for each frame's
+                // NLMSG_ERROR ack made every ACK a synchronous netlink round
+                // trip: the TX queue saturated near 70 frames/s (~100 KiB/s)
+                // and the sender saw that wait as RTT. tx_stats() drains the
+                // same acks asynchronously and counts refusals.
+                let result = self.request_frame_async(&payload);
                 match result {
                     Ok(()) => {
                         self.accepted.set(self.accepted.get() + 1);
@@ -9232,6 +9661,35 @@ pub mod os {
                         Err(err)
                     }
                 }
+            }
+
+            /// Submit one request without waiting for its `NLMSG_ERROR` ack.
+            /// The ack and any genl reply/cookie are drained by [`Self::tx_stats`].
+            fn request_frame_async(&self, payload: &[u8]) -> Result<(), Error> {
+                let seq = self.socket.seq.get();
+                self.socket.seq.set(seq.wrapping_add(1));
+                let mut msg = Vec::with_capacity(16 + payload.len());
+                msg.extend_from_slice(&((16 + payload.len()) as u32).to_ne_bytes());
+                msg.extend_from_slice(&self.family.to_ne_bytes());
+                msg.extend_from_slice(
+                    &((libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16).to_ne_bytes(),
+                );
+                msg.extend_from_slice(&seq.to_ne_bytes());
+                msg.extend_from_slice(&0u32.to_ne_bytes());
+                msg.extend_from_slice(payload);
+                // SAFETY: msg is valid readable memory for msg.len() bytes.
+                let sent = unsafe {
+                    libc::send(
+                        self.socket.fd.as_raw_fd(),
+                        msg.as_ptr().cast::<libc::c_void>(),
+                        msg.len(),
+                        0,
+                    )
+                };
+                if sent < 0 {
+                    return Err(last_errno());
+                }
+                Ok(())
             }
 
             /// Send one request and wait for *its* `NLMSG_ERROR` ack.
@@ -9272,13 +9730,24 @@ pub mod os {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
                 loop {
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() { return Err(Error::Io(libc::ETIMEDOUT)); }
-                    let mut pollfd = libc::pollfd { fd: self.socket.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    if remaining.is_zero() {
+                        return Err(Error::Io(libc::ETIMEDOUT));
+                    }
+                    let mut pollfd = libc::pollfd {
+                        fd: self.socket.fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
                     // SAFETY: pollfd is a valid single poll descriptor.
-                    let ready = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis().max(1) as i32) };
-                    if ready == 0 { return Err(Error::Io(libc::ETIMEDOUT)); }
+                    let ready =
+                        unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis().max(1) as i32) };
+                    if ready == 0 {
+                        return Err(Error::Io(libc::ETIMEDOUT));
+                    }
                     if ready < 0 {
-                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue; }
+                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
                         return Err(last_errno());
                     }
                     // SAFETY: buf is valid writable memory for buf.len() bytes.
@@ -9292,22 +9761,37 @@ pub mod os {
                     };
                     if len < 0 {
                         let errno = std::io::Error::last_os_error().raw_os_error();
-                        if errno == Some(libc::EAGAIN) || errno == Some(libc::EINTR) { continue; }
+                        if errno == Some(libc::EAGAIN) || errno == Some(libc::EINTR) {
+                            continue;
+                        }
                         return Err(last_errno());
                     }
                     let len = len as usize;
-                    if len == 0 || len > buf.len() { return Err(Error::Protocol); }
-                    let events = crate::tx_status::parse(&buf[..len], self.family).ok_or(Error::Protocol)?;
+                    if len == 0 || len > buf.len() {
+                        return Err(Error::Protocol);
+                    }
+                    let events =
+                        crate::tx_status::parse(&buf[..len], self.family).ok_or(Error::Protocol)?;
                     let mut ack = None;
                     for event in events {
-                        self.tracker.borrow_mut().event(&event, self.clock.elapsed().as_millis() as u64);
-                            self.roc.borrow_mut().event(&event, self.clock.elapsed().as_micros() as u64);
+                        self.tracker
+                            .borrow_mut()
+                            .event(&event, self.clock.elapsed().as_millis() as u64);
+                        self.roc
+                            .borrow_mut()
+                            .event(&event, self.clock.elapsed().as_micros() as u64);
                         if let crate::tx_status::Event::Ack { seq: reply, error } = event {
-                            if reply == seq { ack = Some(error); }
+                            if reply == seq {
+                                ack = Some(error);
+                            }
                         }
                     }
                     if let Some(error) = ack {
-                        return if error == 0 { Ok(()) } else { Err(Error::Io(error.saturating_neg())) };
+                        return if error == 0 {
+                            Ok(())
+                        } else {
+                            Err(Error::Io(error.saturating_neg()))
+                        };
                     }
                 }
             }
@@ -9332,11 +9816,18 @@ pub mod os {
                     return Err(last_errno());
                 }
                 // Bound missing driver ACKs so the supervisor can recover.
-                let timeout = libc::timeval { tv_sec: 3, tv_usec: 0 };
+                let timeout = libc::timeval {
+                    tv_sec: 3,
+                    tv_usec: 0,
+                };
                 unsafe {
-                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
                         (&timeout as *const libc::timeval).cast(),
-                        std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                    );
                 }
                 // SAFETY: fd was just returned by socket and is uniquely owned here.
                 Ok(Self {
@@ -9566,7 +10057,8 @@ pub mod os {
                 // genlmsghdr (4 bytes) + a decoy attr + the nested iftypes attr.
                 let mut payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0];
                 push_attr(&mut payload, 2 /* WIPHY_NAME */, b"phy0");
-                let nest = iftype_nest(&[2 /* managed */, 6 /* monitor */, 3 /* ap */]);
+                let nest =
+                    iftype_nest(&[2 /* managed */, 6 /* monitor */, 3 /* ap */]);
                 // Kernel sets the NESTED flag on this attr's type; we must mask it.
                 push_attr(&mut payload, 0x8000 | NL80211_ATTR_SUPPORTED_IFTYPES, &nest);
 
@@ -9616,7 +10108,11 @@ pub mod os {
                 let mut payload = vec![NL80211_CMD_GET_INTERFACE, 1, 0, 0];
                 push_attr(&mut payload, 2 /* IFNAME */, b"wlan0");
                 push_attr(&mut payload, NL80211_ATTR_IFINDEX, &7u32.to_ne_bytes());
-                push_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &5260u32.to_ne_bytes());
+                push_attr(
+                    &mut payload,
+                    NL80211_ATTR_WIPHY_FREQ,
+                    &5260u32.to_ne_bytes(),
+                );
                 assert_eq!(
                     parse_attr_u32(&payload, NL80211_ATTR_WIPHY_FREQ),
                     Some(5260)
@@ -9630,7 +10126,11 @@ pub mod os {
             #[test]
             fn parse_attr_u32_skips_the_genl_header() {
                 let mut payload = vec![NL80211_CMD_GET_INTERFACE, 1, 0, 0];
-                push_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &2437u32.to_ne_bytes());
+                push_attr(
+                    &mut payload,
+                    NL80211_ATTR_WIPHY_FREQ,
+                    &2437u32.to_ne_bytes(),
+                );
                 assert_eq!(
                     parse_attr_u32(&payload, NL80211_ATTR_WIPHY_FREQ),
                     Some(2437)
@@ -9643,7 +10143,11 @@ pub mod os {
             fn parse_attr_u32_ignores_a_short_body() {
                 let mut payload = vec![NL80211_CMD_GET_INTERFACE, 1, 0, 0];
                 push_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &[0xaa, 0xbb]);
-                push_attr(&mut payload, 99 /* unrelated */, &5260u32.to_ne_bytes());
+                push_attr(
+                    &mut payload,
+                    99, /* unrelated */
+                    &5260u32.to_ne_bytes(),
+                );
                 assert_eq!(parse_attr_u32(&payload, NL80211_ATTR_WIPHY_FREQ), None);
             }
 
@@ -9824,7 +10328,7 @@ pub mod os {
             payload.extend_from_slice(&NUD_PERMANENT.to_ne_bytes()); // ndm_state
             payload.push(0); // ndm_flags
             payload.push(0); // ndm_type
-            // NDA_DST (IPv6 address, 16 bytes).
+                             // NDA_DST (IPv6 address, 16 bytes).
             push_attr(&mut payload, NDA_DST, &req.ipv6);
             // NDA_LLADDR (MAC, 6 bytes) — only for NEWNEIGH; DELNEIGH keys on
             // the dst alone but including lladdr is harmless and keeps the
@@ -10005,7 +10509,11 @@ pub mod os {
             #[test]
             fn plan_rejects_zero_ifindex() {
                 assert_eq!(
-                    plan_neighbor(0, [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xff, 0xfe, 0, 0, 1], [0x02, 0, 0, 0, 0, 1]),
+                    plan_neighbor(
+                        0,
+                        [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xff, 0xfe, 0, 0, 1],
+                        [0x02, 0, 0, 0, 0, 1]
+                    ),
                     Err(Error::Invalid)
                 );
             }
@@ -10013,7 +10521,11 @@ pub mod os {
             #[test]
             fn plan_rejects_non_link_local_ipv6() {
                 assert_eq!(
-                    plan_neighbor(5, [0x20, 0x01, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xff, 0xfe, 0, 0, 1], [0x02, 0, 0, 0, 0, 1]),
+                    plan_neighbor(
+                        5,
+                        [0x20, 0x01, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xff, 0xfe, 0, 0, 1],
+                        [0x02, 0, 0, 0, 0, 1]
+                    ),
                     Err(Error::Invalid)
                 );
             }
@@ -10042,11 +10554,11 @@ pub mod os {
                 assert_eq!(payload[0], AF_INET6);
                 assert_eq!(payload[1], 0);
                 assert_eq!(u16::from_ne_bytes([payload[2], payload[3]]), 0);
-                assert_eq!(i32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]), 7);
                 assert_eq!(
-                    u16::from_ne_bytes([payload[8], payload[9]]),
-                    NUD_PERMANENT
+                    i32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]),
+                    7
                 );
+                assert_eq!(u16::from_ne_bytes([payload[8], payload[9]]), NUD_PERMANENT);
             }
 
             #[test]
@@ -10070,8 +10582,16 @@ pub mod os {
                 ];
                 let req = plan_neighbor(7, ipv6, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]).unwrap();
                 let (_msg_type, flags, _payload) = build_neighbor_payload(&req, false);
-                assert_ne!(flags & libc::NLM_F_CREATE as u16, 0, "NLM_F_CREATE must be set");
-                assert_ne!(flags & libc::NLM_F_REPLACE as u16, 0, "NLM_F_REPLACE must be set");
+                assert_ne!(
+                    flags & libc::NLM_F_CREATE as u16,
+                    0,
+                    "NLM_F_CREATE must be set"
+                );
+                assert_ne!(
+                    flags & libc::NLM_F_REPLACE as u16,
+                    0,
+                    "NLM_F_REPLACE must be set"
+                );
                 assert_ne!(flags & libc::NLM_F_ACK as u16, 0, "NLM_F_ACK must be set");
 
                 // Delete must NOT carry CREATE/REPLACE.
@@ -10136,7 +10656,10 @@ pub mod os {
         use super::{File, UNSUPPORTED};
 
         #[derive(Debug, PartialEq, Eq)]
-        pub enum Error { InvalidName, Io(i32) }
+        pub enum Error {
+            InvalidName,
+            Io(i32),
+        }
 
         #[derive(Debug, PartialEq, Eq)]
         pub struct IfReqPlan {
@@ -10146,10 +10669,15 @@ pub mod os {
 
         pub fn plan_tap_ifreq(name: &str) -> Result<IfReqPlan, Error> {
             let bytes = name.as_bytes();
-            if bytes.is_empty() || bytes.len() >= 16 { return Err(Error::InvalidName); }
+            if bytes.is_empty() || bytes.len() >= 16 {
+                return Err(Error::InvalidName);
+            }
             let mut out = [0u8; 16];
             out[..bytes.len()].copy_from_slice(bytes);
-            Ok(IfReqPlan { name: out, flags: 0 })
+            Ok(IfReqPlan {
+                name: out,
+                flags: 0,
+            })
         }
 
         pub fn open_tap(name: &str) -> Result<File, Error> {
@@ -10162,14 +10690,26 @@ pub mod os {
         use super::UNSUPPORTED;
 
         #[derive(Debug, PartialEq, Eq)]
-        pub enum Error { InvalidIfIndex, InvalidName, Io(i32) }
+        pub enum Error {
+            InvalidIfIndex,
+            InvalidName,
+            Io(i32),
+        }
 
         #[derive(Debug, PartialEq, Eq)]
-        pub struct BindPlan { pub ifindex: i32, pub protocol_be: u16 }
+        pub struct BindPlan {
+            pub ifindex: i32,
+            pub protocol_be: u16,
+        }
 
         pub fn plan_bind(ifindex: i32) -> Result<BindPlan, Error> {
-            if ifindex <= 0 { return Err(Error::InvalidIfIndex); }
-            Ok(BindPlan { ifindex, protocol_be: 0x0003u16.to_be() })
+            if ifindex <= 0 {
+                return Err(Error::InvalidIfIndex);
+            }
+            Ok(BindPlan {
+                ifindex,
+                protocol_be: 0x0003u16.to_be(),
+            })
         }
 
         #[derive(Debug)]
@@ -10177,16 +10717,24 @@ pub mod os {
 
         impl PacketSocket {
             pub fn open_bound(iface: &str) -> Result<Self, Error> {
-                if iface.is_empty() { return Err(Error::InvalidName); }
+                if iface.is_empty() {
+                    return Err(Error::InvalidName);
+                }
                 Err(Error::Io(UNSUPPORTED))
             }
             pub fn open_bound_ifindex(ifindex: i32) -> Result<Self, Error> {
                 plan_bind(ifindex)?;
                 Err(Error::Io(UNSUPPORTED))
             }
-            pub fn recv(&self, _buf: &mut [u8]) -> Result<usize, Error> { Err(Error::Io(UNSUPPORTED)) }
-            pub fn send(&self, _frame: &[u8]) -> Result<usize, Error> { Err(Error::Io(UNSUPPORTED)) }
-            pub fn as_raw_fd(&self) -> std::os::fd::RawFd { -1 }
+            pub fn recv(&self, _buf: &mut [u8]) -> Result<usize, Error> {
+                Err(Error::Io(UNSUPPORTED))
+            }
+            pub fn send(&self, _frame: &[u8]) -> Result<usize, Error> {
+                Err(Error::Io(UNSUPPORTED))
+            }
+            pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                -1
+            }
         }
     }
 
@@ -10194,25 +10742,51 @@ pub mod os {
         use super::UNSUPPORTED;
 
         #[derive(Debug, PartialEq, Eq)]
-        pub enum Error { InvalidName, Io(i32) }
+        pub enum Error {
+            InvalidName,
+            Io(i32),
+        }
         #[derive(Debug, PartialEq, Eq)]
-        pub struct IfName { pub bytes: [u8; 16] }
+        pub struct IfName {
+            pub bytes: [u8; 16],
+        }
 
         pub fn plan_if_name(name: &str) -> Result<IfName, Error> {
             let raw = name.as_bytes();
-            if raw.is_empty() || raw.len() >= 16 { return Err(Error::InvalidName); }
-            let mut bytes = [0u8; 16]; bytes[..raw.len()].copy_from_slice(raw);
+            if raw.is_empty() || raw.len() >= 16 {
+                return Err(Error::InvalidName);
+            }
+            let mut bytes = [0u8; 16];
+            bytes[..raw.len()].copy_from_slice(raw);
             Ok(IfName { bytes })
         }
-        pub fn up_flags(existing: i16) -> i16 { existing }
-        pub fn down_flags(existing: i16) -> i16 { existing }
-        pub fn get_hwaddr(_iface: &str) -> Result<[u8; 6], Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn set_hwaddr(_iface: &str, _hwaddr: [u8; 6]) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn set_mtu(_iface: &str, _mtu: i32) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn set_up(_iface: &str) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn set_down(_iface: &str) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn ifindex(_iface: &str) -> u32 { 0 }
-        pub fn is_up(_iface: &str) -> bool { false }
+        pub fn up_flags(existing: i16) -> i16 {
+            existing
+        }
+        pub fn down_flags(existing: i16) -> i16 {
+            existing
+        }
+        pub fn get_hwaddr(_iface: &str) -> Result<[u8; 6], Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn set_hwaddr(_iface: &str, _hwaddr: [u8; 6]) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn set_mtu(_iface: &str, _mtu: i32) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn set_up(_iface: &str) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn set_down(_iface: &str) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn ifindex(_iface: &str) -> u32 {
+            0
+        }
+        pub fn is_up(_iface: &str) -> bool {
+            false
+        }
     }
 
     pub mod nl80211 {
@@ -10220,41 +10794,86 @@ pub mod os {
         use std::borrow::Cow;
 
         #[derive(Debug, PartialEq, Eq)]
-        pub enum Error { Io(i32), Invalid, Protocol }
+        pub enum Error {
+            Io(i32),
+            Invalid,
+            Protocol,
+        }
         #[derive(Debug, PartialEq, Eq)]
-        pub struct ChannelRequest { pub ifindex: i32, pub frequency_mhz: u32 }
+        pub struct ChannelRequest {
+            pub ifindex: i32,
+            pub frequency_mhz: u32,
+        }
         pub fn plan_set_channel(ifindex: i32, frequency_mhz: u32) -> Result<ChannelRequest, Error> {
-            if ifindex <= 0 || frequency_mhz == 0 { return Err(Error::Invalid); }
-            Ok(ChannelRequest { ifindex, frequency_mhz })
+            if ifindex <= 0 || frequency_mhz == 0 {
+                return Err(Error::Invalid);
+            }
+            Ok(ChannelRequest {
+                ifindex,
+                frequency_mhz,
+            })
         }
         pub fn iftype_name(iftype: u32) -> Cow<'static, str> {
-            Cow::Owned(match iftype { 2 => "managed".to_string(), 3 => "AP".to_string(), 6 => "monitor".to_string(), n => format!("iftype-{n}") })
+            Cow::Owned(match iftype {
+                2 => "managed".to_string(),
+                3 => "AP".to_string(),
+                6 => "monitor".to_string(),
+                n => format!("iftype-{n}"),
+            })
         }
-        pub fn supported_iftypes(_iface: &str) -> Result<Vec<u32>, Error> { Err(Error::Io(UNSUPPORTED)) }
+        pub fn supported_iftypes(_iface: &str) -> Result<Vec<u32>, Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
         pub fn supports_monitor(iface: &str) -> Result<bool, Error> {
             Ok(supported_iftypes(iface)?.contains(&6))
         }
-        pub fn set_monitor(_iface: &str) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn set_channel(_iface: &str, _frequency_mhz: u32) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn set_channel_ifindex(_ifindex: i32, _frequency_mhz: u32) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn current_frequency_mhz(_iface: &str) -> Result<u32, Error> { Err(Error::Io(UNSUPPORTED)) }
+        pub fn set_monitor(_iface: &str) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn set_channel(_iface: &str, _frequency_mhz: u32) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn set_channel_ifindex(_ifindex: i32, _frequency_mhz: u32) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn current_frequency_mhz(_iface: &str) -> Result<u32, Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
 
         #[derive(Debug)]
         pub struct MgmtTx;
         impl MgmtTx {
             pub fn enable_roc(&self) {}
             pub fn set_home_freq(&self, _freq: Option<u32>) {}
-            pub fn roc_frequency(&self) -> Option<u32> { None }
-            pub fn roc_finished(&self) -> bool { false }
-            pub fn roc_pending(&self) -> bool { false }
-            pub fn start_roc(&self, _frequency: u32, _duration_ms: u32) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
+            pub fn roc_frequency(&self) -> Option<u32> {
+                None
+            }
+            pub fn roc_finished(&self) -> bool {
+                false
+            }
+            pub fn roc_pending(&self) -> bool {
+                false
+            }
+            pub fn start_roc(&self, _frequency: u32, _duration_ms: u32) -> Result<(), Error> {
+                Err(Error::Io(UNSUPPORTED))
+            }
             pub fn cancel_roc(&self) {}
 
-            pub fn tx_stats(&self) -> crate::tx_status::Stats { crate::tx_status::Stats::default() }
-            pub fn open(_iface: &str, _frequency_mhz: u32) -> Result<Self, Error> { Err(Error::Io(UNSUPPORTED)) }
-            pub fn accepted(&self) -> u64 { 0 }
-            pub fn rejected(&self) -> u64 { 0 }
-            pub fn send(&self, _frame: &[u8]) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
+            pub fn tx_stats(&self) -> crate::tx_status::Stats {
+                crate::tx_status::Stats::default()
+            }
+            pub fn open(_iface: &str, _frequency_mhz: u32) -> Result<Self, Error> {
+                Err(Error::Io(UNSUPPORTED))
+            }
+            pub fn accepted(&self) -> u64 {
+                0
+            }
+            pub fn rejected(&self) -> u64 {
+                0
+            }
+            pub fn send(&self, _frame: &[u8]) -> Result<(), Error> {
+                Err(Error::Io(UNSUPPORTED))
+            }
         }
     }
 
@@ -10262,20 +10881,50 @@ pub mod os {
         use super::UNSUPPORTED;
 
         #[derive(Debug, PartialEq, Eq)]
-        pub enum Error { Invalid, Io(i32), Protocol }
+        pub enum Error {
+            Invalid,
+            Io(i32),
+            Protocol,
+        }
         #[derive(Debug, PartialEq, Eq)]
-        pub struct NeighborRequest { pub ifindex: i32, pub ipv6: [u8; 16], pub mac: [u8; 6] }
-        pub fn plan_neighbor(ifindex: i32, ipv6: [u8; 16], mac: [u8; 6]) -> Result<NeighborRequest, Error> {
-            if ifindex <= 0 || ipv6[0] != 0xfe || (ipv6[1] & 0xc0) != 0x80 { return Err(Error::Invalid); }
+        pub struct NeighborRequest {
+            pub ifindex: i32,
+            pub ipv6: [u8; 16],
+            pub mac: [u8; 6],
+        }
+        pub fn plan_neighbor(
+            ifindex: i32,
+            ipv6: [u8; 16],
+            mac: [u8; 6],
+        ) -> Result<NeighborRequest, Error> {
+            if ifindex <= 0 || ipv6[0] != 0xfe || (ipv6[1] & 0xc0) != 0x80 {
+                return Err(Error::Invalid);
+            }
             Ok(NeighborRequest { ifindex, ipv6, mac })
         }
         pub fn build_neighbor_payload(_req: &NeighborRequest, remove: bool) -> (u16, u16, Vec<u8>) {
-            (if remove { 29 } else { 28 }, if remove { 4 } else { 0x605 }, Vec::new())
+            (
+                if remove { 29 } else { 28 },
+                if remove { 4 } else { 0x605 },
+                Vec::new(),
+            )
         }
-        pub fn add_neighbor(_iface: &str, _ipv6: [u8; 16], _mac: [u8; 6]) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn add_neighbor_ifindex(_ifindex: i32, _ipv6: [u8; 16], _mac: [u8; 6]) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn remove_neighbor(_iface: &str, _ipv6: [u8; 16]) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
-        pub fn remove_neighbor_ifindex(_ifindex: i32, _ipv6: [u8; 16]) -> Result<(), Error> { Err(Error::Io(UNSUPPORTED)) }
+        pub fn add_neighbor(_iface: &str, _ipv6: [u8; 16], _mac: [u8; 6]) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn add_neighbor_ifindex(
+            _ifindex: i32,
+            _ipv6: [u8; 16],
+            _mac: [u8; 6],
+        ) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn remove_neighbor(_iface: &str, _ipv6: [u8; 16]) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
+        pub fn remove_neighbor_ifindex(_ifindex: i32, _ipv6: [u8; 16]) -> Result<(), Error> {
+            Err(Error::Io(UNSUPPORTED))
+        }
     }
 }
 
@@ -10489,7 +11138,8 @@ pub mod introspect {
         }
 
         pub fn set(&self, level: GateLevel) {
-            self.0.store(level.as_u8(), std::sync::atomic::Ordering::Relaxed);
+            self.0
+                .store(level.as_u8(), std::sync::atomic::Ordering::Relaxed);
         }
 
         /// `event_level_num` is `tracing::Level::as_usize()` (ERROR=1 … TRACE=5).
@@ -10531,12 +11181,11 @@ pub mod introspect {
     }
 
     impl tracing::field::Visit for FieldCollector {
-        fn record_debug(
-            &mut self,
-            field: &tracing::field::Field,
-            value: &dyn std::fmt::Debug,
-        ) {
-            self.route(field.name(), serde_json::Value::String(format!("{value:?}")));
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.route(
+                field.name(),
+                serde_json::Value::String(format!("{value:?}")),
+            );
         }
 
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -10764,9 +11413,7 @@ pub mod introspect {
         };
         let level = match GateLevel::from_request_str(&parsed.level) {
             Some(l) => l,
-            None => {
-                return Response::text(400, "unknown level; expected off|debug|trace")
-            }
+            None => return Response::text(400, "unknown level; expected off|debug|trace"),
         };
         intro.trace_gate().set(level);
         Response::text(200, "ok")
@@ -10800,7 +11447,11 @@ pub mod introspect {
         let method = parts.next()?;
         let target = parts.next()?;
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        Some(ParsedRequestLine { method, path, query })
+        Some(ParsedRequestLine {
+            method,
+            path,
+            query,
+        })
     }
 
     /// Reason phrase for the few status codes this minimal server emits.
@@ -11286,7 +11937,10 @@ pub mod introspect {
             let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
             let obj = json.as_object().expect("snapshot is a JSON object");
 
-            assert_eq!(obj.get("current_channel").and_then(|v| v.as_u64()), Some(44));
+            assert_eq!(
+                obj.get("current_channel").and_then(|v| v.as_u64()),
+                Some(44)
+            );
             assert_eq!(obj.get("master_anchor").and_then(|v| v.as_u64()), Some(52));
             assert_eq!(
                 obj.get("tsf_offset_us").and_then(|v| v.as_u64()),
@@ -11434,7 +12088,9 @@ pub mod introspect {
                 Some("injected awdl announce frame")
             );
             assert_eq!(
-                obj.get("fields").and_then(|v| v.get("sent")).and_then(|v| v.as_u64()),
+                obj.get("fields")
+                    .and_then(|v| v.get("sent"))
+                    .and_then(|v| v.as_u64()),
                 Some(1)
             );
         }
@@ -11512,7 +12168,10 @@ pub mod introspect {
             let ev = &ring.last_n(1)[0];
             assert_eq!(ev.level, "WARN");
             assert_eq!(ev.msg, "channel switch failed");
-            assert_eq!(ev.fields.get("iface").and_then(|v| v.as_str()), Some("wlan0mon"));
+            assert_eq!(
+                ev.fields.get("iface").and_then(|v| v.as_str()),
+                Some("wlan0mon")
+            );
             assert_eq!(ev.fields.get("ok").and_then(|v| v.as_bool()), Some(true));
         }
 
@@ -11627,7 +12286,10 @@ pub mod introspect {
             assert_eq!(resp.status, 200);
             assert!(resp.content_type.contains("application/json"));
             let obj = json_body(&resp).as_object().unwrap().clone();
-            assert_eq!(obj.get("current_channel").and_then(|v| v.as_u64()), Some(44));
+            assert_eq!(
+                obj.get("current_channel").and_then(|v| v.as_u64()),
+                Some(44)
+            );
             assert_eq!(
                 obj.get("master_mac").and_then(|v| v.as_str()),
                 Some("02:aa:bb:cc:dd:ee")
@@ -11677,14 +12339,14 @@ pub mod introspect {
         #[test]
         fn peers_route_returns_array_of_peer_views() {
             let intro = Introspection::new();
-            intro.set_peers(vec![
-                PeerView {
-                    mac: mac_string([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
-                    last_seen_ms_ago: 312,
-                    decoded_chanseq: vec![44, 44, 6, 6, 149, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44],
-                    current_channel: 44,
-                },
-            ]);
+            intro.set_peers(vec![PeerView {
+                mac: mac_string([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                last_seen_ms_ago: 312,
+                decoded_chanseq: vec![
+                    44, 44, 6, 6, 149, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44,
+                ],
+                current_channel: 44,
+            }]);
 
             let resp = route(&intro, &req("GET", "/peers"));
             assert_eq!(resp.status, 200);
@@ -11695,7 +12357,10 @@ pub mod introspect {
                 p.get("mac").and_then(|v| v.as_str()),
                 Some("02:aa:bb:cc:dd:ee")
             );
-            assert_eq!(p.get("last_seen_ms_ago").and_then(|v| v.as_u64()), Some(312));
+            assert_eq!(
+                p.get("last_seen_ms_ago").and_then(|v| v.as_u64()),
+                Some(312)
+            );
             let seq = p.get("decoded_chanseq").unwrap().as_array().unwrap();
             assert_eq!(seq.len(), 16);
             assert_eq!(seq[2].as_u64(), Some(6));
@@ -11710,8 +12375,7 @@ pub mod introspect {
             gate.set(GateLevel::Trace);
             let layer = TraceLayer::new(ring.clone(), gate);
             use tracing_subscriber::prelude::*;
-            let dispatch =
-                tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+            let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
             tracing::dispatcher::with_default(&dispatch, || {
                 tracing::info!("first");
                 tracing::info!("second");
@@ -11725,11 +12389,19 @@ pub mod introspect {
             let arr = body.as_array().unwrap();
             assert_eq!(arr.len(), 2);
             assert_eq!(
-                arr[0].as_object().unwrap().get("msg").and_then(|v| v.as_str()),
+                arr[0]
+                    .as_object()
+                    .unwrap()
+                    .get("msg")
+                    .and_then(|v| v.as_str()),
                 Some("second")
             );
             assert_eq!(
-                arr[1].as_object().unwrap().get("msg").and_then(|v| v.as_str()),
+                arr[1]
+                    .as_object()
+                    .unwrap()
+                    .get("msg")
+                    .and_then(|v| v.as_str()),
                 Some("third")
             );
         }
@@ -11765,10 +12437,7 @@ pub mod introspect {
             );
             assert_eq!(resp.status, 400);
 
-            let resp = route(
-                &intro,
-                &req_with_body("POST", "/trace", b"not json at all"),
-            );
+            let resp = route(&intro, &req_with_body("POST", "/trace", b"not json at all"));
             assert_eq!(resp.status, 400);
         }
 
@@ -11826,8 +12495,12 @@ pub mod introspect {
                 content_type: "text/plain; charset=utf-8",
                 body: b"bad".to_vec(),
             };
-            assert!(String::from_utf8(format_response(&not_found)).unwrap().contains("404 Not Found"));
-            assert!(String::from_utf8(format_response(&bad)).unwrap().contains("400 Bad Request"));
+            assert!(String::from_utf8(format_response(&not_found))
+                .unwrap()
+                .contains("404 Not Found"));
+            assert!(String::from_utf8(format_response(&bad))
+                .unwrap()
+                .contains("400 Bad Request"));
         }
 
         #[test]
@@ -11950,7 +12623,10 @@ mod announce_wire_tests {
         let frame = runtime::build_announce_80211(ActionSubtype::Mif, &state(6), 0, 0);
         let k = kinds(&frame);
         assert_eq!(&k[..11], &[4, 5, 18, 24, 12, 7, 17, 33, 16, 21, 6]);
-        assert!(!k.contains(&2), "captured pairing services have no local listener");
+        assert!(
+            !k.contains(&2),
+            "captured pairing services have no local listener"
+        );
     }
 
     #[test]
@@ -12026,14 +12702,15 @@ mod announce_wire_tests {
             e
         };
         let body = awdl::encapsulate_ethernet_payload(&ethernet, 7).expect("encapsulate");
-        assert_eq!(&body[0..8], &[0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00]);
+        assert_eq!(
+            &body[0..8],
+            &[0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00]
+        );
         assert_eq!(&body[8..10], &[0x03, 0x04], "AWDL data head is 0x0403");
         assert_eq!(&body[10..12], &[7, 0], "sequence follows the data head");
 
         let dst = [0x02, 0, 0, 0, 0, 0x01];
-        let frame = crate::ieee80211::build_data_frame(
-            dst, SELF, AWDL_BSSID, 0x70, &body,
-        );
+        let frame = crate::ieee80211::build_data_frame(dst, SELF, AWDL_BSSID, 0x70, &body);
         assert_eq!(&frame[0..2], &[0x08, 0x00], "data frame control");
         assert_eq!(&frame[4..10], &dst);
         assert_eq!(&frame[16..22], &AWDL_BSSID, "addr3 is the AWDL BSSID");
