@@ -1,5 +1,8 @@
 # 小米 13 内置 WLAN 驱动实验
 
+2026-10-28：新增0057正式最小补丁（continuation去除余数掩码）及0058（重组后将skb非线性分段完整复制到AWDL sink，atomic分配、失败丢副本，不改原skb所有权）。0058在远端0057基础上完整模块编译通过，SHA256 `e10e1d7b65ca730692df80e9b853429064f62abadd6a900747852c194a4e08a6`；实际代码块ASan/UBSan边界验证通过。两轮有界上机、正常STOP/原厂恢复和网关3/3；出现3010B完整A-MSDU，64KiB文件AWDL/TLS接收hash一致。1MiB仍超时，40–50MB/长期驻留/无AP/SSR未验收。App模块资产已更新为0058。详细证据及限制见docs/HANDOFF.md最新章节与build/airdrop/driver/candidate-0058/。
+
+
 **2026-10-27 续测**：4轮有界20秒UDP，新增4次正常STOP/自动原厂恢复，末次boot_count78、网关3/3。首次双向往返为手机5/40、Mac3/39；另一轮无共同52信道又0/40，尚未稳定。用户态已修首次选主采用时钟的顺序及统计，未解决固件line#1413；短测无故障不能当长时稳定证明。详见HANDOFF最新条目和 `build/airdrop/ip-probe/continued-20261027.json`。
 
 **2026-10-27 新运行期故障（优先于历史安全结论）**：0056独立UDP测试约48秒发生固件RDDM/SSR，SFR `0x1366428:0x1c34a98, line#1413`。无整机重启，自动恢复原厂和网关3/3，boot_count78。该签名旧mld-owner日志也有，根因未定；未重复试跑。抓包确认Mac宣告无52信道，一帧待发送单播堵住整个TAP；已实现有界分对端队列并离线验证，未无线验证。pending_rx真机释放2包，但探针未绑定导致端口不可达，现探针增加双端ready闸门。详见HANDOFF顶部和 `build/airdrop/ip-probe/lease-20261027/`。继续基础驱动/帧/IP层，稳定验收仍0/4。

@@ -1,0 +1,58 @@
+From: Marionette AirDrop driver research
+Subject: [EXPERIMENTAL] allow long station ROC dwells for AWDL
+
+The 200 ms clamp on a station remain-on-channel request is our own code, not a
+firmware limit. wiphy advertises MAX_REMAIN_ON_CHANNEL_DURATION (2000), and the
+0045 experiment measured a 2 s station ROC with 0 % packet loss (latency
+14 ms -> 52 ms). A 200 ms dwell plus the driver's ~120 ms READY latency makes
+the radio deaf for ~38 % of every cycle, which collapses bulk TCP transfers
+(measured 2026-11-05: 16-43 KiB/s, RTO plateaus up to 19.8 s).
+
+Raise the clamp to the wiphy maximum so userspace can request long dwells that
+amortise the acquisition cost, and let the promiscuous AWDL receive filter
+cover the same range (0008 previously stopped at 1000 ms).
+
+Measured with a 1800 ms userspace request against this 2000 ms cap:
+  - "ROC request failed": 0
+  - dwell cycle ~1.9 s (~95 % duty) instead of ~330 ms (~62 %)
+  - STA stays associated (ping replies continue, latency ~0.9 s while a
+    transfer runs, which is the time-sharing cost)
+  - 1 MiB 11.0 s, 8 MiB 116.5 s, 32 MiB 358.9 s; all phone-side SHA256s match
+    the sender
+
+Build/deploy used for that measurement (yuni):
+  DRIVER_TARGET=modules DRIVER_JOBS=8 \
+  DRIVER_PROVIDER_SYMVERS=$PWD/stock-provider.symvers \
+    bash driver/build-baseline.sh kernel kernel-out wlan clang
+  ./clang/bin/llvm-objcopy --strip-debug \
+    wlan/qcacld-3.0/kiwi_v2.ko audit-0059/candidate-0059.ko
+  candidate-0059.ko sha256 8570940428b10acd6e75dd76b052af8b0b155b72ec3fd4b7453b234fc1e63562
+  (24 141 624 bytes; 24 bytes differ from candidate-0058)
+
+The on-device loader keeps its capability fast-path, so replacing a loaded
+0058 with 0059 needs a forced run: copy the modules plus driver-load.sh with
+the `if [ -f "$CAPTURE_HOLD" ]` block removed and run that copy as root.
+
+diff --git a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+--- a/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
++++ b/qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c
+@@ -186,7 +186,7 @@ static int __wlan_hdd_cfg80211_remain_on_channel(struct wiphy *wiphy,
+ 		if (!marionette_sta_monitor_enabled() ||
+ 		    adapter->device_mode != QDF_STA_MODE ||
+ 		    !hdd_cm_is_vdev_associated(adapter) || !chan ||
+-		    !duration || duration > 200 ||
++		    !duration || duration > 2000 ||
+ 		    (chan->center_freq != 2437 && chan->center_freq != 5220 &&
+ 		     chan->center_freq != 5745))
+ 			return -EINVAL;
+diff --git a/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c b/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c
+--- a/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c
++++ b/qcacld-3.0/components/p2p/core/src/wlan_p2p_roc.c
+@@ -129,7 +129,7 @@ static QDF_STATUS p2p_scan_start(struct p2p_roc_context *roc_ctx,
+ 	if (marionette_awdl_roc_rx &&
+ 	    wlan_vdev_mlme_get_opmode(vdev) == QDF_STA_MODE &&
+-	    roc_ctx->duration <= 1000 &&
++	    roc_ctx->duration <= 2000 &&
+ 	    (roc_ctx->chan_freq == 2437 || roc_ctx->chan_freq == 5220 ||
+ 	     roc_ctx->chan_freq == 5745)) {
+ 		/* WMI_SCAN_FILTER_PROMISCOUS already has a normal scan API

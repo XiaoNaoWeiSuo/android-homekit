@@ -1,0 +1,12 @@
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_1.0.h
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/1.0/dp_rx_mon_1.0.h
+@@ -736,8 +736,7 @@
+ 
+ 		*is_frag_p = true;
+ 		*frag_len_p = (RX_MONITOR_BUFFER_SIZE - rx_pkt_tlv_len -
+-			       *l2_hdr_offset_p) &
+-			      (RXDMA_DATA_DMA_BLOCK_SIZE - 1);
++			       *l2_hdr_offset_p);
+ 		*total_frag_len_p += *frag_len_p;
+ 	} else {
+ 		if (hal_rx_tlv_decap_format_get(dp_soc->hal_soc, rx_desc_tlv) ==

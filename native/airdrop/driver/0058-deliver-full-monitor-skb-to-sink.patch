@@ -1,0 +1,46 @@
+--- a/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
++++ b/qca-wifi-host-cmn/dp/wifi3.0/monitor/dp_rx_mon.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "marionette_monitor_rx_observe.h"
++#include "marionette_sta_monitor.h"
+ #include "hal_hw_headers.h"
+ #include "dp_types.h"
+ #include "dp_rx.h"
+@@ -1841,9 +1842,32 @@
+ 	 * without it filin cannot derive the peer's availability windows.
+ 	 * It lives in rx_status, next to the fields the CBF path already
+ 	 * reads, so pass it through while the descriptor is in scope. */
+-	marionette_monitor_post_frame(qdf_nbuf_data(mon_mpdu),
+-				     qdf_nbuf_headlen(mon_mpdu),
+-				     mon_pdev->ppdu_info.rx_status.tsft);
++	/* Restitch keeps the rest of an A-MSDU in skb fragments/frag_list.
++	 * Passing only headlen silently truncates it at one RX buffer. Copy
++	 * the complete skb for the sink without changing monitor ownership.
++	 * RX runs in atomic context; failure drops this sink copy only. */
++	if (marionette_sta_monitor_enabled()) {
++		u32 length = qdf_nbuf_len(mon_mpdu);
++		u8 *full_frame = NULL;
++
++		if (length && length <= 65535) {
++			if (length == qdf_nbuf_headlen(mon_mpdu)) {
++				marionette_monitor_post_frame(
++					qdf_nbuf_data(mon_mpdu), length,
++					mon_pdev->ppdu_info.rx_status.tsft);
++			} else {
++				full_frame = qdf_mem_malloc_atomic(length);
++				if (full_frame) {
++					if (!qdf_nbuf_copy_bits(mon_mpdu, 0, length,
++								full_frame))
++						marionette_monitor_post_frame(
++							full_frame, length,
++							mon_pdev->ppdu_info.rx_status.tsft);
++					qdf_mem_free(full_frame);
++				}
++			}
++		}
++	}
+ 	dp_rx_mon_process_dest_pktlog(soc, mac_id, mon_mpdu);
+ 
+ 	/* monitor vap cannot be present when mcopy is enabled
