@@ -21,3 +21,5 @@ multicast/unicast socket options without transmitting. Run independently:
 
 Android capture after the fix shows hop-limit 255 for the actual AirDrop PTR,
 SRV, TXT and AAAA announcements (device-20261026/round2/tap.log).
+
+2026-10-28: `ServiceDaemon::refresh_browse` sends a single PTR query for an active browse. It preserves the subscriber/cache and adds no retry timer. AirDrop uses it every 10 seconds because the upstream hour-long browse backoff can leave a missed AWDL announcement undiscovered. Other callers keep the upstream backoff.

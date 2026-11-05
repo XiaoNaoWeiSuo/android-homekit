@@ -6,8 +6,8 @@
 //! Reference: `docs/airdrop-protocol.md` (HTTP flow + iOS-18 quirks) and
 //! `opendrop-patch/server.py.patched` (the receiver these requests target).
 
-use crate::dvzip::cpio_to_dvzip;
 use crate::cpio::build_odc_cpio;
+use crate::dvzip::cpio_to_dvzip;
 use crate::http::{HttpRequest, HttpResponse};
 use crate::plist_impl::ReceiverConfig;
 use anyhow::Result;
@@ -45,7 +45,11 @@ impl SenderConfig {
     /// Build a `SenderConfig` with a freshly generated 6-byte `SenderID`.
     /// The value is random-but-stable-for-the-process so multiple transfers
     /// from one `luftlift send` invocation share a sender identity.
-    pub fn new(computer_name: impl Into<String>, model_name: impl Into<String>, bundle_id: impl Into<String>) -> Self {
+    pub fn new(
+        computer_name: impl Into<String>,
+        model_name: impl Into<String>,
+        bundle_id: impl Into<String>,
+    ) -> Self {
         Self {
             computer_name: computer_name.into(),
             model_name: model_name.into(),
@@ -119,10 +123,18 @@ pub struct FileToSend {
 /// minimal sender plist; Content-Type application/x-apple-plist.
 pub fn build_discover_request(cfg: &SenderConfig) -> HttpRequest {
     let mut dict = Dictionary::new();
-    dict.insert("SenderComputerName".into(), Value::String(cfg.computer_name.clone()));
-    dict.insert("SenderModelName".into(), Value::String(cfg.model_name.clone()));
+    dict.insert(
+        "SenderComputerName".into(),
+        Value::String(cfg.computer_name.clone()),
+    );
+    dict.insert(
+        "SenderModelName".into(),
+        Value::String(cfg.model_name.clone()),
+    );
     let mut body = Vec::new();
-    Value::Dictionary(dict).to_writer_binary(&mut body).expect("serialise discover request");
+    Value::Dictionary(dict)
+        .to_writer_binary(&mut body)
+        .expect("serialise discover request");
 
     let mut headers = HashMap::new();
     headers.insert("host".into(), "airdrop._tcp.local.".into());
@@ -137,13 +149,20 @@ pub fn build_discover_request(cfg: &SenderConfig) -> HttpRequest {
 
 /// Build the `/Ask` request body (file metadata plist). `transfer_id` is a
 /// caller-generated UUID; the receiver replies 200 after accepting the request.
-pub fn build_ask_request(cfg: &SenderConfig, transfer_id: &str, files: &[FileToSend]) -> HttpRequest {
+pub fn build_ask_request(
+    cfg: &SenderConfig,
+    transfer_id: &str,
+    files: &[FileToSend],
+) -> HttpRequest {
     let mut files_arr = Vec::new();
     for f in files {
         let mut entry = Dictionary::new();
         entry.insert("FileName".into(), Value::String(f.name.clone()));
         entry.insert("FileType".into(), Value::String(f.uti_type.clone()));
-        entry.insert("FileSize".into(), Value::Integer((f.data.len() as i64).into()));
+        entry.insert(
+            "FileSize".into(),
+            Value::Integer((f.data.len() as i64).into()),
+        );
         entry.insert("FileIsDirectory".into(), Value::Boolean(false));
         entry.insert("FileBomPath".into(), Value::String(format!("./{}", f.name)));
         files_arr.push(Value::Dictionary(entry));
@@ -155,16 +174,28 @@ pub fn build_ask_request(cfg: &SenderConfig, transfer_id: &str, files: &[FileToS
     // OpenDrop's /Ask sends config.service_id (12 hex characters), not
     // plist Data. Keep the type explicit; local handlers ignore this field
     // and therefore cannot establish Apple compatibility by round-tripping.
-    let sender_id: String = cfg.sender_id.iter().map(|byte| format!("{byte:02x}")).collect();
+    let sender_id: String = cfg
+        .sender_id
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     root.insert("SenderID".into(), Value::String(sender_id));
     root.insert("ConvertMediaFormats".into(), Value::Boolean(false));
-    root.insert("SenderComputerName".into(), Value::String(cfg.computer_name.clone()));
-    root.insert("SenderModelName".into(), Value::String(cfg.model_name.clone()));
+    root.insert(
+        "SenderComputerName".into(),
+        Value::String(cfg.computer_name.clone()),
+    );
+    root.insert(
+        "SenderModelName".into(),
+        Value::String(cfg.model_name.clone()),
+    );
     root.insert("BundleID".into(), Value::String(cfg.bundle_id.clone()));
     root.insert("Files".into(), Value::Array(files_arr));
 
     let mut body = Vec::new();
-    Value::Dictionary(root).to_writer_binary(&mut body).expect("serialise ask request");
+    Value::Dictionary(root)
+        .to_writer_binary(&mut body)
+        .expect("serialise ask request");
 
     let mut headers = HashMap::new();
     headers.insert("host".into(), "airdrop._tcp.local.".into());
@@ -180,8 +211,10 @@ pub fn build_ask_request(cfg: &SenderConfig, transfer_id: &str, files: &[FileToS
 /// Build the `/Upload` request body: a CPIO archive of the files, framed as
 /// dvzip (iOS-18 Content-Type `application/x-dvzip`).
 pub fn build_upload_request(files: &[FileToSend]) -> HttpRequest {
-    let entries: Vec<(&str, &[u8])> =
-        files.iter().map(|f| (f.name.as_str(), f.data.as_slice())).collect();
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|f| (f.name.as_str(), f.data.as_slice()))
+        .collect();
     let cpio = build_odc_cpio(&entries);
     let dvzip = cpio_to_dvzip(&cpio);
 
@@ -203,7 +236,9 @@ pub fn parse_discover_response(resp: &HttpResponse) -> Result<ReceiverConfig> {
         anyhow::bail!("/Discover returned status {}", resp.status);
     }
     let val = Value::from_reader(std::io::Cursor::new(&resp.body))?;
-    let dict = val.as_dictionary().ok_or_else(|| anyhow::anyhow!("/Discover response not a dict"))?;
+    let dict = val
+        .as_dictionary()
+        .ok_or_else(|| anyhow::anyhow!("/Discover response not a dict"))?;
     Ok(ReceiverConfig {
         computer_name: dict
             .get("ReceiverComputerName")
@@ -215,7 +250,10 @@ pub fn parse_discover_response(resp: &HttpResponse) -> Result<ReceiverConfig> {
             .and_then(|v| v.as_string())
             .unwrap_or("unknown")
             .to_string(),
-        record_data: dict.get("ReceiverRecordData").and_then(|v| v.as_data()).map(|d| d.to_vec()),
+        record_data: dict
+            .get("ReceiverRecordData")
+            .and_then(|v| v.as_data())
+            .map(|d| d.to_vec()),
     })
 }
 
@@ -255,7 +293,13 @@ pub fn send_files(
     files: &[FileToSend],
     transfer_id: &str,
 ) -> Result<()> {
-    send_files_with(transport, sender, files, transfer_id, &crate::progress::Sink::disabled())
+    send_files_with(
+        transport,
+        sender,
+        files,
+        transfer_id,
+        &crate::progress::Sink::disabled(),
+    )
 }
 
 /// As [`send_files`], reporting each protocol leg and byte progress to `sink`.
@@ -296,7 +340,8 @@ pub fn send_files_with(
     // on the client side skips the interim 100. The in-memory transport test
     // still works because format_request → parse_request transparently
     // decodes the chunked body before handle_post sees it.
-    req.headers.insert("transfer-encoding".into(), "chunked".into());
+    req.headers
+        .insert("transfer-encoding".into(), "chunked".into());
     req.headers.insert("expect".into(), "100-continue".into());
     req.body = chunk_frame(&req.body);
     let resp = transport.send_with_progress(&req, &mut |written, total| {
@@ -340,6 +385,31 @@ impl RustlsTransport {
             io_timeout: Duration::from_secs(70),
         }
     }
+
+    /// Bound a probe: the defaults wait long enough for a human acceptance
+    /// dialog, which is far too long for a name lookup.
+    pub fn set_timeouts(&mut self, connect: Duration, io: Duration) {
+        self.connect_timeout = connect;
+        self.io_timeout = io;
+    }
+}
+
+/// Ask a peer for its receiver record via `/Discover` and return the name it
+/// reports.
+///
+/// Apple hides the human device name from mDNS on modern devices: the instance
+/// is a random token and the SRV host is a UUID. The `/Discover` response still
+/// carries `ReceiverComputerName`, so a short probe recovers the name the
+/// AirDrop picker shows. Timeouts are deliberately short so a peer that
+/// advertises but does not answer cannot stall anything.
+pub fn probe_receiver_name(peer: SocketAddr) -> Result<String> {
+    let tls_config = Arc::new(crate::tls::build_client_config()?);
+    let mut transport = RustlsTransport::new(tls_config, peer);
+    transport.set_timeouts(Duration::from_secs(8), Duration::from_secs(8));
+    let sender = SenderConfig::new("luftlift", "MacBookPro", "com.luftlift.app");
+    let resp = transport.send(&build_discover_request(&sender))?;
+    let receiver = parse_discover_response(&resp)?;
+    Ok(receiver.computer_name)
 }
 
 /// How much of the outgoing wire to hand to TLS between progress reports.
@@ -454,10 +524,10 @@ fn parse_header_value(headers: &str, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chunked::decode_chunked;
-    use crate::dvzip::dvzip_to_cpio;
     use crate::cpio::read_odc_cpio;
-    use crate::http::{format_request, parse_request};
+    use crate::dvzip::dvzip_to_cpio;
     use crate::handlers::handle_post;
+    use crate::http::{format_request, parse_request};
     use crate::plist_impl::ReceiverConfig;
 
     fn sender() -> SenderConfig {
@@ -491,7 +561,10 @@ mod tests {
         let _ = done.send(());
         worker.join().unwrap();
         assert!(result.is_err());
-        assert!(elapsed < Duration::from_secs(1), "silent TLS peer stalled for {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "silent TLS peer stalled for {elapsed:?}"
+        );
     }
 
     // ---- build_discover_request ----
@@ -501,7 +574,10 @@ mod tests {
         let req = build_discover_request(&sender());
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/Discover");
-        assert_eq!(req.header("content-type"), Some("application/x-apple-plist"));
+        assert_eq!(
+            req.header("content-type"),
+            Some("application/x-apple-plist")
+        );
         assert_eq!(&req.body[..8], b"bplist00");
         // The receiver handler should accept it and produce a response.
         let resp = handle_post(&req, &rcfg());
@@ -536,19 +612,35 @@ mod tests {
         let req = build_ask_request(&sender(), "TID-SID", &files);
         let val = Value::from_reader(std::io::Cursor::new(&req.body)).unwrap();
         let dict = val.as_dictionary().unwrap();
-        let sid = dict.get("SenderID").expect("SenderID must be present in Ask body");
+        let sid = dict
+            .get("SenderID")
+            .expect("SenderID must be present in Ask body");
         assert_eq!(sid.as_string(), Some("deadbeefcafe"));
         assert!(dict.get("Items").is_none());
-        assert_eq!(dict.get("ConvertMediaFormats").unwrap().as_boolean(), Some(false));
-        let offer = dict.get("Files").unwrap().as_array().unwrap()[0].as_dictionary().unwrap();
-        assert_eq!(offer.get("FileIsDirectory").unwrap().as_boolean(), Some(false));
-        assert_eq!(offer.get("FileBomPath").unwrap().as_string(), Some("./note.txt"));
+        assert_eq!(
+            dict.get("ConvertMediaFormats").unwrap().as_boolean(),
+            Some(false)
+        );
+        let offer = dict.get("Files").unwrap().as_array().unwrap()[0]
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            offer.get("FileIsDirectory").unwrap().as_boolean(),
+            Some(false)
+        );
+        assert_eq!(
+            offer.get("FileBomPath").unwrap().as_string(),
+            Some("./note.txt")
+        );
     }
 
     #[test]
     fn sender_config_new_generates_non_empty_sender_id() {
         let cfg = SenderConfig::new("n", "m", "b");
-        assert!(!cfg.sender_id.is_empty(), "default SenderID must not be empty");
+        assert!(
+            !cfg.sender_id.is_empty(),
+            "default SenderID must not be empty"
+        );
         // Two constructions in the same process should be distinct (time-seeded).
         let other = SenderConfig::new("n", "m", "b");
         assert_ne!(cfg.sender_id, other.sender_id, "SenderIDs should differ");
@@ -581,7 +673,10 @@ mod tests {
         assert_eq!(resp.received_files[0].name, "hello.txt");
         assert_eq!(resp.received_files[0].bytes, b"hi from luftlift");
         assert_eq!(resp.received_files[1].name, "sweep.bin");
-        assert_eq!(resp.received_files[1].bytes, (0u8..=255).collect::<Vec<u8>>());
+        assert_eq!(
+            resp.received_files[1].bytes,
+            (0u8..=255).collect::<Vec<u8>>()
+        );
     }
 
     #[test]
@@ -613,7 +708,11 @@ mod tests {
 
     #[test]
     fn parse_discover_response_errors_on_non_200() {
-        let resp = HttpResponse { status: 404, body: Vec::new(), headers: Vec::new() };
+        let resp = HttpResponse {
+            status: 404,
+            body: Vec::new(),
+            headers: Vec::new(),
+        };
         assert!(parse_discover_response(&resp).is_err());
     }
 
@@ -699,15 +798,24 @@ mod tests {
             .collect();
         assert_eq!(stages, ["discover", "ask", "upload"]);
 
-        let sent = events.iter().find(|e| e["event"] == "sent").expect("sent event");
+        let sent = events
+            .iter()
+            .find(|e| e["event"] == "sent")
+            .expect("sent event");
         assert_eq!(sent["bytes"], 11, "the payload size, not the dvzip size");
-        assert_eq!(sent["peer"], "luftlift-pc", "the name the receiver reported in /Discover");
+        assert_eq!(
+            sent["peer"], "luftlift-pc",
+            "the name the receiver reported in /Discover"
+        );
 
         // The default transport impl cannot see the wire, so it reports one
         // (total,total) at the end — the contract the real TLS transport refines.
         let progress: Vec<&serde_json::Value> =
             events.iter().filter(|e| e["event"] == "progress").collect();
-        assert!(!progress.is_empty(), "an upload must report at least one progress event");
+        assert!(
+            !progress.is_empty(),
+            "an upload must report at least one progress event"
+        );
     }
 
     #[test]
@@ -725,7 +833,11 @@ mod tests {
                         headers: Vec::new(),
                     });
                 }
-                Ok(HttpResponse { status: 403, body: Vec::new(), headers: Vec::new() })
+                Ok(HttpResponse {
+                    status: 403,
+                    body: Vec::new(),
+                    headers: Vec::new(),
+                })
             }
         }
         let buf = CapBuf::default();
@@ -744,7 +856,9 @@ mod tests {
         );
         // No `upload` stage either: we must not claim to be uploading after a
         // rejection.
-        assert!(!events.iter().any(|e| e["event"] == "stage" && e["stage"] == "upload"));
+        assert!(!events
+            .iter()
+            .any(|e| e["event"] == "stage" && e["stage"] == "upload"));
     }
 
     #[test]
@@ -776,7 +890,10 @@ mod tests {
         let mut reader = std::io::Cursor::new(&raw[..]);
         let bytes = read_full_response(&mut reader).unwrap();
         let resp = crate::http::parse_response(&bytes).unwrap();
-        assert_eq!(resp.status, 200, "must skip the 100 Continue and return the final 200");
+        assert_eq!(
+            resp.status, 200,
+            "must skip the 100 Continue and return the final 200"
+        );
         assert_eq!(resp.body, b"hello");
     }
 
@@ -862,7 +979,11 @@ mod tests {
                         headers: Vec::new(),
                     })
                 } else {
-                    Ok(HttpResponse { status: 200, body: Vec::new(), headers: Vec::new() })
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: Vec::new(),
+                        headers: Vec::new(),
+                    })
                 }
             }
         }

@@ -18,19 +18,34 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 pub fn allow_awdl_ingress(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     let enabled: libc::c_int = 1;
     // SAFETY: enabled is a valid c_int for this socket option.
-    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, 0x1104,
-        (&enabled as *const libc::c_int).cast(), std::mem::size_of_val(&enabled) as libc::socklen_t) } != 0 {
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            0x1104,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    } != 0
+    {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-pub fn connect_tcp(peer: &SocketAddr, timeout: std::time::Duration) -> std::io::Result<std::net::TcpStream> {
+pub fn connect_tcp(
+    peer: &SocketAddr,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
     #[cfg(target_os = "macos")]
     if let SocketAddr::V6(v6) = peer {
         if v6.ip().is_unicast_link_local() {
             use std::os::fd::AsRawFd;
-            let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
             allow_awdl_ingress(socket.as_raw_fd())?;
             socket.connect_timeout(&(*peer).into(), timeout)?;
             return Ok(socket.into());
@@ -45,15 +60,23 @@ pub fn get_ipv6_for_interface(name: &str) -> Option<Ipv6Addr> {
     #[cfg(unix)]
     unsafe {
         let mut addresses: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut addresses) != 0 { return None; }
+        if libc::getifaddrs(&mut addresses) != 0 {
+            return None;
+        }
         let mut cursor = addresses;
         let mut found = None;
         while !cursor.is_null() {
             let item = &*cursor;
-            if !item.ifa_addr.is_null() && (*item.ifa_addr).sa_family as i32 == libc::AF_INET6 && std::ffi::CStr::from_ptr(item.ifa_name).to_bytes() == name.as_bytes() {
+            if !item.ifa_addr.is_null()
+                && (*item.ifa_addr).sa_family as i32 == libc::AF_INET6
+                && std::ffi::CStr::from_ptr(item.ifa_name).to_bytes() == name.as_bytes()
+            {
                 let addr = &*(item.ifa_addr as *const libc::sockaddr_in6);
                 let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-                if ip.is_unicast_link_local() { found = Some(ip); break; }
+                if ip.is_unicast_link_local() {
+                    found = Some(ip);
+                    break;
+                }
             }
             cursor = item.ifa_next;
         }
@@ -70,7 +93,9 @@ pub fn get_ipv6_for_interface(name: &str) -> Option<Ipv6Addr> {
         }
     }
     #[cfg(not(unix))]
-    { None }
+    {
+        None
+    }
 }
 
 /// Parse a `/proc/net/if_inet6` hex address (32 hex chars, no colons)
@@ -85,6 +110,68 @@ fn parse_inet6_addr(hex: &str) -> Option<Ipv6Addr> {
         bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(Ipv6Addr::from(bytes))
+}
+
+/// Find the IPv4 address and netmask of the named interface (e.g. `wlan0`).
+///
+/// Companion Link discovery has to sweep the local subnet because this
+/// network drops client-to-client multicast; the netmask decides how far the
+/// sweep may go.
+pub fn get_ipv4_for_interface(name: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    #[cfg(unix)]
+    unsafe {
+        let mut addresses: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut addresses) != 0 {
+            return None;
+        }
+        let mut cursor = addresses;
+        let mut found = None;
+        while !cursor.is_null() {
+            let item = &*cursor;
+            if !item.ifa_addr.is_null()
+                && (*item.ifa_addr).sa_family as i32 == libc::AF_INET
+                && std::ffi::CStr::from_ptr(item.ifa_name).to_bytes() == name.as_bytes()
+                && !item.ifa_netmask.is_null()
+            {
+                let addr = &*(item.ifa_addr as *const libc::sockaddr_in);
+                let mask = &*(item.ifa_netmask as *const libc::sockaddr_in);
+                let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                let netmask = std::net::Ipv4Addr::from(u32::from_be(mask.sin_addr.s_addr));
+                found = Some((ip, netmask));
+                break;
+            }
+            cursor = item.ifa_next;
+        }
+        libc::freeifaddrs(addresses);
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Derive the IPv6 link-local address an AWDL peer uses from its 6-byte MAC
+/// (EUI-64 with the universal/local bit flipped).
+///
+/// Verified against the reference Mac: MAC `6e:a1:81:28:0a:8d` maps to
+/// `fe80::6ca1:81ff:fe28:a8d`, which is exactly what its `awdl0` reports.
+/// filin's peer table holds the MACs; this is the conversion the sender needs
+/// to target a Mac's AWDL-only AirDrop receiver.
+pub fn mac_to_link_local(mac: [u8; 6]) -> Ipv6Addr {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0xfe;
+    bytes[1] = 0x80;
+    bytes[8] = mac[0] ^ 0x02;
+    bytes[9] = mac[1];
+    bytes[10] = mac[2];
+    bytes[11] = 0xff;
+    bytes[12] = 0xfe;
+    bytes[13] = mac[3];
+    bytes[14] = mac[4];
+    bytes[15] = mac[5];
+    Ipv6Addr::from(bytes)
 }
 
 /// Resolve a network interface name (e.g. `awdl0`) to its numeric index via
@@ -106,6 +193,34 @@ pub fn if_index_for(name: &str) -> Option<u32> {
     }
 }
 
+/// Identity of one incarnation of an interface. A recreated TAP may have
+/// exactly the same address/MAC but a different index; its multicast sockets
+/// must be recreated too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterfaceIdentity {
+    pub index: u32,
+    pub address: Ipv6Addr,
+}
+
+pub fn interface_identity(name: &str) -> Option<InterfaceIdentity> {
+    interface_identity_with(|| if_index_for(name), || get_ipv6_for_interface(name))
+}
+
+fn interface_identity_with(
+    mut index: impl FnMut() -> Option<u32>,
+    address: impl FnOnce() -> Option<Ipv6Addr>,
+) -> Option<InterfaceIdentity> {
+    // Bracket the address lookup: don't pair a new address with an old index
+    // when the interface is replaced during getifaddrs(). Retry next tick.
+    let before = index().filter(|i| *i != 0)?;
+    let address = address()?;
+    let after = index()?;
+    (before == after).then_some(InterfaceIdentity {
+        index: after,
+        address,
+    })
+}
+
 /// Build the [`SocketAddr`] to *connect* to a peer at `addr:port`, attaching
 /// the IPv6 `scope_id` when the peer is link-local (`fe80::/10`).
 ///
@@ -118,11 +233,7 @@ pub fn if_index_for(name: &str) -> Option<u32> {
 ///
 /// **Pure** — the `if_nametoindex` call is split out into [`if_index_for`] so
 /// this function is unit-testable without touching the OS.
-pub fn connect_addr_with_scope(
-    addr: IpAddr,
-    port: u16,
-    scope_id: Option<u32>,
-) -> SocketAddr {
+pub fn connect_addr_with_scope(addr: IpAddr, port: u16, scope_id: Option<u32>) -> SocketAddr {
     match addr {
         IpAddr::V6(v6) if v6.is_unicast_link_local() => {
             let scope = scope_id.unwrap_or(0);
@@ -144,8 +255,15 @@ mod tests {
         let mut enabled: libc::c_int = 0;
         let mut size = std::mem::size_of_val(&enabled) as libc::socklen_t;
         // SAFETY: enabled and size are valid writable socket-option buffers.
-        let result = unsafe { libc::getsockopt(listener.as_raw_fd(), libc::SOL_SOCKET,
-            0x1104, (&mut enabled as *mut libc::c_int).cast(), &mut size) };
+        let result = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                0x1104,
+                (&mut enabled as *mut libc::c_int).cast(),
+                &mut size,
+            )
+        };
         assert_eq!(result, 0);
         assert_eq!(enabled, 1);
     }
@@ -175,6 +293,39 @@ mod tests {
         if let Some(addr) = get_ipv6_for_interface("lo") {
             assert_eq!(addr, Ipv6Addr::LOCALHOST);
         }
+    }
+
+    #[test]
+    fn same_address_on_recreated_interface_is_a_new_identity() {
+        let address = "fe80::1".parse().unwrap();
+        let first = interface_identity_with(|| Some(47), || Some(address)).unwrap();
+        let recreated = interface_identity_with(|| Some(61), || Some(address)).unwrap();
+        assert_ne!(first, recreated);
+        assert_eq!(
+            first,
+            interface_identity_with(|| Some(47), || Some(address)).unwrap()
+        );
+    }
+
+    #[test]
+    fn interface_snapshot_rejects_replacement_during_address_lookup() {
+        let mut indices = [Some(47), Some(61)].into_iter();
+        assert_eq!(
+            interface_identity_with(
+                || indices.next().unwrap(),
+                || Some("fe80::1".parse().unwrap())
+            ),
+            None
+        );
+        assert_eq!(
+            interface_identity_with(|| None, || Some("fe80::1".parse().unwrap())),
+            None
+        );
+        assert_eq!(interface_identity_with(|| Some(47), || None), None);
+        assert_eq!(
+            interface_identity_with(|| Some(0), || Some("fe80::1".parse().unwrap())),
+            None
+        );
     }
 
     // ---- connect_addr_with_scope (the scope_id fix) ----
@@ -238,6 +389,14 @@ mod tests {
             SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 0),
             other => panic!("expected V6, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mac_to_link_local_matches_the_mac_awdl_address() {
+        // filin reports MAC 6e:a1:81:28:0a:8d for the reference Mac, whose
+        // awdl0 address is fe80::6ca1:81ff:fe28:a8d. EUI-64 flips the U/L bit.
+        let addr = mac_to_link_local([0x6e, 0xa1, 0x81, 0x28, 0x0a, 0x8d]);
+        assert_eq!(addr.to_string(), "fe80::6ca1:81ff:fe28:a8d");
     }
 
     #[test]

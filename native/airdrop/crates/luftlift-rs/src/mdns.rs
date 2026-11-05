@@ -71,6 +71,11 @@ pub struct MdnsConfig {
     /// receiver; DISCOVER_MAYBE tells the sender it may run `/Discover`.
     /// Override via `--flags` for experimentation.
     pub flags: u32,
+    /// Experimental `PINInfo` TXT value (UTF-8 JSON). Default `None`: normal
+    /// receivers never advertise this key, because PIN pairing is not
+    /// implemented. Set only for protocol observation with
+    /// `--pin-info-experimental`.
+    pub pin_info: Option<String>,
 }
 
 /// Build the `_airdrop._tcp` ServiceInfo for announcement.
@@ -87,6 +92,13 @@ pub fn build_airdrop_service_info(cfg: &MdnsConfig, addr: IpAddr) -> Result<Serv
     let hostname = format!("{}.local.", cfg.computer_name);
     let mut props = HashMap::new();
     props.insert("flags".to_string(), cfg.flags.to_string());
+    if let Some(pin_info) = &cfg.pin_info {
+        // Validate here so a malformed experimental value fails before the
+        // record is announced, instead of producing an unusable TXT record.
+        crate::pairing::PinInfo::from_json(pin_info)
+            .map_err(|e| anyhow::anyhow!("invalid PINInfo JSON: {e}"))?;
+        props.insert("PINInfo".to_string(), pin_info.clone());
+    }
 
     let info = ServiceInfo::new(
         "_airdrop._tcp.local.",
@@ -213,6 +225,9 @@ pub fn goodbye(daemon: &ServiceDaemon, fullname: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
     pub name: String,
+    /// SRV target, e.g. `Johns-MacBook-Pro.local.`. Apple hides the human
+    /// name from the instance on many devices but often leaves it here.
+    pub hostname: String,
     pub addresses: Vec<IpAddr>,
     pub port: u16,
 }
@@ -272,9 +287,23 @@ pub fn browse_stream(
         };
         match receiver.recv_timeout(wait) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                info!(name = %info.get_fullname(), addresses = ?info.get_addresses(), "discovered AirDrop peer");
+                // Apple hides the display name from the mDNS instance on
+                // modern devices (the instance is a random token). Log every
+                // TXT key so the naming source is observable instead of
+                // guessed; the UI otherwise shows the token verbatim.
+                let props: Vec<(String, String)> = info
+                    .get_properties()
+                    .iter()
+                    .map(|p| (p.key().to_string(), p.val_str().to_string()))
+                    .collect();
+                info!(
+                    name = %info.get_fullname(),
+                    ?props,
+                    "discovered AirDrop peer"
+                );
                 on_event(PeerEvent::Found(DiscoveredPeer {
                     name: info.get_fullname().to_string(),
+                    hostname: info.get_hostname().to_string(),
                     addresses: info.get_addresses().iter().copied().collect(),
                     port: info.get_port(),
                 }));
@@ -309,7 +338,9 @@ pub struct BrowseHandle {
 
 impl BrowseHandle {
     pub fn is_finished(&self) -> bool {
-        self.handle.lock().map(|h| h.as_ref().is_none_or(JoinHandle::is_finished))
+        self.handle
+            .lock()
+            .map(|h| h.as_ref().is_none_or(JoinHandle::is_finished))
             .unwrap_or(true)
     }
 
@@ -376,18 +407,40 @@ pub fn spawn_browse_with_started(
     on_event: impl FnMut(PeerEvent) + Send + 'static,
 ) -> Result<BrowseHandle> {
     let receiver = daemon.browse(AIRDROP_SERVICE_TYPE)?;
+    let query_daemon = daemon.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let handle = thread::Builder::new().name("airdrop-browse".into()).spawn(move || {
-        browse_loop(&stop_thread, on_started, || {
-            match receiver.recv_timeout(BROWSE_TICK) {
-                Ok(event) => Ok(Some(event)),
-                Err(_) if receiver.is_disconnected() => Err(()),
-                Err(_) => Ok(None),
-            }
-        }, on_event);
-    })?;
-    Ok(BrowseHandle { stop, handle: Mutex::new(Some(handle)) })
+    let handle = thread::Builder::new()
+        .name("airdrop-browse".into())
+        .spawn(move || {
+            // Normal mDNS browse backs off to one query per hour. AWDL can miss
+            // a whole discovery window, so ask again while keeping this listener
+            // and its peer cache intact (no reset/lost flicker).
+            let mut last_query = Instant::now();
+            browse_loop(
+                &stop_thread,
+                on_started,
+                || {
+                    let now = Instant::now();
+                    if should_reannounce(last_query, now) {
+                        if let Err(error) = query_daemon.refresh_browse(AIRDROP_SERVICE_TYPE) {
+                            warn!(%error, "AirDrop browse refresh failed");
+                        }
+                        last_query = now;
+                    }
+                    match receiver.recv_timeout(BROWSE_TICK) {
+                        Ok(event) => Ok(Some(event)),
+                        Err(_) if receiver.is_disconnected() => Err(()),
+                        Err(_) => Ok(None),
+                    }
+                },
+                on_event,
+            );
+        })?;
+    Ok(BrowseHandle {
+        stop,
+        handle: Mutex::new(Some(handle)),
+    })
 }
 
 // The receive adapter distinguishes timeout from channel closure, making
@@ -406,14 +459,24 @@ fn browse_loop(
             Ok(Some(ServiceEvent::ServiceResolved(info))) => {
                 let mut addresses: Vec<_> = info.get_addresses().iter().copied().collect();
                 addresses.sort_unstable();
+                // Apple does not put a human name in the mDNS instance on modern
+                // devices (it is a random token), so record every TXT key while
+                // resolving. That makes the naming source observable instead of
+                // guessed; the UI otherwise shows the token verbatim.
+                let props: Vec<(String, String)> = info
+                    .get_properties()
+                    .iter()
+                    .map(|p| (p.key().to_string(), p.val_str().to_string()))
+                    .collect();
                 let peer = DiscoveredPeer {
                     name: info.get_fullname().to_string(),
+                    hostname: info.get_hostname().to_string(),
                     addresses,
                     port: info.get_port(),
                 };
                 if peer_is_new_or_changed(&known, &peer) {
                     debug!(name = %peer.name, addresses = ?peer.addresses,
-                           port = peer.port, "AirDrop peer resolved");
+                           port = peer.port, ?props, "AirDrop peer resolved");
                     known.insert(peer.name.clone(), peer.clone());
                     on_event(PeerEvent::Found(peer));
                 }
@@ -448,9 +511,15 @@ pub fn peer_is_new_or_changed(
     match known.get(&peer.name) {
         Some(old) => {
             old.port != peer.port
-                || old.addresses.iter().collect::<std::collections::BTreeSet<_>>()
-                    != peer.addresses.iter().collect::<std::collections::BTreeSet<_>>()
-        },
+                || old
+                    .addresses
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    != peer
+                        .addresses
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+        }
         None => true,
     }
 }
@@ -460,7 +529,12 @@ mod tests {
     use super::*;
 
     fn cfg() -> MdnsConfig {
-        MdnsConfig { computer_name: "luftlift-pc".into(), port: 8771, flags: DEFAULT_FLAGS }
+        MdnsConfig {
+            computer_name: "luftlift-pc".into(),
+            port: 8771,
+            flags: DEFAULT_FLAGS,
+            pin_info: None,
+        }
     }
 
     #[test]
@@ -473,6 +547,38 @@ mod tests {
         // 0x88, advertised as its decimal string "136".
         let props = info.get_properties();
         assert_eq!(props.get("flags").map(|v| v.val_str()), Some("136"));
+    }
+
+    #[test]
+    fn pin_info_txt_is_absent_by_default() {
+        let info =
+            build_airdrop_service_info(&cfg(), "127.0.0.1".parse().unwrap()).expect("build info");
+        assert!(info.get_properties().get("PINInfo").is_none());
+    }
+
+    #[test]
+    fn pin_info_txt_is_announced_only_when_explicitly_configured() {
+        let mut cfg = cfg();
+        cfg.pin_info = Some(
+            r#"{"deviceID":"AA:BB:CC:DD:EE:FF","pkData":"cGtEYXRh","applicationLabel":"com.apple.sharingd.AirDrop"}"#
+                .into(),
+        );
+        let info =
+            build_airdrop_service_info(&cfg, "127.0.0.1".parse().unwrap()).expect("build info");
+        let props = info.get_properties();
+        let value = props
+            .get("PINInfo")
+            .map(|v| v.val_str())
+            .expect("PINInfo TXT property");
+        assert!(value.contains("\"deviceID\""));
+        assert!(value.contains("\"pkData\""));
+    }
+
+    #[test]
+    fn malformed_pin_info_is_rejected_before_announcement() {
+        let mut cfg = cfg();
+        cfg.pin_info = Some("not json".into());
+        assert!(build_airdrop_service_info(&cfg, "127.0.0.1".parse().unwrap()).is_err());
     }
 
     #[test]
@@ -504,7 +610,8 @@ mod tests {
 
     #[test]
     fn announce_registers_without_error() {
-        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) =
+            announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         assert!(info.get_fullname().contains("_airdrop._tcp"));
         // Clean shutdown via graceful goodbye.
         goodbye(&daemon, info.get_fullname()).expect("goodbye");
@@ -512,7 +619,8 @@ mod tests {
 
     #[test]
     fn goodbye_unregisters_a_registered_service() {
-        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) =
+            announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         let fullname = info.get_fullname().to_string();
         // goodbye must return Ok and send the TTL=0 multicast promptly (the
         // unregister status receiver resolves well within the 2s timeout).
@@ -529,8 +637,14 @@ mod tests {
     fn reannounce_interval_is_under_asrv_ttl() {
         // The A/SRV record TTL is 120s. REANNOUNCE_SECS must be comfortably
         // under it so a refresh goes out before the records expire on a peer.
-        assert!(REANNOUNCE_SECS < 120, "re-announce interval must be < 120s A/SRV TTL");
-        assert_eq!(REANNOUNCE_SECS, 10, "10s gives ~12 chances to land in a peer listen window before TTL expiry");
+        assert!(
+            REANNOUNCE_SECS < 120,
+            "re-announce interval must be < 120s A/SRV TTL"
+        );
+        assert_eq!(
+            REANNOUNCE_SECS, 10,
+            "10s gives ~12 chances to land in a peer listen window before TTL expiry"
+        );
     }
 
     #[test]
@@ -539,15 +653,20 @@ mod tests {
         // boundary the live receiver depends on.
         let last = Instant::now();
         // 1s before the threshold: not yet.
-        let before =
-            last + Duration::from_secs(REANNOUNCE_SECS) - Duration::from_secs(1);
-        assert!(!should_reannounce(last, before), "1s before interval -> no re-announce");
+        let before = last + Duration::from_secs(REANNOUNCE_SECS) - Duration::from_secs(1);
+        assert!(
+            !should_reannounce(last, before),
+            "1s before interval -> no re-announce"
+        );
         // Exactly at the threshold: yes.
         let at = last + Duration::from_secs(REANNOUNCE_SECS);
         assert!(should_reannounce(last, at), "at interval -> re-announce");
         // 30s past the threshold: still yes.
         let past = last + Duration::from_secs(REANNOUNCE_SECS + 30);
-        assert!(should_reannounce(last, past), "past interval -> re-announce");
+        assert!(
+            should_reannounce(last, past),
+            "past interval -> re-announce"
+        );
     }
 
     #[test]
@@ -556,7 +675,8 @@ mod tests {
         // the canonical mdns-sd refresh (emits fresh A/SRV/PTR/TXT + the
         // RFC 6762 §8.3 1s retransmit, no TTL=0 goodbye). Verify it accepts
         // the second register without error.
-        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) =
+            announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         reannounce(&daemon, &info).expect("re-announce must succeed on same daemon");
         // A second re-announce should also be fine (idempotent refresh).
         reannounce(&daemon, &info).expect("second re-announce must succeed");
@@ -568,14 +688,17 @@ mod tests {
         // The re-announcer thread must observe the stop flag within ~1 tick
         // (REANNOUNCE_TICK = 1s), so the SIGINT handler can wind it down
         // cleanly. Verifies the join handle resolves promptly after stop.
-        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) =
+            announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         let fullname = info.get_fullname().to_string();
         let daemon = Arc::new(daemon);
         let (stop, handle) = spawn_reannouncer(daemon.clone(), info);
         // Let it tick once, then stop it.
         std::thread::sleep(Duration::from_millis(1100));
         stop.store(true, std::sync::atomic::Ordering::Release);
-        handle.join().expect("re-announcer thread must exit cleanly after stop");
+        handle
+            .join()
+            .expect("re-announcer thread must exit cleanly after stop");
         goodbye(&daemon, &fullname).ok();
     }
 
@@ -584,6 +707,7 @@ mod tests {
     fn peer(name: &str, addr: &str, port: u16) -> DiscoveredPeer {
         DiscoveredPeer {
             name: name.to_string(),
+            hostname: format!("{name}.local."),
             addresses: vec![addr.parse().expect("test address")],
             port,
         }
@@ -596,23 +720,38 @@ mod tests {
         // time; the browse loop must stay silent for an unchanged record.
         let mut known = HashMap::new();
         let first = peer("a._airdrop._tcp.local.", "fe80::1", 8771);
-        assert!(peer_is_new_or_changed(&known, &first), "first sighting is always emitted");
+        assert!(
+            peer_is_new_or_changed(&known, &first),
+            "first sighting is always emitted"
+        );
         known.insert(first.name.clone(), first.clone());
-        assert!(!peer_is_new_or_changed(&known, &first), "identical re-resolution is suppressed");
+        assert!(
+            !peer_is_new_or_changed(&known, &first),
+            "identical re-resolution is suppressed"
+        );
 
         // Port change (a restarted receiver) must be surfaced.
         let mut moved = first.clone();
         moved.port = 9000;
-        assert!(peer_is_new_or_changed(&known, &moved), "port change is emitted");
+        assert!(
+            peer_is_new_or_changed(&known, &moved),
+            "port change is emitted"
+        );
 
         // Address change (peer's AWDL interface re-created) must be surfaced.
         let mut readdr = first.clone();
         readdr.addresses = vec!["fe80::2".parse().unwrap()];
-        assert!(peer_is_new_or_changed(&known, &readdr), "address change is emitted");
+        assert!(
+            peer_is_new_or_changed(&known, &readdr),
+            "address change is emitted"
+        );
 
         // A different peer with the same address is still its own row.
         let other = peer("b._airdrop._tcp.local.", "fe80::1", 8771);
-        assert!(peer_is_new_or_changed(&known, &other), "different name is emitted");
+        assert!(
+            peer_is_new_or_changed(&known, &other),
+            "different name is emitted"
+        );
     }
 
     #[test]
@@ -626,15 +765,22 @@ mod tests {
         ]);
         let events = RefCell::new(Vec::new());
         let mut calls = 0;
-        browse_loop(&AtomicBool::new(false), || events.borrow_mut().push("reset"),
+        browse_loop(
+            &AtomicBool::new(false),
+            || events.borrow_mut().push("reset"),
             || {
                 calls += 1;
-                input.pop_front().expect("disconnected channel was polled again")
+                input
+                    .pop_front()
+                    .expect("disconnected channel was polled again")
             },
-            |event| events.borrow_mut().push(match event {
-                PeerEvent::Found(_) => "peer",
-                PeerEvent::Lost(_) => "lost",
-            }));
+            |event| {
+                events.borrow_mut().push(match event {
+                    PeerEvent::Found(_) => "peer",
+                    PeerEvent::Lost(_) => "lost",
+                })
+            },
+        );
         assert_eq!(*events.borrow(), ["reset", "peer", "lost"]);
         assert_eq!(calls, 3);
     }
@@ -658,16 +804,28 @@ mod tests {
         let mut input = std::collections::VecDeque::from([
             Ok(Some(ServiceEvent::ServiceResolved(info.clone()))),
             Ok(Some(ServiceEvent::ServiceResolved(info))),
-            Ok(Some(ServiceEvent::ServiceRemoved(AIRDROP_SERVICE_TYPE.into(), fullname.clone()))),
-            Ok(Some(ServiceEvent::ServiceRemoved(AIRDROP_SERVICE_TYPE.into(), fullname))),
+            Ok(Some(ServiceEvent::ServiceRemoved(
+                AIRDROP_SERVICE_TYPE.into(),
+                fullname.clone(),
+            ))),
+            Ok(Some(ServiceEvent::ServiceRemoved(
+                AIRDROP_SERVICE_TYPE.into(),
+                fullname,
+            ))),
             Err(()),
         ]);
         let mut events = Vec::new();
-        browse_loop(&AtomicBool::new(false), || {}, || input.pop_front().unwrap(),
-            |event| events.push(match event {
-                PeerEvent::Found(_) => "peer",
-                PeerEvent::Lost(_) => "lost",
-            }));
+        browse_loop(
+            &AtomicBool::new(false),
+            || {},
+            || input.pop_front().unwrap(),
+            |event| {
+                events.push(match event {
+                    PeerEvent::Found(_) => "peer",
+                    PeerEvent::Lost(_) => "lost",
+                })
+            },
+        );
         assert_eq!(events, ["peer", "lost"]);
     }
 
@@ -677,8 +835,10 @@ mod tests {
         // on the daemon that is already announcing (one UDP 5353 socket, one
         // responder), and it must stop within a browse tick so the announce
         // supervisor can tear down / re-create the pair on address change.
-        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
-        let handle = spawn_browse(&daemon, |_event| {}).expect("browse must start on a live daemon");
+        let (daemon, info) =
+            announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let handle =
+            spawn_browse(&daemon, |_event| {}).expect("browse must start on a live daemon");
         std::thread::sleep(Duration::from_millis(200));
         let started = Instant::now();
         handle.stop();
@@ -697,11 +857,11 @@ mod tests {
         // Teardown closures drop the handle when they cannot call stop()
         // explicitly; Drop must be equivalent, otherwise every address change
         // would leak a browse thread.
-        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) =
+            announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         {
             let _handle = spawn_browse(&daemon, |_event| {}).expect("browse must start");
         }
         goodbye(&daemon, info.get_fullname()).expect("goodbye");
     }
 }
-

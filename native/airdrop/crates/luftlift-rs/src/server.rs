@@ -4,16 +4,16 @@
 //!
 //! Reference: `opendrop-patch/server.py.patched` (`start_server`, `do_POST`).
 
-use crate::handlers::{HandleResult, handle_post};
-use crate::http::{HttpRequest, format_response, parse_request};
+use crate::handlers::{handle_post, HandleResult};
+use crate::http::{format_response, parse_request, HttpRequest, HttpResponse};
 use crate::introspect::IntrospectState;
 use crate::plist_impl::ReceiverConfig;
 use crate::progress::Sink;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustls::ServerConfig;
-use std::io::{BufRead, BufReader, Write, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -31,15 +31,22 @@ const RECV_CHUNK: usize = 64 * 1024;
 /// approval could be replayed.
 const APPROVAL_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Per-peer approval state, shared across connections.
+/// Per-peer approval state, shared across connections and across transports.
 ///
 /// Both keep-alive and reconnecting senders consume this same registry.
 /// A local connection flag must never bypass consumption: doing so leaves
 /// a second reusable grant after an upload on the original connection.
-type Approvals = Arc<Mutex<std::collections::HashMap<IpAddr, Instant>>>;
+pub type Approvals = Arc<Mutex<std::collections::HashMap<IpAddr, Instant>>>;
+
+/// Create an empty approval registry. Share one instance between the legacy
+/// HTTPS listener and the experimental QUIC endpoint so an `/Ask` approved on
+/// one transport authorizes the matching `/Upload` on the other.
+pub fn new_approvals() -> Approvals {
+    Arc::new(Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Record that `peer` just had a transfer approved.
-fn grant_approval(approvals: &Approvals, peer: IpAddr) {
+pub fn grant_approval(approvals: &Approvals, peer: IpAddr) {
     if let Ok(mut map) = approvals.lock() {
         // Opportunistic cleanup: this map holds one entry per peer that ever
         // sent something, which on a shared link is unbounded over time.
@@ -53,7 +60,7 @@ fn grant_approval(approvals: &Approvals, peer: IpAddr) {
 /// Consuming (rather than just checking) means one `/Ask` authorizes exactly one
 /// `/Upload`; a replayed upload would otherwise be accepted forever within the
 /// TTL.
-fn take_approval(approvals: &Approvals, peer: IpAddr) -> bool {
+pub fn take_approval(approvals: &Approvals, peer: IpAddr) -> bool {
     match approvals.lock() {
         Ok(mut map) => match map.remove(&peer) {
             Some(at) => at.elapsed() < APPROVAL_TTL,
@@ -96,6 +103,71 @@ pub fn handle_one_connection_with(
     let result = handle_post(&req, cfg);
     let response_bytes = format_response(&result.response);
     writer.write_all(&response_bytes)?;
+    Ok(result)
+}
+
+/// Handle one already-parsed AirDrop request for a local peer.
+///
+/// Both transports share this consent/persistence path so behavior cannot
+/// drift: `/Ask` supersedes an older approval, `/Upload` must consume a valid
+/// approval, and received files are written before the response is returned.
+/// The caller writes the returned response on its own framing (HTTP/1.1 or
+/// HTTP/3). Introduced for the experimental QUIC listener, which previously
+/// duplicated this logic in `main.rs`.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_airdrop_request(
+    peer: IpAddr,
+    req: &HttpRequest,
+    cfg: &ReceiverConfig,
+    output_dir: Option<&Path>,
+    introspect: &IntrospectState,
+    sink: &Sink,
+    approvals: &Approvals,
+) -> Result<HandleResult> {
+    if req.path == "/Ask" {
+        // A new request supersedes an old grant even if this one is rejected.
+        let _ = take_approval(approvals, peer);
+    }
+    if req.path == "/Upload" && !take_approval(approvals, peer) {
+        let mut response = HttpResponse::new(403);
+        response.headers.push(("Content-Length".into(), "0".into()));
+        return Ok(HandleResult {
+            response,
+            received_files: Vec::new(),
+        });
+    }
+
+    announce_discover(req, sink);
+    bump_introspect_for_request(introspect, req);
+
+    if req.path == "/Ask" {
+        if !crate::guard::approve(req, sink)? {
+            let mut response = HttpResponse::new(403);
+            response.headers.push(("Content-Length".into(), "0".into()));
+            return Ok(HandleResult {
+                response,
+                received_files: Vec::new(),
+            });
+        }
+        grant_approval(approvals, peer);
+    }
+
+    let result = handle_post(req, cfg);
+    if let Some(dir) = output_dir {
+        let mut saved: Vec<(String, u64, String)> = Vec::new();
+        for f in &result.received_files {
+            let path = crate::guard::save(dir, &f.name, &f.bytes)?;
+            saved.push((
+                f.name.clone(),
+                f.bytes.len() as u64,
+                path.display().to_string(),
+            ));
+        }
+        if !saved.is_empty() {
+            let total: u64 = saved.iter().map(|(_, size, _)| *size).sum();
+            sink.received(&dir.display().to_string(), total, &saved);
+        }
+    }
     Ok(result)
 }
 
@@ -171,7 +243,15 @@ fn read_headers(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         let mut line = Vec::new();
-        let n = reader.take(8193).read_until(b'\n', &mut line)?;
+        let n = reader
+            .take(8193)
+            .read_until(b'\n', &mut line)
+            .with_context(|| {
+                format!(
+                    "HTTP header read failed after {} bytes",
+                    buf.len() + line.len()
+                )
+            })?;
         anyhow::ensure!(buf.len() + line.len() <= 8192, "HTTP headers too large");
         if n == 0 {
             break;
@@ -196,7 +276,11 @@ fn read_headers(reader: &mut impl BufRead) -> Result<Vec<u8>> {
 /// between them. This is the only place that can report receive progress: by the
 /// time `handle_post` runs, the whole body is already in memory, so a UI hooked
 /// there could only ever show 0 % then 100 %.
-fn read_body(reader: &mut impl BufRead, header_bytes: &[u8], sink: Option<&Sink>) -> Result<Vec<u8>> {
+fn read_body(
+    reader: &mut impl BufRead,
+    header_bytes: &[u8],
+    sink: Option<&Sink>,
+) -> Result<Vec<u8>> {
     let head_str = std::str::from_utf8(header_bytes).unwrap_or("");
     // Progress is a property of the *transfer*, which is /Upload. /Discover and
     // /Ask also carry bodies (a few hundred bytes of plist), and reporting
@@ -243,8 +327,13 @@ fn read_exact_with_progress(
     let mut done = 0usize;
     while done < buf.len() {
         let want = (buf.len() - done).min(RECV_CHUNK);
-        reader.read_exact(&mut buf[done..done + want])?;
-        done += want;
+        let n = read_body_piece(
+            reader,
+            &mut buf[done..done + want],
+            done as u64,
+            "fixed-length body",
+        )?;
+        done += n;
         if let Some(sink) = sink {
             sink.progress(done as u64, total);
         }
@@ -289,18 +378,19 @@ pub fn serve_forever(
     output_dir: Option<PathBuf>,
     introspect: Arc<IntrospectState>,
     sink: Arc<Sink>,
+    approvals: Approvals,
 ) {
     let cfg = Arc::new(cfg);
     let output_dir = Arc::new(output_dir);
     let dump_dir = dump_upload_dir();
     let last_sender: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let approvals: Approvals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(tcp_stream) => {
                 if active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 8 {
-                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); continue;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    continue;
                 }
                 let active = active.clone();
                 let tls_config = tls_config.clone();
@@ -312,7 +402,7 @@ pub fn serve_forever(
                 let sink = sink.clone();
                 let approvals = approvals.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_tls_connection(
+                    let result = handle_tls_connection(
                         tcp_stream,
                         tls_config,
                         cfg,
@@ -320,11 +410,15 @@ pub fn serve_forever(
                         dump_dir,
                         last_sender,
                         introspect,
-                        sink,
+                        sink.clone(),
                         approvals,
-                    ) {
-                        warn!(error = %e, "connection error");
+                    );
+                    if let Err(e) = result {
+                        warn!(error = %format!("{e:#}"), "connection error");
                     }
+                    // Covers graceful incomplete requests as well as errors.
+                    // The UI ignores this after a completed upload.
+                    sink.emit("idle", serde_json::json!({"reason": "connection ended"}));
                     active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 });
             }
@@ -346,9 +440,32 @@ fn handle_tls_connection(
     approvals: Approvals,
 ) -> Result<()> {
     let peer = tcp_stream.peer_addr()?.ip();
-    anyhow::ensure!(peer.is_loopback() || matches!(peer, std::net::IpAddr::V6(v) if v.is_unicast_link_local() || v.to_ipv4_mapped().map(|a| a.is_loopback()).unwrap_or(false)), "non-local AirDrop peer");
+    anyhow::ensure!(
+        peer.is_loopback()
+            || matches!(peer, std::net::IpAddr::V6(v) if v.is_unicast_link_local() || v.to_ipv4_mapped().map(|a| a.is_loopback()).unwrap_or(false)),
+        "non-local AirDrop peer"
+    );
     tcp_stream.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
     tcp_stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    // Accepted sockets inherit the listener's buffer, but set it again so a
+    // previously autotuned (shrunken) window is undone, and disable Nagle:
+    // the AirDrop protocol is request/response with large bodies, and the
+    // extra ACK delay only inflates the already high AWDL RTT.
+    {
+        use std::os::fd::AsRawFd;
+        let size: libc::c_int = 4 * 1024 * 1024;
+        // SAFETY: `tcp_stream` owns a valid fd and the option value is a live c_int.
+        unsafe {
+            libc::setsockopt(
+                tcp_stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    let _ = tcp_stream.set_nodelay(true);
     let conn = rustls::ServerConnection::new(tls_config)?;
     let mut tls = rustls::StreamOwned::new(conn, tcp_stream);
     // Read headers, then body. The split lets us emit an interim
@@ -365,13 +482,15 @@ fn handle_tls_connection(
         // not an error.
         let header_bytes = match read_headers(&mut reader) {
             Ok(h) => h,
-            Err(_) if served > 0 => return Ok(()),
+            Err(e) if served > 0 => {
+                tracing::debug!(error = %format!("{e:#}"), served, "keep-alive connection ended before next request");
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         let head_str = std::str::from_utf8(&header_bytes).unwrap_or("");
-        let (method, path) = crate::http::parse_request_line(
-            head_str.split("\r\n").next().unwrap_or("")
-        )?;
+        let (method, path) =
+            crate::http::parse_request_line(head_str.split("\r\n").next().unwrap_or(""))?;
         if method != "POST" {
             reader.get_mut().write_all(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
             reader.get_mut().flush()?;
@@ -387,13 +506,17 @@ fn handle_tls_connection(
             // possibly huge body. The approval may have arrived on a *different*
             // connection, which is why it lives in `approvals` and not in a
             // local flag.
-            reader.get_mut().write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            reader.get_mut().write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
             reader.get_mut().flush()?;
             return Ok(());
         }
         if let Some(expect) = parse_header_value(head_str, "expect") {
             if expect.eq_ignore_ascii_case("100-continue") {
-                reader.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                reader
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                 // CRITICAL: flush the 100 Continue through the TLS encryption
                 // layer so it reaches the Apple sender. Without this, rustls
                 // buffers the plaintext and the sender never sees the 100,
@@ -402,7 +525,14 @@ fn handle_tls_connection(
                 reader.get_mut().flush()?;
             }
         }
-        let body = read_body(&mut reader, &header_bytes, Some(&sink))?;
+        info!(%peer, %method, %path, "HTTP request headers received");
+        let body_started = Instant::now();
+        let body = read_body(&mut reader, &header_bytes, Some(&sink)).with_context(|| {
+            format!(
+                "{method} {path} body read failed after {:?}",
+                body_started.elapsed()
+            )
+        })?;
         let mut raw = header_bytes;
         raw.extend_from_slice(&body);
 
@@ -436,7 +566,9 @@ fn handle_tls_connection(
 
         if req.path == "/Ask" {
             if !crate::guard::approve(&req, &sink)? {
-                reader.get_mut().write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                reader.get_mut().write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )?;
                 reader.get_mut().flush()?;
                 return Ok(());
             }
@@ -449,7 +581,11 @@ fn handle_tls_connection(
         for f in &result.received_files {
             if let Some(dir) = output_dir.as_ref() {
                 let path = crate::guard::save(dir, &f.name, &f.bytes)?;
-                saved.push((f.name.clone(), f.bytes.len() as u64, path.display().to_string()));
+                saved.push((
+                    f.name.clone(),
+                    f.bytes.len() as u64,
+                    path.display().to_string(),
+                ));
             }
         }
         // One event per completed transfer so the floating window can flip
@@ -483,9 +619,10 @@ fn handle_tls_connection(
         // (/Upload success, 406 — they set `Connection: close`) or the client
         // asked to. Otherwise loop to read the pipelined next request — this is
         // what lets a web-link Upload arrive on the same connection as its Ask.
-        let resp_closes = result.response.headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")
-        });
+        let resp_closes =
+            result.response.headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")
+            });
         let req_closes = req
             .header("connection")
             .map(|v| v.eq_ignore_ascii_case("close"))
@@ -505,6 +642,32 @@ fn handle_tls_connection(
 pub fn bind_listener(port: u16) -> Result<TcpListener> {
     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     let listener = TcpListener::bind(addr)?;
+    // A 1 MiB AirDrop upload over AWDL sees ~120 ms RTT. With the kernel's
+    // autotuned ~14 KiB receive window that caps the transfer near 100 KiB/s
+    // even when almost nothing is retransmitted (measured 2026-11-05:
+    // retrans 0/1 while bytes_received crawled). A fixed large buffer lets the
+    // sender keep a BDP's worth of data in flight; the negotiated window scale
+    // already permits it. rmem_max on the device is 16 MiB.
+    const RECV_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `listener` owns a valid fd and the option value is a live c_int.
+        let rc = unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&RECV_BUFFER_BYTES as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            warn!(
+                error = %std::io::Error::last_os_error(),
+                "could not enlarge the listener receive buffer"
+            );
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
@@ -547,7 +710,10 @@ fn read_chunked_stream(reader: &mut impl BufRead, sink: Option<&Sink>) -> Result
     let mut payload = 0u64;
     loop {
         let mut size_line = String::new();
-        let n = reader.take(1025).read_line(&mut size_line)?;
+        let n = reader
+            .take(1025)
+            .read_line(&mut size_line)
+            .with_context(|| format!("chunk header read failed after {payload} payload bytes"))?;
         anyhow::ensure!(size_line.len() <= 1024, "chunk header too large");
         if n == 0 {
             anyhow::bail!("chunked body: EOF before last-chunk (truncated)");
@@ -574,17 +740,24 @@ fn read_chunked_stream(reader: &mut impl BufRead, sink: Option<&Sink>) -> Result
             // Genuine last-chunk: consume the trailing CRLF (and any
             // optional trailer-part up to the blank line).
             let mut trailer = String::new();
-            reader.read_line(&mut trailer)?;
+            reader.read_line(&mut trailer).with_context(|| {
+                format!("chunk trailer read failed after {payload} payload bytes")
+            })?;
             raw.extend_from_slice(trailer.as_bytes());
             break;
         }
-        anyhow::ensure!(size <= crate::guard::MAX_BODY.saturating_sub(raw.len()), "chunk body too large");
+        anyhow::ensure!(
+            size <= crate::guard::MAX_BODY.saturating_sub(raw.len()),
+            "chunk body too large"
+        );
         let start = raw.len();
         raw.resize(start + size, 0);
         read_chunk_payload(reader, &mut raw[start..], payload, sink)?;
         payload += size as u64;
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf)?;
+        reader
+            .read_exact(&mut crlf)
+            .with_context(|| format!("chunk CRLF read failed after {payload} payload bytes"))?;
         raw.extend_from_slice(&crlf);
     }
     Ok(raw)
@@ -607,13 +780,42 @@ fn read_chunk_payload(
     let mut done = 0usize;
     while done < buf.len() {
         let want = (buf.len() - done).min(RECV_CHUNK);
-        reader.read_exact(&mut buf[done..done + want])?;
-        done += want;
+        let n = read_body_piece(
+            reader,
+            &mut buf[done..done + want],
+            already + done as u64,
+            "chunk payload",
+        )?;
+        done += n;
         if let Some(sink) = sink {
             sink.progress(already + done as u64, 0);
         }
     }
     Ok(())
+}
+
+/// Count each successful read, including partial TLS records, instead of
+/// losing the partial byte count inside `read_exact`. Interrupted reads are
+/// retried; WouldBlock/TimedOut remain terminal (on a blocking socket with
+/// SO_RCVTIMEO, WouldBlock can mean the configured read timeout elapsed).
+fn read_body_piece(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    received: u64,
+    stage: &str,
+) -> Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Ok(0) => anyhow::bail!("{stage}: unexpected EOF after {received} payload bytes"),
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("{stage}: read failed after {received} payload bytes")
+                })
+            }
+        }
+    }
 }
 
 // ---- raw /Upload body capture (LUFTLIFT_DUMP_UPLOAD) ----
@@ -680,7 +882,9 @@ pub fn dump_raw_body(dir: &std::path::Path, kind: &str, sender: &str, body: &[u8
             kind,
             "dumped raw request body (LUFTLIFT_DUMP_UPLOAD)"
         ),
-        Err(e) => warn!(path = %path.display(), error = %e, kind, "failed to dump raw request body"),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, kind, "failed to dump raw request body")
+        }
     }
 }
 
@@ -872,8 +1076,13 @@ mod tests {
         let cont_idx = out
             .find("HTTP/1.1 100 Continue")
             .expect("interim 100 Continue must be sent");
-        let final_idx = out.find("HTTP/1.1 200").expect("final 200 response must follow");
-        assert!(cont_idx < final_idx, "100 Continue must precede the final response");
+        let final_idx = out
+            .find("HTTP/1.1 200")
+            .expect("final 200 response must follow");
+        assert!(
+            cont_idx < final_idx,
+            "100 Continue must precede the final response"
+        );
     }
 
     #[test]
@@ -887,7 +1096,10 @@ mod tests {
         let mut writer = Vec::new();
         let _ = handle_one_connection(&mut reader, &mut writer, &cfg()).unwrap();
         let out = String::from_utf8_lossy(&writer);
-        assert!(!out.contains("100 Continue"), "no 100 Continue without Expect header");
+        assert!(
+            !out.contains("100 Continue"),
+            "no 100 Continue without Expect header"
+        );
         assert!(out.starts_with("HTTP/1.1 200"));
     }
 
@@ -927,7 +1139,10 @@ mod tests {
                          \r\n\
                          hello";
         let mut reader = Cursor::new(&request[..]);
-        let mut writer = FlushTracker { inner: Vec::new(), flush_count: 0 };
+        let mut writer = FlushTracker {
+            inner: Vec::new(),
+            flush_count: 0,
+        };
 
         let raw = read_request_respecting_expect(&mut reader, &mut writer).unwrap();
 
@@ -944,7 +1159,10 @@ mod tests {
              deadlocks waiting for it"
         );
         // Body was still read correctly.
-        assert!(raw.windows(5).any(|w| w == b"hello"), "body must be present in raw");
+        assert!(
+            raw.windows(5).any(|w| w == b"hello"),
+            "body must be present in raw"
+        );
     }
 
     #[test]
@@ -1014,7 +1232,10 @@ mod tests {
             .read(&mut buf)
             .expect("read 100-continue (timed out = server didn't flush the 100 Continue)");
         let cont = String::from_utf8_lossy(&buf[..n]);
-        assert!(cont.contains("100 Continue"), "expected 100 Continue, got: {cont}");
+        assert!(
+            cont.contains("100 Continue"),
+            "expected 100 Continue, got: {cont}"
+        );
 
         // 100 Continue received — send the chunked body.
         stream.write_all(&chunked_body).expect("write chunked body");
@@ -1022,12 +1243,17 @@ mod tests {
 
         // Read the final 200 response.
         let mut resp_buf = Vec::new();
-        stream.read_to_end(&mut resp_buf).expect("read final response");
+        stream
+            .read_to_end(&mut resp_buf)
+            .expect("read final response");
         let resp = String::from_utf8_lossy(&resp_buf);
         assert!(resp.contains("200"), "final response should be 200: {resp}");
 
         // Verify the server-side result.
-        let result = server_thread.join().expect("server thread").expect("handle");
+        let result = server_thread
+            .join()
+            .expect("server thread")
+            .expect("handle");
         assert_eq!(result.response.status, 200);
         assert_eq!(result.received_files.len(), 1);
         assert_eq!(result.received_files[0].name, "expect_test.txt");
@@ -1039,10 +1265,16 @@ mod tests {
     #[test]
     fn sanitize_sender_replaces_unsafe_chars() {
         // "Andrew's MacBook Pro" -> "Andrew_s_MacBook_Pro"
-        assert_eq!(sanitize_sender_for_filename("Andrew's MacBook Pro"), "Andrew_s_MacBook_Pro");
+        assert_eq!(
+            sanitize_sender_for_filename("Andrew's MacBook Pro"),
+            "Andrew_s_MacBook_Pro"
+        );
         // Alphanumeric / -_./ are kept.
         assert_eq!(sanitize_sender_for_filename("iPhone42"), "iPhone42");
-        assert_eq!(sanitize_sender_for_filename("luftlift-pc.local"), "luftlift-pc.local");
+        assert_eq!(
+            sanitize_sender_for_filename("luftlift-pc.local"),
+            "luftlift-pc.local"
+        );
         assert_eq!(sanitize_sender_for_filename("a_b-c.d"), "a_b-c.d");
     }
 
@@ -1052,7 +1284,10 @@ mod tests {
         // Non-ASCII chars are replaced with `_`; ASCII alphanumerics survive.
         // Use a string of only non-ASCII chars so output is all underscores.
         let s = sanitize_sender_for_filename("üïöé");
-        assert!(s.chars().all(|c| c == '_'), "expected all underscores, got {s:?}");
+        assert!(
+            s.chars().all(|c| c == '_'),
+            "expected all underscores, got {s:?}"
+        );
         // Mixed: ASCII kept, non-ASCII replaced.
         assert_eq!(sanitize_sender_for_filename("café"), "caf_");
     }
@@ -1073,7 +1308,10 @@ mod tests {
                 let name = name.to_string_lossy();
                 if name.starts_with(pattern)
                     && name.ends_with("-iPhone42.bin")
-                    && entry.metadata().map(|m| m.len() as usize == body.len()).unwrap_or(false)
+                    && entry
+                        .metadata()
+                        .map(|m| m.len() as usize == body.len())
+                        .unwrap_or(false)
                 {
                     let candidate = entry.path();
                     if found.as_ref().is_none_or(|p| {
@@ -1089,8 +1327,14 @@ mod tests {
         let read_back = std::fs::read(&path).expect("read dumped file");
         assert_eq!(read_back, body, "dumped bytes must match the input body");
         let fname = path.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(fname.contains("-iPhone42.bin"), "filename must include sender: {fname}");
-        assert!(fname.starts_with("upload-"), "filename must start with upload-: {fname}");
+        assert!(
+            fname.contains("-iPhone42.bin"),
+            "filename must include sender: {fname}"
+        );
+        assert!(
+            fname.starts_with("upload-"),
+            "filename must start with upload-: {fname}"
+        );
         // Cleanup.
         let _ = std::fs::remove_file(&path);
     }
@@ -1151,7 +1395,8 @@ mod tests {
         // Content-Length is on the wire, so the bar can show a real percentage
         // from the first byte. The final progress must equal the declared
         // length — a bar that stops at 98 % looks like a failed transfer.
-        let dvzip = crate::dvzip::cpio_to_dvzip(&crate::cpio::build_odc_cpio(&[("a.txt", b"hello")]));
+        let dvzip =
+            crate::dvzip::cpio_to_dvzip(&crate::cpio::build_odc_cpio(&[("a.txt", b"hello")]));
         let request = format!(
             "POST /Upload HTTP/1.1\r\nContent-Type: application/x-dvzip\r\nContent-Length: {}\r\n\r\n",
             dvzip.len()
@@ -1162,15 +1407,107 @@ mod tests {
         let (sink, buf) = cap_sink();
         let mut reader = Cursor::new(&raw[..]);
         let mut writer = Vec::new();
-        let result = handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
+        let result =
+            handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
         assert_eq!(result.response.status, 200);
 
         let events = cap_events(&buf);
-        let receiving = events.iter().find(|e| e["event"] == "receiving").expect("receiving event");
-        assert_eq!(receiving["total"], dvzip.len() as u64, "declared length must be reported");
-        let last = events.iter().rev().find(|e| e["event"] == "progress").expect("progress events");
+        let receiving = events
+            .iter()
+            .find(|e| e["event"] == "receiving")
+            .expect("receiving event");
+        assert_eq!(
+            receiving["total"],
+            dvzip.len() as u64,
+            "declared length must be reported"
+        );
+        let last = events
+            .iter()
+            .rev()
+            .find(|e| e["event"] == "progress")
+            .expect("progress events");
         assert_eq!(last["received"], dvzip.len() as u64);
         assert_eq!(last["total"], dvzip.len() as u64);
+    }
+
+    /// A stalled TLS reader can return some plaintext before the socket's
+    /// read timeout surfaces as WouldBlock. Preserve that count and error kind.
+    struct PartialThenStalled {
+        bytes: std::io::Cursor<Vec<u8>>,
+        interrupt_once: bool,
+    }
+
+    impl Read for PartialThenStalled {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupt_once {
+                self.interrupt_once = false;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = self.bytes.read(buf)?;
+            if n == 0 {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(n)
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_body_stall_keeps_partial_progress_and_timeout_kind() {
+        let mut reader = PartialThenStalled {
+            bytes: Cursor::new(vec![7; 123]),
+            interrupt_once: true,
+        };
+        let (sink, events) = cap_sink();
+        let err = read_exact_with_progress(&mut reader, &mut [0; 1000], Some(&sink)).unwrap_err();
+        assert!(format!("{err:#}").contains("123 payload bytes"));
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let events = cap_events(&events);
+        assert_eq!(events.last().unwrap()["received"], 123);
+        assert_eq!(events.last().unwrap()["total"], 1000);
+    }
+
+    #[test]
+    fn chunk_body_stall_keeps_cumulative_partial_progress() {
+        let mut reader = PartialThenStalled {
+            bytes: Cursor::new(vec![7; 123]),
+            interrupt_once: false,
+        };
+        let (sink, events) = cap_sink();
+        let err = read_chunk_payload(&mut reader, &mut [0; 1000], 500, Some(&sink)).unwrap_err();
+        assert!(format!("{err:#}").contains("623 payload bytes"));
+        let events = cap_events(&events);
+        assert_eq!(events.last().unwrap()["received"], 623);
+        assert_eq!(events.last().unwrap()["total"], 0);
+    }
+
+    #[test]
+    fn blocking_socket_timeout_is_bounded_and_not_retried_forever() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let started = Instant::now();
+        let err = read_exact_with_progress(&mut socket, &mut [0; 1], None).unwrap_err();
+        let kind = err.downcast_ref::<std::io::Error>().unwrap().kind();
+        assert!(matches!(
+            kind,
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(format!("{err:#}").contains("0 payload bytes"));
+    }
+
+    #[test]
+    fn body_eof_is_not_reported_as_success() {
+        let err = read_exact_with_progress(&mut Cursor::new(vec![1; 13]), &mut [0; 20], None)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unexpected EOF after 13 payload bytes"));
     }
 
     #[test]
@@ -1179,7 +1516,8 @@ mod tests {
         // so `total` is 0 and the UI must render an indeterminate bar. The
         // byte counter still has to advance, otherwise the user sees nothing
         // at all for a 2-minute transfer.
-        let dvzip = crate::dvzip::cpio_to_dvzip(&crate::cpio::build_odc_cpio(&[("b.txt", b"chunk me")]));
+        let dvzip =
+            crate::dvzip::cpio_to_dvzip(&crate::cpio::build_odc_cpio(&[("b.txt", b"chunk me")]));
         let mut raw = b"POST /Upload HTTP/1.1\r\nContent-Type: application/x-dvzip\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         raw.extend_from_slice(format!("{:x}\r\n", dvzip.len()).as_bytes());
         raw.extend_from_slice(&dvzip);
@@ -1188,16 +1526,26 @@ mod tests {
         let (sink, buf) = cap_sink();
         let mut reader = Cursor::new(&raw[..]);
         let mut writer = Vec::new();
-        let result = handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
+        let result =
+            handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
         assert_eq!(result.response.status, 200);
         assert_eq!(result.received_files.len(), 1);
 
         let events = cap_events(&buf);
-        let receiving = events.iter().find(|e| e["event"] == "receiving").expect("receiving event");
-        assert_eq!(receiving["total"], 0, "chunked bodies have no declared total");
+        let receiving = events
+            .iter()
+            .find(|e| e["event"] == "receiving")
+            .expect("receiving event");
+        assert_eq!(
+            receiving["total"], 0,
+            "chunked bodies have no declared total"
+        );
         let progress: Vec<&serde_json::Value> =
             events.iter().filter(|e| e["event"] == "progress").collect();
-        assert!(!progress.is_empty(), "chunked uploads must still report bytes");
+        assert!(
+            !progress.is_empty(),
+            "chunked uploads must still report bytes"
+        );
         assert!(progress.last().unwrap()["received"].as_u64().unwrap() > 0);
         assert_eq!(progress.last().unwrap()["total"], 0);
     }
@@ -1208,8 +1556,14 @@ mod tests {
         // shows it while the user is still browsing the picker.
         use plist::{Dictionary, Value};
         let mut d = Dictionary::new();
-        d.insert("SenderComputerName".into(), Value::String("Andrew's MacBook Pro".into()));
-        d.insert("SenderModelName".into(), Value::String("MacBookPro18,3".into()));
+        d.insert(
+            "SenderComputerName".into(),
+            Value::String("Andrew's MacBook Pro".into()),
+        );
+        d.insert(
+            "SenderModelName".into(),
+            Value::String("MacBookPro18,3".into()),
+        );
         let mut body = Vec::new();
         Value::Dictionary(d).to_writer_binary(&mut body).unwrap();
 
@@ -1226,7 +1580,10 @@ mod tests {
         handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
 
         let events = cap_events(&buf);
-        let discover = events.iter().find(|e| e["event"] == "discover").expect("discover event");
+        let discover = events
+            .iter()
+            .find(|e| e["event"] == "discover")
+            .expect("discover event");
         assert_eq!(discover["sender"], "Andrew's MacBook Pro");
     }
 
@@ -1238,10 +1595,14 @@ mod tests {
         let (sink, buf) = cap_sink();
         let mut reader = Cursor::new(request.as_bytes());
         let mut writer = Vec::new();
-        let result = handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
+        let result =
+            handle_one_connection_with(&mut reader, &mut writer, &cfg(), Some(&sink)).unwrap();
         assert_eq!(result.response.status, 200);
         let events = cap_events(&buf);
-        let discover = events.iter().find(|e| e["event"] == "discover").expect("discover event");
+        let discover = events
+            .iter()
+            .find(|e| e["event"] == "discover")
+            .expect("discover event");
         assert_eq!(discover["sender"], "unknown");
     }
 
@@ -1261,17 +1622,29 @@ mod tests {
             Value::Dictionary(d).to_writer_binary(&mut b).unwrap();
             b
         };
-        let ask = format!("POST /Ask HTTP/1.1\r\nContent-Length: {}\r\n\r\n", ask_body.len());
+        let ask = format!(
+            "POST /Ask HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            ask_body.len()
+        );
         let mut raw = ask.into_bytes();
         raw.extend_from_slice(&ask_body);
-        handle_one_connection_with(&mut Cursor::new(&raw[..]), &mut writer, &cfg(), Some(&sink)).unwrap();
+        handle_one_connection_with(&mut Cursor::new(&raw[..]), &mut writer, &cfg(), Some(&sink))
+            .unwrap();
 
         let discover = b"POST /Discover HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
-        handle_one_connection_with(&mut Cursor::new(&discover[..]), &mut writer, &cfg(), Some(&sink)).unwrap();
+        handle_one_connection_with(
+            &mut Cursor::new(&discover[..]),
+            &mut writer,
+            &cfg(),
+            Some(&sink),
+        )
+        .unwrap();
 
         let events = cap_events(&buf);
         assert!(
-            !events.iter().any(|e| e["event"] == "receiving" || e["event"] == "progress"),
+            !events
+                .iter()
+                .any(|e| e["event"] == "receiving" || e["event"] == "progress"),
             "only /Upload is a transfer: {:?}",
             events
         );
@@ -1290,8 +1663,14 @@ mod tests {
 
         assert!(!take_approval(&approvals, mac), "nothing approved yet");
         grant_approval(&approvals, mac);
-        assert!(!take_approval(&approvals, phone), "another peer must not inherit it");
-        assert!(take_approval(&approvals, mac), "the approved peer may upload");
+        assert!(
+            !take_approval(&approvals, phone),
+            "another peer must not inherit it"
+        );
+        assert!(
+            take_approval(&approvals, mac),
+            "the approved peer may upload"
+        );
         assert!(!take_approval(&approvals, mac), "and only once");
     }
 
@@ -1303,7 +1682,10 @@ mod tests {
         let mac: IpAddr = "fe80::3".parse().unwrap();
         {
             let mut map = approvals.lock().unwrap();
-            map.insert(mac, Instant::now() - APPROVAL_TTL - std::time::Duration::from_secs(1));
+            map.insert(
+                mac,
+                Instant::now() - APPROVAL_TTL - std::time::Duration::from_secs(1),
+            );
         }
         assert!(!take_approval(&approvals, mac));
         // And a fresh grant still works, proving the map is not wedged.
@@ -1326,6 +1708,82 @@ mod tests {
         let mut writer = Vec::new();
         let result = handle_one_connection_with(&mut reader, &mut writer, &cfg(), None).unwrap();
         assert_eq!(result.received_files[0].bytes, b"x");
+    }
+
+    #[test]
+    fn quic_style_discover_does_not_require_approval() {
+        let sink = Sink::disabled();
+        let introspect = IntrospectState::new();
+        let approvals = new_approvals();
+        let req = req_for("/Discover", Vec::new());
+        let result = handle_airdrop_request(
+            "127.0.0.1".parse().unwrap(),
+            &req,
+            &cfg(),
+            None,
+            &introspect,
+            sink.as_ref(),
+            &approvals,
+        )
+        .unwrap();
+        assert_eq!(result.response.status, 200);
+    }
+
+    #[test]
+    fn quic_style_upload_without_approval_is_forbidden() {
+        let sink = Sink::disabled();
+        let introspect = IntrospectState::new();
+        let approvals = new_approvals();
+        let mut req = req_for("/Upload", crate::cpio::build_odc_cpio(&[("q.txt", b"hi")]));
+        req.headers
+            .insert("content-type".into(), "application/x-cpio".into());
+        let result = handle_airdrop_request(
+            "127.0.0.1".parse().unwrap(),
+            &req,
+            &cfg(),
+            None,
+            &introspect,
+            sink.as_ref(),
+            &approvals,
+        )
+        .unwrap();
+        assert_eq!(result.response.status, 403);
+        assert!(result.received_files.is_empty());
+    }
+
+    #[test]
+    fn quic_style_upload_after_grant_saves_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("luftlift-quic-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sink = Sink::disabled();
+        let introspect = IntrospectState::new();
+        let approvals = new_approvals();
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        grant_approval(&approvals, peer);
+        let mut req = req_for("/Upload", crate::cpio::build_odc_cpio(&[("q.txt", b"hi")]));
+        req.headers
+            .insert("content-type".into(), "application/x-cpio".into());
+
+        let result = handle_airdrop_request(
+            peer,
+            &req,
+            &cfg(),
+            Some(dir.as_path()),
+            &introspect,
+            sink.as_ref(),
+            &approvals,
+        )
+        .unwrap();
+        assert_eq!(result.response.status, 200);
+        assert_eq!(result.received_files.len(), 1);
+        assert_eq!(std::fs::read(dir.join("q.txt")).unwrap(), b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

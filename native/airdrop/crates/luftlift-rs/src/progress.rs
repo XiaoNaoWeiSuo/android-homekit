@@ -33,6 +33,7 @@
 //! receiving  {total}                            /Upload body started arriving
 //! progress   {received, total}                  throttled byte counter
 //! received   {dir, total, files[]}              files are on disk
+//! idle       {reason}                           connection ended (failed or complete)
 //! browsing   {duration}                         send: mDNS browse started
 //! peer       {name, address, port}              send/find: a peer resolved
 //! lost       {name}                             find --watch: a peer went away
@@ -85,7 +86,9 @@ pub struct Sink {
 
 impl std::fmt::Debug for Sink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sink").field("enabled", &self.enabled).finish()
+        f.debug_struct("Sink")
+            .field("enabled", &self.enabled)
+            .finish()
     }
 }
 
@@ -255,10 +258,18 @@ impl Sink {
 
     /// A peer resolved. Shared by `send` (the chosen target) and
     /// `find --watch` (every peer as it appears).
-    pub fn peer(&self, name: &str, address: &str, port: u16) {
+    pub fn peer(&self, name: &str, address: &str, port: u16, display: &str) {
+        self.peer_with_kind(name, address, port, display, "airdrop");
+    }
+
+    /// Like [`Sink::peer`], with the protocol family that produced the record:
+    /// `airdrop` (legacy `_airdrop._tcp`) or `companion`
+    /// (`_companion-link._tcp`, macOS 26/27). The UI can use `kind` to decide
+    /// which transport a device supports; older readers ignore the extra key.
+    pub fn peer_with_kind(&self, name: &str, address: &str, port: u16, display: &str, kind: &str) {
         self.emit(
             "peer",
-            json!({"name": name, "address": address, "port": port}),
+            json!({"name": name, "address": address, "port": port, "display": display, "kind": kind}),
         );
     }
 
@@ -380,16 +391,23 @@ mod tests {
         sink.request("1730-0", "iPhone", 2048, &[("a.jpg".into(), 2048)]);
         sink.decision("1730-0", true);
         sink.receiving(2048);
-        sink.received("/sdcard/AirDrop", 2048, &[("a.jpg".into(), 2048, "/sdcard/AirDrop/a.jpg".into())]);
+        sink.received(
+            "/sdcard/AirDrop",
+            2048,
+            &[("a.jpg".into(), 2048, "/sdcard/AirDrop/a.jpg".into())],
+        );
         sink.browsing(5);
-        sink.peer("Mac", "fe80::1", 8771);
+        sink.peer("Mac", "fe80::1", 8771, "Mac.local.");
         sink.lost("Mac");
         sink.stage("upload");
         sink.sent(2048, "Mac");
         sink.error("nope");
 
         let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(raw.ends_with('\n'), "the last event must be newline-terminated");
+        assert!(
+            raw.ends_with('\n'),
+            "the last event must be newline-terminated"
+        );
         assert_eq!(raw.matches('\n').count(), 13, "one line per event");
 
         let parsed = lines(&buf);
@@ -400,8 +418,19 @@ mod tests {
         assert_eq!(
             names,
             [
-                "listening", "ready", "discover", "request", "decision", "receiving", "received",
-                "browsing", "peer", "lost", "stage", "sent", "error"
+                "listening",
+                "ready",
+                "discover",
+                "request",
+                "decision",
+                "receiving",
+                "received",
+                "browsing",
+                "peer",
+                "lost",
+                "stage",
+                "sent",
+                "error"
             ]
         );
         // Non-ASCII must survive as real UTF-8, not escaped bytes, so the
@@ -452,10 +481,7 @@ mod tests {
         sink.progress(9, 1000); // still 0% → dropped
         sink.progress(10, 1000); // 1% → emitted
         let parsed = lines(&buf);
-        let progress: Vec<&Value> = parsed
-            .iter()
-            .filter(|v| v["event"] == "progress")
-            .collect();
+        let progress: Vec<&Value> = parsed.iter().filter(|v| v["event"] == "progress").collect();
         assert_eq!(progress.len(), 2, "0% then 1% only: {:?}", parsed);
         assert_eq!(progress[0]["received"], 0);
         assert_eq!(progress[1]["received"], 10);
@@ -486,7 +512,11 @@ mod tests {
         }
         let parsed = lines(&buf);
         let progress = parsed.iter().filter(|v| v["event"] == "progress").count();
-        assert_eq!(progress, 1, "all 20 same-instant updates collapse: {:?}", parsed);
+        assert_eq!(
+            progress, 1,
+            "all 20 same-instant updates collapse: {:?}",
+            parsed
+        );
     }
 
     #[test]
@@ -531,11 +561,13 @@ mod tests {
         sink.stage("upload");
         sink.progress(0, 1000);
         let parsed = lines(&buf);
-        let progress: Vec<&Value> = parsed
-            .iter()
-            .filter(|v| v["event"] == "progress")
-            .collect();
-        assert_eq!(progress.len(), 2, "post-reset 0% must be emitted: {:?}", parsed);
+        let progress: Vec<&Value> = parsed.iter().filter(|v| v["event"] == "progress").collect();
+        assert_eq!(
+            progress.len(),
+            2,
+            "post-reset 0% must be emitted: {:?}",
+            parsed
+        );
         assert_eq!(progress[1]["received"], 0);
     }
 }

@@ -239,6 +239,13 @@ impl ServiceDaemon {
         Ok(resp_r)
     }
 
+    /// Send one extra PTR query for an existing browse without replacing its
+    /// listener, clearing cached peers, or adding a retransmission timer.
+    pub fn refresh_browse(&self, service_type: &str) -> Result<()> {
+        check_domain_suffix(service_type)?;
+        self.send_cmd(Command::RefreshBrowse(service_type.to_string()))
+    }
+
     /// Stops searching for a specific service type.
     ///
     /// When an error is returned, the caller should retry only when
@@ -615,6 +622,13 @@ impl ServiceDaemon {
         match command {
             Command::Browse(ty, next_delay, listener) => {
                 zc.exec_command_browse(repeating, ty, next_delay, listener);
+            }
+
+            Command::RefreshBrowse(ty) => {
+                if zc.service_queriers.contains_key(&ty) {
+                    zc.send_query(&ty, TYPE_PTR);
+                    zc.increase_counter(Counter::Browse, 1);
+                }
             }
 
             Command::ResolveHostname(hostname, next_delay, listener, timeout) => {
@@ -2368,6 +2382,7 @@ pub enum DaemonEvent {
 enum Command {
     /// Browsing for a service type (ty_domain, next_time_delay_in_seconds, channel::sender)
     Browse(String, u32, Sender<ServiceEvent>),
+    RefreshBrowse(String),
 
     /// Resolve a hostname to IP addresses.
     ResolveHostname(String, u32, Sender<HostnameResolutionEvent>, Option<u64>), // (hostname, next_time_delay_in_seconds, sender, timeout_in_milliseconds)
@@ -2412,6 +2427,7 @@ impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Browse(_, _, _) => write!(f, "Command Browse"),
+            Self::RefreshBrowse(_) => write!(f, "Command RefreshBrowse"),
             Self::ResolveHostname(_, _, _, _) => write!(f, "Command ResolveHostname"),
             Self::Exit(_) => write!(f, "Command Exit"),
             Self::GetStatus(_) => write!(f, "Command GetStatus"),

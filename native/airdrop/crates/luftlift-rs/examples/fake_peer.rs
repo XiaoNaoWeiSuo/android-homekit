@@ -32,7 +32,14 @@ fn main() -> anyhow::Result<()> {
     let addr = netutil::get_ipv6_for_interface(&interface)
         .ok_or_else(|| anyhow::anyhow!("interface {interface} has no IPv6 address"))?;
 
-    let cfg = MdnsConfig { computer_name: name, port: 8771, flags: DEFAULT_FLAGS };
+    let cfg = MdnsConfig {
+        computer_name: name,
+        port: 8771,
+        flags: DEFAULT_FLAGS,
+        // Observation-only: set MARIONETTE_PIN_INFO to a JSON object to put a
+        // PINInfo TXT on the fake service. Normal fake peers leave it unset.
+        pin_info: std::env::var("MARIONETTE_PIN_INFO").ok(),
+    };
     let (daemon, info) = mdns::announce(&interface, &cfg, addr.into())?;
     let daemon = std::sync::Arc::new(daemon);
     let (stop, handle) = mdns::spawn_reannouncer(daemon.clone(), info.clone());

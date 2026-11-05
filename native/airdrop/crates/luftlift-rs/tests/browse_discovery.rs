@@ -62,7 +62,12 @@ fn browse_on_announcing_daemon_reports_peer_then_lost() {
 
     // 1. Announce "ourselves" — the daemon under test is announcing, which is
     //    the situation the resident receiver is always in.
-    let self_cfg = MdnsConfig { computer_name: "luftlift-itest-self".into(), port: 8771, flags: DEFAULT_FLAGS };
+    let self_cfg = MdnsConfig {
+        computer_name: "luftlift-itest-self".into(),
+        port: 8771,
+        flags: DEFAULT_FLAGS,
+        pin_info: None,
+    };
     let (daemon, self_info) =
         mdns::announce(&interface, &self_cfg, addr.into()).expect("announce self");
     let self_name = self_info.get_fullname().to_string();
@@ -78,7 +83,12 @@ fn browse_on_announcing_daemon_reports_peer_then_lost() {
     // 3. A second instance on the same link, announced through the same daemon
     //    (a real peer would announce from its own host; the daemon does not
     //    care which process the record came from).
-    let peer_cfg = MdnsConfig { computer_name: "luftlift-itest-peer".into(), port: 8771, flags: DEFAULT_FLAGS };
+    let peer_cfg = MdnsConfig {
+        computer_name: "luftlift-itest-peer".into(),
+        port: 8771,
+        flags: DEFAULT_FLAGS,
+        pin_info: None,
+    };
     let peer_info =
         mdns::build_airdrop_service_info(&peer_cfg, addr.into()).expect("build peer info");
     let peer_name = peer_info.get_fullname().to_string();
@@ -93,9 +103,12 @@ fn browse_on_announcing_daemon_reports_peer_then_lost() {
     // 5. Our own announcement is reported too — `spawn_browse` deliberately
     //    does not filter; the receiver filters by instance prefix because only
     //    it knows which instance is its own.
-    wait_for(&events, Duration::from_secs(15), "Found(self)", |event| {
-        matches!(event, PeerEvent::Found(p) if p.name == self_name)
-    });
+    wait_for(
+        &events,
+        Duration::from_secs(15),
+        "Found(self)",
+        |event| matches!(event, PeerEvent::Found(p) if p.name == self_name),
+    );
 
     // 6. Re-announcing the same records must not duplicate the Found event.
     mdns::reannounce(&daemon, &peer_info).expect("re-announce peer");
@@ -106,14 +119,20 @@ fn browse_on_announcing_daemon_reports_peer_then_lost() {
         .iter()
         .filter(|e| matches!(e, PeerEvent::Found(p) if p.name == peer_name))
         .count();
-    assert_eq!(found_count, 1, "re-announce must not duplicate the peer event");
+    assert_eq!(
+        found_count, 1,
+        "re-announce must not duplicate the peer event"
+    );
 
     // 7. A goodbye must surface as Lost, so the UI can drop the row.
     let status = daemon.unregister(&peer_name).expect("unregister peer");
     let _ = status.recv_timeout(Duration::from_secs(2));
-    wait_for(&events, Duration::from_secs(15), "Lost(peer)", |event| {
-        matches!(event, PeerEvent::Lost(name) if *name == peer_name)
-    });
+    wait_for(
+        &events,
+        Duration::from_secs(15),
+        "Lost(peer)",
+        |event| matches!(event, PeerEvent::Lost(name) if *name == peer_name),
+    );
 
     browse.stop();
     mdns::goodbye(&daemon, &self_name).expect("goodbye self");
