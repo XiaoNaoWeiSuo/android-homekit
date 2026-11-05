@@ -43,7 +43,27 @@ ctrlc = "3"
 # Plain serde_json keeps the introspect surface tiny — no full async runtime.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+quinn = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+bytes = "1"
+http = "1"
+# Companion Link pairing crypto: X25519 key agreement, HKDF-SHA512 key
+# derivation and ChaCha20-Poly1305 for the HAP-style pair-verify messages.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# HAP pair-setup uses RFC 5054 SRP-6a with a 3072-bit group; the RustCrypto
+# `srp` crate's M1 differs from HAP's, so the arithmetic lives here.
+num-bigint = "0.4"
+num-traits = "0.2"
+hkdf = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
 # Add as needed: hyper/axum, cpio, etc.
+
+[dev-dependencies]
+# Only the pairing probes/examples sign with Ed25519.
+ed25519-dalek = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 socket2 = "0.5.10"

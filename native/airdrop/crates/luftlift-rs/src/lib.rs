@@ -6,18 +6,23 @@
 //!
 //! Reference: ../../opendrop-patch/ (patched Python opendrop + dvzip.py decoder).
 
-pub mod lifecycle;
-pub mod guard;
 pub mod chunked;
 pub mod client;
+pub mod companion;
 pub mod cpio;
+pub mod dns;
 pub mod dvzip;
+pub mod guard;
 pub mod handlers;
 pub mod http;
 pub mod introspect;
+pub mod lifecycle;
 pub mod mdns;
 pub mod netutil;
+pub mod pairing;
 pub mod plist_impl;
 pub mod progress;
+pub mod quic;
+pub mod rapport;
 pub mod server;
 pub mod tls;

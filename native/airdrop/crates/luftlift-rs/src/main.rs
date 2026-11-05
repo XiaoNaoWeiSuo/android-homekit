@@ -9,20 +9,21 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use luftlift_rs::{
-    client::{FileToSend, RustlsTransport, SenderConfig, send_files_with},
-    introspect::{
-        DEFAULT_HTTP_ADDR, IntrospectState, TraceCollector,
-        spawn_http_server,
-    },
-    mdns, netutil, server, tls,
+    client::{send_files_with, FileToSend, RustlsTransport, SenderConfig},
+    companion,
+    handlers::HandleResult,
+    introspect::{spawn_http_server, IntrospectState, TraceCollector, DEFAULT_HTTP_ADDR},
+    mdns,
     mdns::DEFAULT_FLAGS,
+    netutil,
     plist_impl::ReceiverConfig,
     progress::Sink,
+    server, tls,
 };
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type GoodbyeCallback = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
 
@@ -82,6 +83,26 @@ enum Command {
         /// which instance is ours, so it lists the phone as a nearby device).
         #[arg(long)]
         browse: bool,
+        /// Interface used to browse `_companion-link._tcp` (macOS 26/27
+        /// Rapport). This is the ordinary Wi-Fi interface, NOT `awdl0`: the
+        /// Mac advertises Companion Link over en0 / wlan0. Discovery is
+        /// independent of the AWDL announce lifecycle, so a missing interface
+        /// is retried instead of failing the receiver.
+        #[arg(long, default_value = "wlan0")]
+        companion_interface: String,
+        /// Experimental QUIC/HTTP3 listener (UDP). Default `off`: the legacy
+        /// HTTPS listener on 8771 remains the only advertised transport.
+        /// Accepts `IP:PORT` (for example `127.0.0.1:64020` or `[::]:64020`).
+        /// This does NOT advertise `_asquic`; application-service pairing is
+        /// still required before Apple devices can use it.
+        #[arg(long, default_value = "off")]
+        quic_addr: String,
+        /// Experimental `PINInfo` TXT value (UTF-8 JSON). Hidden and off by
+        /// default: PIN pairing is not implemented, so normal receivers must
+        /// not advertise this key. Intended only for bounded protocol
+        /// observation against a real Apple peer.
+        #[arg(long, hide = true)]
+        pin_info: Option<String>,
     },
     /// Find AirDrop senders on the local network.
     Find {
@@ -115,14 +136,23 @@ enum Command {
     },
 }
 
-/// Parse a flags integer in decimal or hex (e.g. `6`, `0x06`).
 fn parse_flags(s: &str) -> Result<u32, String> {
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
     let radix_base = if lower.starts_with("0x") { 16 } else { 10 };
     let stripped = lower.strip_prefix("0x").unwrap_or(s);
-    u32::from_str_radix(stripped, radix_base)
-        .map_err(|e| format!("invalid flags value '{s}': {e}"))
+    u32::from_str_radix(stripped, radix_base).map_err(|e| format!("invalid flags value '{s}': {e}"))
+}
+
+/// Parse `--quic-addr`: `off` disables the experimental QUIC listener.
+fn parse_quic_addr(value: &str) -> Result<Option<std::net::SocketAddr>, String> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|e| format!("invalid --quic-addr '{value}': {e}"))
 }
 
 fn main() -> Result<()> {
@@ -145,7 +175,11 @@ fn main() -> Result<()> {
     });
     let registry = tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
         .with(TraceCollector::new(introspect.clone()));
     registry.init();
 
@@ -163,15 +197,39 @@ fn main() -> Result<()> {
     let sink = Sink::from_flag(cli.progress || env_flag("MARIONETTE_PROGRESS"));
 
     match cli.command {
-        Command::Receive { output, flags, name, http_addr, browse } => {
-            receive(&cli.interface, output, flags, name, http_addr, browse, introspect, sink)
-        }
-        Command::Find { duration, json, watch } => {
-            find(&cli.interface, duration, json, watch, sink)
-        }
-        Command::Send { recipient, file, duration, address } => {
-            send(&cli.interface, &recipient, file, duration, address, sink)
-        }
+        Command::Receive {
+            output,
+            flags,
+            name,
+            http_addr,
+            browse,
+            companion_interface,
+            quic_addr,
+            pin_info,
+        } => receive(
+            &cli.interface,
+            output,
+            flags,
+            name,
+            http_addr,
+            browse,
+            companion_interface,
+            quic_addr,
+            pin_info,
+            introspect,
+            sink,
+        ),
+        Command::Find {
+            duration,
+            json,
+            watch,
+        } => find(&cli.interface, duration, json, watch, sink),
+        Command::Send {
+            recipient,
+            file,
+            duration,
+            address,
+        } => send(&cli.interface, &recipient, file, duration, address, sink),
     }
 }
 
@@ -206,10 +264,17 @@ fn receive(
     name: Option<String>,
     http_addr: String,
     browse: bool,
+    companion_interface: String,
+    quic_addr: String,
+    pin_info: Option<String>,
     introspect: Arc<IntrospectState>,
     sink: Arc<Sink>,
 ) -> Result<()> {
-    tracing::info!(interface, flags = format!("0x{flags:02x}"), "starting AirDrop receiver");
+    tracing::info!(
+        interface,
+        flags = format!("0x{flags:02x}"),
+        "starting AirDrop receiver"
+    );
 
     let cert = tls::generate_self_signed_cert()?;
     let tls_config = tls::build_server_config(&cert)?;
@@ -230,6 +295,16 @@ fn receive(
         computer_model: "MacBookPro".into(),
         record_data: None,
     };
+
+    if let Some(json) = &pin_info {
+        match luftlift_rs::pairing::PinInfo::from_json(json) {
+            Ok(info) => tracing::warn!(
+                advertisable = info.has_advertisement_fields(),
+                "experimental PINInfo TXT enabled — PIN pairing is NOT implemented; use only for bounded observation"
+            ),
+            Err(e) => anyhow::bail!("invalid --pin-info JSON: {e}"),
+        }
+    }
 
     // Spawn the loopback introspect HTTP server unless explicitly disabled.
     // Bound to 127.0.0.1 only — never reachable over the AWDL link. The
@@ -259,6 +334,50 @@ fn receive(
     // automatically reappears in the AirDrop picker after a card bounce
     // instead of advertising a dead/old address.
     let goodbye: GoodbyeCallback = Arc::new(Mutex::new(None));
+    // Companion Link (macOS 26/27): the Mac no longer advertises
+    // `_airdrop._tcp`, only `_companion-link._tcp` on its Wi-Fi interface.
+    // Browse it concurrently and feed the same peer list, so the phone shows
+    // real device names (the Companion instance name is human-readable).
+    if browse {
+        let sink = sink.clone();
+        let companion_interface = companion_interface.clone();
+        std::thread::Builder::new()
+            .name("companion-supervisor".into())
+            .spawn(move || loop {
+                let event_sink = sink.clone();
+                match companion::spawn_browse(&companion_interface, move |event| match event {
+                    companion::CompanionEvent::Found(peer) => {
+                        let address = companion::preferred_address(&peer.addresses)
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+                        event_sink.peer_with_kind(
+                            &peer.fullname,
+                            &address,
+                            peer.port,
+                            &peer.name,
+                            "companion",
+                        );
+                    }
+                    companion::CompanionEvent::Lost(name) => event_sink.lost(&name),
+                }) {
+                    Ok(handle) => {
+                        while !handle.is_finished() {
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                        tracing::warn!(
+                            interface = %companion_interface,
+                            "Companion Link browse ended — retrying"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        interface = %companion_interface,
+                        error = %e,
+                        "Companion Link browse failed to start — retrying"
+                    ),
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            })?;
+    }
     {
         let interface = interface.to_string();
         let base_name = default_base_name();
@@ -266,6 +385,7 @@ fn receive(
         let introspect = introspect.clone();
         let goodbye = goodbye.clone();
         let sink = sink.clone();
+        let pin_info = pin_info.clone();
         std::thread::spawn(move || {
             mdns_announce_supervisor(
                 &interface,
@@ -276,6 +396,7 @@ fn receive(
                 introspect,
                 goodbye,
                 sink,
+                pin_info,
             );
         });
     }
@@ -304,8 +425,95 @@ fn receive(
     // "up but invisible to Apple devices".
     sink.listening(&receiver_name, 8771);
 
-    server::serve_forever(listener, Arc::new(tls_config), cfg, Some(output), introspect, sink);
+    // One approval registry shared by both transports: an `/Ask` approved on
+    // HTTPS can authorize an `/Upload` that arrives over QUIC (and vice versa).
+    // The same request supersede/consume rules apply, so QUIC cannot become a
+    // consent bypass.
+    let approvals = server::new_approvals();
+    match parse_quic_addr(&quic_addr).map_err(anyhow::Error::msg)? {
+        Some(addr) => spawn_quic_listener(
+            addr,
+            cert,
+            cfg.clone(),
+            output.clone(),
+            introspect.clone(),
+            sink.clone(),
+            approvals.clone(),
+        ),
+        None => tracing::info!("QUIC/HTTP3 listener disabled (--quic-addr off)"),
+    }
+
+    server::serve_forever(
+        listener,
+        Arc::new(tls_config),
+        cfg,
+        Some(output),
+        introspect,
+        sink,
+        approvals,
+    );
     Ok(())
+}
+
+/// Start the experimental QUIC/HTTP3 listener on its own tokio runtime.
+///
+/// Binding or runtime failures are reported but do not stop the legacy HTTPS
+/// receiver: QUIC is additive and unadvertised.
+#[allow(clippy::too_many_arguments)]
+fn spawn_quic_listener(
+    addr: std::net::SocketAddr,
+    cert: tls::AirDropTlsCert,
+    cfg: ReceiverConfig,
+    output: PathBuf,
+    introspect: Arc<IntrospectState>,
+    sink: Arc<Sink>,
+    approvals: server::Approvals,
+) {
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                tracing::error!(error = %e, "QUIC runtime failed — continuing with legacy HTTPS only");
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let endpoint = match luftlift_rs::quic::bind(addr, &cert) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    tracing::error!(error = %e, %addr, "QUIC bind failed — continuing with legacy HTTPS only");
+                    return;
+                }
+            };
+            tracing::info!(%addr, "experimental QUIC/HTTP3 listener bound (not advertised)");
+            let handle = move |peer: std::net::IpAddr, req: luftlift_rs::http::HttpRequest| -> HandleResult {
+                match server::handle_airdrop_request(
+                    peer,
+                    &req,
+                    &cfg,
+                    Some(&output),
+                    &introspect,
+                    &sink,
+                    &approvals,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::error!(error = %e, "QUIC request handling failed");
+                        HandleResult {
+                            response: luftlift_rs::http::HttpResponse::new(500),
+                            received_files: Vec::new(),
+                        }
+                    }
+                }
+            };
+            if let Err(e) = luftlift_rs::quic::serve(endpoint, handle).await {
+                tracing::error!(error = %e, "QUIC listener stopped");
+            }
+        });
+    });
 }
 
 /// Keep an mDNS `_airdrop._tcp` announcement alive on the CURRENT awdl0
@@ -328,33 +536,39 @@ fn mdns_announce_supervisor(
     introspect: Arc<IntrospectState>,
     goodbye: GoodbyeCallback,
     sink: Arc<Sink>,
+    pin_info: Option<String>,
 ) {
     let mdns_cfg = mdns::MdnsConfig {
         computer_name: base_name.to_string(),
         port: 8771,
         flags,
+        pin_info,
     };
-    // Our own announcement is visible to our own browse (it is multicast, and
-    // the daemon caches what it registers). The AirDrop picker must not list
-    // the phone itself, so peers whose name carries our instance prefix are
-    // filtered out of the event stream. build_airdrop_service_info() names the
-    // instance `<base>-<pid>`, hence the same shape here.
-    let self_prefix = format!("{}-{}.", base_name, std::process::id());
-    // Teardown for the currently-active announce, and the address it advertises.
+    // Multicast membership belongs to an interface incarnation, not just
+    // its address: awdl0 can be recreated with the same MAC/IPv6 address.
     let mut teardown: Option<Box<dyn Fn()>> = None;
-    let mut last_addr: Option<std::net::Ipv6Addr> = None;
+    let mut last_interface: Option<netutil::InterfaceIdentity> = None;
     let mut active_browse: Option<Arc<mdns::BrowseHandle>> = None;
+    let mut browse_retry_at = None;
 
     loop {
-        if active_browse.as_ref().is_some_and(|handle| handle.is_finished()) {
-            if let Some(td) = teardown.take() { td(); }
+        if active_browse
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+            || browse_retry_due(browse_retry_at, Instant::now())
+        {
+            if let Some(td) = teardown.take() {
+                td();
+            }
             active_browse = None;
-            last_addr = None;
-            tracing::warn!("browse stream ended; recreating discovery session");
+            last_interface = None;
+            browse_retry_at = None;
+            tracing::warn!("browse unavailable; recreating discovery session");
         }
-        match netutil::get_ipv6_for_interface(interface) {
-            // New or changed awdl0 address → (re)announce.
-            Some(addr) if Some(addr) != last_addr => {
+        match netutil::interface_identity(interface) {
+            // Address OR interface index changed: rebuild sockets and browse.
+            Some(identity) if Some(identity) != last_interface => {
+                let addr = identity.address;
                 if let Some(td) = teardown.take() {
                     td();
                 }
@@ -364,7 +578,7 @@ fn mdns_announce_supervisor(
                         let fullname = info.get_fullname().to_string();
                         let (stop, _handle) = mdns::spawn_reannouncer(daemon.clone(), info);
                         introspect.record_announce(receiver_name.to_string(), 8771);
-                        tracing::info!(%addr, interface, service = %fullname, "mDNS (re)announced");
+                        tracing::info!(%addr, interface, ifindex = identity.index, service = %fullname, "mDNS (re)announced");
                         // The UI's "starting" spinner is cleared here rather
                         // than at bind() time: until the announce lands we are
                         // listening but *invisible*, and claiming readiness
@@ -378,30 +592,113 @@ fn mdns_announce_supervisor(
                         // receiver still works, it just cannot list peers.
                         let browsing = if browse {
                             let started_sink = sink.clone();
+                            // Apple hides the human name from mDNS (random
+                            // instance token, UUID SRV host). Ask each peer
+                            // over /Discover once, in the background, and emit
+                            // a second peer event when the name arrives.
+                            let probe_interface = interface.to_string();
+                            let probed: Arc<
+                                Mutex<std::collections::HashMap<String, std::time::Instant>>,
+                            > = Arc::new(Mutex::new(std::collections::HashMap::new()));
                             match mdns::spawn_browse_with_started(
-                                &daemon, move || started_sink.browsing(0), {
-                                let sink = sink.clone();
-                                let self_prefix = self_prefix.clone();
-                                move |event| match event {
-                                    mdns::PeerEvent::Found(peer) => {
-                                        if peer.name.starts_with(&self_prefix) {
-                                            return;
+                                &daemon,
+                                move || started_sink.browsing(0),
+                                {
+                                    let sink = sink.clone();
+                                    let self_fullname = fullname.clone();
+                                    let probe_interface = probe_interface.clone();
+                                    let probed = probed.clone();
+                                    move |event| match event {
+                                        mdns::PeerEvent::Found(peer) => {
+                                            if peer.name.eq_ignore_ascii_case(&self_fullname) {
+                                                return;
+                                            }
+                                            let address = preferred_address(&peer.addresses)
+                                                .map(|a| a.to_string())
+                                                .unwrap_or_default();
+                                            sink.peer(&peer.name, &address, peer.port, "");
+                                            if let Some(ip) = preferred_address(&peer.addresses) {
+                                                // Retry a failed lookup instead of
+                                                // remembering the name forever: a
+                                                // peer in "Contacts Only" may start
+                                                // answering later, and the AWDL link
+                                                // is lossy.
+                                                let due = probed
+                                                    .lock()
+                                                    .map(|mut seen| {
+                                                        let now = std::time::Instant::now();
+                                                        match seen.get(&peer.name) {
+                                                            Some(last)
+                                                                if now.duration_since(*last)
+                                                                    < std::time::Duration::from_secs(30) =>
+                                                            {
+                                                                false
+                                                            }
+                                                            _ => {
+                                                                seen.insert(peer.name.clone(), now);
+                                                                true
+                                                            }
+                                                        }
+                                                    })
+                                                    .unwrap_or(false);
+                                                if due {
+                                                    let sink = sink.clone();
+                                                    let name = peer.name.clone();
+                                                    let iface = probe_interface.clone();
+                                                    let port = peer.port;
+                                                    std::thread::spawn(move || {
+                                                        let scope = netutil::if_index_for(&iface);
+                                                        let sock = netutil::connect_addr_with_scope(
+                                                            ip, port, scope,
+                                                        );
+                                                        match luftlift_rs::client::probe_receiver_name(
+                                                            sock,
+                                                        ) {
+                                                            Ok(n)
+                                                                if !n.trim().is_empty()
+                                                                    && n != "unknown" =>
+                                                            {
+                                                                tracing::info!(
+                                                                    peer = %name,
+                                                                    display = %n,
+                                                                    "Discover name resolved"
+                                                                );
+                                                                sink.peer(
+                                                                    &name,
+                                                                    &ip.to_string(),
+                                                                    port,
+                                                                    &n,
+                                                                );
+                                                            }
+                                                            Ok(n) => tracing::debug!(
+                                                                peer = %name,
+                                                                name = %n,
+                                                                "Discover name empty"
+                                                            ),
+                                                            Err(err) => tracing::debug!(
+                                                                peer = %name,
+                                                                ?err,
+                                                                "Discover name probe failed"
+                                                            ),
+                                                        }
+                                                    });
+                                                }
+                                            }
                                         }
-                                        let address = preferred_address(&peer.addresses)
-                                            .map(|a| a.to_string())
-                                            .unwrap_or_default();
-                                        sink.peer(&peer.name, &address, peer.port);
-                                    }
-                                    mdns::PeerEvent::Lost(name) => {
-                                        if name.starts_with(&self_prefix) {
-                                            return;
+                                        mdns::PeerEvent::Lost(name) => {
+                                            if name.eq_ignore_ascii_case(&self_fullname) {
+                                                return;
+                                            }
+                                            sink.lost(&name);
                                         }
-                                        sink.lost(&name);
                                     }
-                                }
-                            }) {
+                                },
+                            ) {
                                 Ok(handle) => {
-                                    tracing::info!(interface, "browsing for nearby AirDrop devices");
+                                    tracing::info!(
+                                        interface,
+                                        "browsing for nearby AirDrop devices"
+                                    );
                                     Some(Arc::new(handle))
                                 }
                                 Err(e) => {
@@ -413,6 +710,15 @@ fn mdns_announce_supervisor(
                             None
                         };
 
+                        // A failed first browse must not strand discovery
+                        // forever just because the announce/address is healthy.
+                        // Retain the HTTPS receiver and retry this scoped mDNS
+                        // session after a bounded backoff, not every loop tick.
+                        browse_retry_at = if browse && browsing.is_none() {
+                            Some(Instant::now() + Duration::from_secs(10))
+                        } else {
+                            None
+                        };
                         active_browse = browsing.clone();
                         // Update the ctrl-c goodbye to point at this daemon.
                         if let Ok(mut g) = goodbye.lock() {
@@ -434,26 +740,35 @@ fn mdns_announce_supervisor(
                             let _ = mdns::goodbye(&d, &fname);
                             let _ = d.shutdown();
                         }));
-                        last_addr = Some(addr);
+                        last_interface = Some(identity);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, %addr, "mDNS announce failed; retrying in 1s");
                     }
                 }
             }
-            // awdl0 lost its address → tear down so we re-announce on return.
-            None if last_addr.is_some() => {
+            // Missing/inconsistent interface snapshot: do not retain rows
+            // or multicast membership from an old link incarnation.
+            None if last_interface.is_some() => {
                 if let Some(td) = teardown.take() {
                     td();
                 }
                 active_browse = None;
-                last_addr = None;
-                tracing::warn!(interface, "awdl0 address gone; will re-announce when it returns");
+                last_interface = None;
+                browse_retry_at = None;
+                tracing::warn!(
+                    interface,
+                    "awdl0 address gone; will re-announce when it returns"
+                );
             }
             _ => {}
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn browse_retry_due(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
 }
 
 fn find(interface: &str, duration: u64, json: bool, watch: bool, sink: Arc<Sink>) -> Result<()> {
@@ -467,8 +782,11 @@ fn find(interface: &str, duration: u64, json: bool, watch: bool, sink: Arc<Sink>
             mdns::PeerEvent::Found(p) => {
                 sink.peer(
                     &p.name,
-                    &preferred_address(&p.addresses).map(|a| a.to_string()).unwrap_or_default(),
+                    &preferred_address(&p.addresses)
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
                     p.port,
+                    &p.hostname,
                 );
             }
             mdns::PeerEvent::Lost(name) => sink.lost(&name),
@@ -479,20 +797,39 @@ fn find(interface: &str, duration: u64, json: bool, watch: bool, sink: Arc<Sink>
     sink.browsing(duration);
     let peers = mdns::browse(interface, Duration::from_secs(duration))?;
     for p in &peers {
-        sink.peer(&p.name, &p.addresses.first().map(|a| a.to_string()).unwrap_or_default(), p.port);
+        sink.peer(
+            &p.name,
+            &p.addresses
+                .first()
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+            p.port,
+            &p.hostname,
+        );
     }
     if json {
         // With --progress the `peer` events above already carry this; printing
         // the array as well would put a bare JSON *array* on a stream the
         // reader parses as one object per line.
         if !sink.is_enabled() {
-            println!("{}", serde_json::Value::Array(peers.iter().map(|p| serde_json::json!({"name":p.name,"port":p.port})).collect()));
+            println!(
+                "{}",
+                serde_json::Value::Array(
+                    peers
+                        .iter()
+                        .map(|p| serde_json::json!({"name":p.name,"port":p.port}))
+                        .collect()
+                )
+            );
         }
         return Ok(());
     }
     if peers.is_empty() {
         say(&sink, "No AirDrop senders found.");
-        say(&sink, "Tip: Apple devices announce only while their sharing pane is open.");
+        say(
+            &sink,
+            "Tip: Apple devices announce only while their sharing pane is open.",
+        );
     } else {
         say(&sink, "AirDrop senders found:");
         for peer in &peers {
@@ -524,7 +861,8 @@ fn preferred_address(addresses: &[std::net::IpAddr]) -> Option<std::net::IpAddr>
 
 /// Base name for mDNS instance/hostname and the receiver name. Respects the
 /// `LUFTLIFT_NAME` environment variable; defaults to "luftlift".
-fn default_base_name() -> String {    std::env::var("LUFTLIFT_NAME").unwrap_or_else(|_| "luftlift".to_string())
+fn default_base_name() -> String {
+    std::env::var("LUFTLIFT_NAME").unwrap_or_else(|_| "luftlift".to_string())
 }
 
 /// Resolve the ReceiverComputerName (what the Apple AirDrop picker displays).
@@ -591,35 +929,19 @@ fn send_inner(
             // Match the recipient by name ONLY. Do NOT fall back to "the first peer
             // discovered" — that silently targets whatever turned up first (typically
             // our own co-located `luftlift receive` service), sending the file to the
-            // wrong host. If nothing matches, fail loudly and list what WAS found.
-            let peer = peers
-                .iter()
-                .find(|p| p.name.contains(recipient))
-                .ok_or_else(|| {
-                    let found = if peers.is_empty() {
-                        "<none>".to_string()
-                    } else {
-                        peers
-                            .iter()
-                            .map(|p| p.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    anyhow::anyhow!(
-                        "no AirDrop receiver matching '{recipient}' found; discovered: [{found}] \
-                         (Apple devices announce only while their sharing pane is open)"
-                    )
+            // wrong host.
+            if let Some(peer) = peers.iter().find(|p| p.name.contains(recipient)) {
+                let addr = peer.addresses.first().copied().ok_or_else(|| {
+                    anyhow::anyhow!("receiver {recipient} has no resolved address")
                 })?;
-            let addr = peer
-                .addresses
-                .first()
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("receiver {recipient} has no resolved address"))?;
-            (peer.name.clone(), addr, peer.port)
+                (peer.name.clone(), addr, peer.port)
+            } else {
+                companion_fallback(recipient, &peers)?
+            }
         }
     };
     tracing::info!(peer = %peer_name, %addr, port, "receiver found");
-    sink.peer(&peer_name, &addr.to_string(), port);
+    sink.peer(&peer_name, &addr.to_string(), port, "");
 
     // The peer's address is IPv6 link-local on awdl0 (fe80::/10). Connecting
     // to a link-local address REQUIRES a scope_id (the interface zone), else
@@ -635,7 +957,11 @@ fn send_inner(
              connect will likely fail with EINVAL (os error 22)"
         );
     } else if needs_scope {
-        tracing::info!(interface, scope_id = scope_id, "attaching IPv6 scope_id for link-local peer");
+        tracing::info!(
+            interface,
+            scope_id = scope_id,
+            "attaching IPv6 scope_id for link-local peer"
+        );
     }
     let peer_addr = netutil::connect_addr_with_scope(addr, port, scope_id);
 
@@ -653,14 +979,91 @@ fn send_inner(
         uti_type: uti_for(&file).to_string(),
         data,
     }];
-    let transfer_id = format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        rand_u32(), rand_u16(), rand_u16(), rand_u16(), rand_u64() & 0xFFFFFFFFFFFF);
+    let transfer_id = format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        rand_u32(),
+        rand_u16(),
+        rand_u16(),
+        rand_u16(),
+        rand_u64() & 0xFFFFFFFFFFFF
+    );
     send_files_with(&mut transport, &sender, &files, &transfer_id, sink)?;
     say(sink, "Send complete.");
     Ok(())
 }
 
 /// Parse `--address` in either `1.2.3.4:8771` or `[fe80::1]:8771` form.
+/// macOS 26/27 fallback for `send`.
+///
+/// The Mac no longer advertises `_airdrop._tcp` on AWDL, so the legacy browse
+/// above finds nothing. Find the device through Companion Link (unicast sweep
+/// on the Wi-Fi interface) and then ask that host for its legacy AirDrop
+/// endpoint with one more unicast DNS query.
+///
+/// The interface defaults to `wlan0` and can be overridden with
+/// `LUFTLIFT_COMPANION_IFACE`; on this phone the Wi-Fi link is the only one
+/// that can reach a Mac's Companion Link advertisement.
+fn companion_fallback(
+    recipient: &str,
+    legacy: &[mdns::DiscoveredPeer],
+) -> Result<(String, std::net::IpAddr, u16)> {
+    let interface =
+        std::env::var("LUFTLIFT_COMPANION_IFACE").unwrap_or_else(|_| "wlan0".to_string());
+    tracing::info!(
+        recipient,
+        interface = %interface,
+        "no AWDL peer matched — trying Companion Link discovery"
+    );
+
+    let found = companion::sweep(&interface)?;
+    let peer = found
+        .iter()
+        .find(|p| p.name.contains(recipient))
+        .ok_or_else(|| {
+            let names = |list: Vec<&str>| {
+                if list.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    list.join(", ")
+                }
+            };
+            let legacy_names = names(legacy.iter().map(|p| p.name.as_str()).collect());
+            let companion_names = names(found.iter().map(|p| p.name.as_str()).collect());
+            anyhow::anyhow!(
+                "no receiver matching '{recipient}'; AWDL _airdrop._tcp: [{legacy_names}], \
+                 Companion Link on {interface}: [{companion_names}]"
+            )
+        })?;
+
+    let host = companion::preferred_address(&peer.addresses)
+        .ok_or_else(|| anyhow::anyhow!("{} has no usable address", peer.name))?;
+    let endpoint =
+        companion::resolve_airdrop_endpoint(host, Duration::from_secs(3)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} was found via Companion Link ({}:{}), but its AirDrop receiver did not answer \
+             on _airdrop._tcp. On macOS 26/27, open Finder → AirDrop on that Mac, keep the \
+             window open, then retry",
+                peer.name,
+                host,
+                peer.port
+            )
+        })?;
+    let addr = endpoint
+        .addresses
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv4())
+        .unwrap_or(host);
+    tracing::info!(
+        peer = %peer.name,
+        %addr,
+        port = endpoint.port,
+        instance = %endpoint.instance,
+        "resolved legacy AirDrop endpoint via Companion Link"
+    );
+    Ok((peer.name.clone(), addr, endpoint.port))
+}
+
 fn parse_socket_addr(text: &str) -> Result<(std::net::IpAddr, u16)> {
     let text = text.trim();
     let (host, port) = text
@@ -678,7 +1081,12 @@ fn parse_socket_addr(text: &str) -> Result<(std::net::IpAddr, u16)> {
 
 /// Best-effort UTI type from a file extension.
 fn uti_for(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("jpg") | Some("jpeg") => "public.jpeg",
         Some("png") => "public.png",
         Some("heic") => "public.heic",
@@ -693,7 +1101,9 @@ fn uti_for(path: &std::path::Path) -> &'static str {
 
 fn rand_u32() -> u32 {
     use std::time::SystemTime;
-    let s = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let s = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
     (s.subsec_nanos()) ^ (s.as_secs() as u32)
 }
 fn rand_u16() -> u16 {
@@ -701,13 +1111,56 @@ fn rand_u16() -> u16 {
 }
 fn rand_u64() -> u64 {
     use std::time::SystemTime;
-    let s = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let s = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
     s.as_nanos() as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_browse_retries_only_after_backoff() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+        assert!(!browse_retry_due(None, now));
+        assert!(!browse_retry_due(Some(deadline), now));
+        assert!(!browse_retry_due(
+            Some(deadline),
+            deadline - Duration::from_millis(1)
+        ));
+        assert!(browse_retry_due(Some(deadline), deadline));
+        assert!(browse_retry_due(
+            Some(deadline),
+            deadline + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn quic_addr_off_disables_listener() {
+        assert_eq!(parse_quic_addr("off").unwrap(), None);
+        assert_eq!(parse_quic_addr("OFF").unwrap(), None);
+    }
+
+    #[test]
+    fn quic_addr_accepts_explicit_ip_and_port() {
+        assert_eq!(
+            parse_quic_addr("127.0.0.1:64020").unwrap(),
+            Some("127.0.0.1:64020".parse().unwrap())
+        );
+        assert_eq!(
+            parse_quic_addr("[::]:64020").unwrap(),
+            Some("[::]:64020".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn quic_addr_rejects_garbage() {
+        assert!(parse_quic_addr("localhost").is_err());
+        assert!(parse_quic_addr("127.0.0.1").is_err());
+    }
 
     #[test]
     fn resolve_receiver_name_default_includes_pid() {
@@ -762,7 +1215,10 @@ mod tests {
         let routable: IpAddr = "2001:db8::1".parse().unwrap();
         let link_local: IpAddr = "fe80::1c2d:3e4f:5a6b:7c8d".parse().unwrap();
         let v4: IpAddr = "192.0.2.5".parse().unwrap();
-        assert_eq!(preferred_address(&[routable, link_local, v4]), Some(link_local));
+        assert_eq!(
+            preferred_address(&[routable, link_local, v4]),
+            Some(link_local)
+        );
         // No link-local → first entry (never None for a non-empty list).
         assert_eq!(preferred_address(&[v4, routable]), Some(v4));
         assert_eq!(preferred_address(&[]), None);

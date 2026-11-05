@@ -18,13 +18,49 @@ pub struct AirDropTlsCert {
     pub key_der: PrivateKeyDer<'static>,
 }
 
+/// What goes into a generated identity. AirDrop's receiver verifies the
+/// *client* certificate during the QUIC/TLS handshake, so the exact shape
+/// (CN, SAN, EKU) is an experimental variable, not boilerplate.
+pub struct CertSpec {
+    pub common_name: String,
+    pub san: Vec<String>,
+    pub client_auth: bool,
+}
+
+impl Default for CertSpec {
+    fn default() -> Self {
+        Self {
+            common_name: "luftlift".to_string(),
+            san: vec!["luftlift".to_string()],
+            client_auth: true,
+        }
+    }
+}
+
 /// Generate an ephemeral self-signed certificate suitable for AirDrop.
 pub fn generate_self_signed_cert() -> Result<AirDropTlsCert> {
+    generate_cert(&CertSpec::default())
+}
+
+/// Generate a self-signed identity with an explicit shape.
+pub fn generate_cert(spec: &CertSpec) -> Result<AirDropTlsCert> {
     // Install the ring crypto provider as the rustls default (idempotent).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let key_pair = rcgen::KeyPair::generate()?;
-    let params = rcgen::CertificateParams::new(vec!["luftlift".into()])?;
+    let mut params = rcgen::CertificateParams::new(spec.san.clone())?;
+    if !spec.common_name.is_empty() {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, spec.common_name.clone());
+    }
+    params.is_ca = rcgen::IsCa::NoCa;
+    if spec.client_auth {
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+    }
     let cert = params.self_signed(&key_pair)?;
     Ok(AirDropTlsCert {
         cert_der: cert.der().clone(),
@@ -114,6 +150,22 @@ pub fn build_client_config_with_identity(cert: &AirDropTlsCert) -> Result<Client
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
         .with_client_auth_cert(vec![cert.cert_der.clone()], cert.key_der.clone_key())?)
+}
+
+/// Load a PEM certificate chain + PKCS#8 key and build a client config with it.
+/// Used by the CA-signed identity experiment against AirDrop's QUIC listener.
+pub fn build_client_config_with_pem(cert_path: &str, key_path: &str) -> Result<ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_bytes = std::fs::read(cert_path)?;
+    let key_bytes = std::fs::read(key_path)?;
+    let certs = rustls_pemfile::certs(&mut cert_bytes.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
+        .ok_or_else(|| anyhow::anyhow!("no private key in {key_path}"))?;
+    Ok(ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_client_auth_cert(certs, key)?)
 }
 
 #[cfg(test)]
