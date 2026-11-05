@@ -35,6 +35,7 @@ MARIONETTE_PROGRESS=1 luftlift <subcommand>   # 环境变量（Android 服务用
 | `receiving` | `total` | `/Upload` 开始。`total:0` 表示**总长未知**（苹果固定用 chunked），UI 应显示不确定进度条。 |
 | `progress` | `received` `total` | 字节计数，已节流（见下）。`total:0` 时只能显示已接收字节数。 |
 | `received` | `dir` `total` `files[{name,size,path}]` | 文件已落盘。`path` 是**实际写入路径**（重名会带 `N-` 前缀），可直接打开。 |
+| `idle` | `reason` | 一个连接正常结束、超时或解析失败。接收中必须回到可继续收发状态；完成/发送状态不因此回退。 |
 | `error` | `message` | 致命错误，**每个进程最多一条**。 |
 
 ### 设备发现（`receive --browse` / `find --watch` / `send`）

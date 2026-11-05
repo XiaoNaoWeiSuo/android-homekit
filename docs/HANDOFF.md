@@ -1,6 +1,90 @@
 # Marionette HomeKit 交接与排障手册
 
-更新日期：2026-10-28
+更新日期：2026-11-04
+
+## 2026-11-04 17:31 调度一致性、发现恢复与中等文件验收（最新）
+
+60 秒 transfer pin 实验未证明改善，且用户随后报告接收弹窗消失，已回退到原 6 秒；不能把它记为吞吐修复。16:15 的手机日志只有 Discover、没有 Ask、审批目录为空；Mac 发起 ASK 后连接未完成，最终 receiverDeclined，不等于用户真的拒绝。
+
+发现明确源码不一致：AwdlState 会动态更新宣告序列，但 RocCapture 一直用初始化的旧副本。已删除该副本，将当前 channel_sequence 传入 tick；初始化即同步宣告序列；新增 capture_channel 只允许 STA 实际 home/保留 ROC 信道，all-social null 续驻留仍需 reservation/READY 验证。13 项 ROC 测试及初始化回归通过，filin 全量测试与 clippy 通过。16:43 部署后用户确认弹窗恢复；16:51 收到 Ask/Upload，但该次仍慢速。用户确认是同一 DMG并授权停止，17:12:42 仅用 socket 过滤关闭该上传，未关闭监听/常驻：终止时已读取 13,238,233 payload bytes、历时 1244.33 秒；Software caused connection abort 是主动停止结果，不是自然故障。
+
+手机发现修复：mDNS supervisor 现在以 `(ifindex, IPv6)` 识别接口代次，避免 awdl0 保持相同地址但重建后浏览仍绑旧接口；在读取地址前后核对 ifindex，竞态快照不使用。另首次 browse 启动失败不再永久停在仅宣告状态，10 秒 backoff 后重建 scoped mDNS 会话。已补接口重建/竞态和 backoff 测试。保留现有 10 秒 PTR refresh 与自身 fullname 过滤，未擅自启用 _asquic/PINInfo。日志已见多条外部 Apple AirDrop 服务的 PEER 进入 Kotlin，仍有 LOST/PEER 抖动；不能宣称全部 Apple 生态发现/互通完成。
+
+吞吐诊断补充：PendingTx 每 5 秒输出区间计数 enqueued/rejected/expired/sent/dropped/queued/queued_bytes；sent 仅代表 injector 接受，不是 OTA ACK。队列年龄/容量/FIFO未修改，take_stats 不重置年龄，有回归测试。
+
+17:28 原生 Mac → 手机的 transfer.log 成功落盘 **589,903 字节**，另有 163B AppleDouble；手机 Upload complete，Mac result=0、failureSubType=none、transport=awdl。Upload 头到解包约 5.77s（含协议/处理，不是纯 PHY 吞吐）；这不是用户选项中所说的 1MiB，不能记为 1MiB或DMG验收。手机文件 SHA256=`37546d18660b997aac4a3dbeb4eb1cb96644cee174102fc0f30d00aef156b7ee`，发送端源文件哈希尚未对比。该次 TX 区间计数合计 enqueued/sent=69，rejected/expired/dropped=0，不排除大文件其他阶段损失。
+
+当前安装的运行二进制与资产 SHA 一致：filin=`4c6c517b104282981df05ee8a7f335e1925772b36619dc73d1ade472e06f39d3`，receiver=`96038840a9a0eca14d22dd06cfe997680c3aa8c572c46027ba34b3964e0a6825`。17:31 receiver 在当前 ifindex=67 宣告/浏览。215 library +10 binary 测试与 clippy 通过；默认 browse_discovery 集成测试未设置 LUFTLIFT_TEST_IFACE，实际无线分支会跳过，不能冒充无线验收。Android release/APK 顺序构建并安装成功；Wi-Fi 10.12.1.61、listening、resident_enabled=true 保持，无抓包进程或活跃文件上传。大 DMG 完整落盘及 SHA **仍未通过**，下一步需分级测试而非再次长时间等待 78MiB。
+
+## 2026-11-04 14:08 大文件重试：极低吞吐后超时，双层窗口内交付一致（历史对照）
+
+用户开始发送前等待较久，13:35–13:39 的首次双层抓包已自动结束，且 Mac AWDL 地址已变化；该旧窗口不能算这次传输的证据。实际请求在 14:08:26.937660 进入 `/Upload`，Mac 变为 `ba:c8:0c:42:71:5d` / `fe80::b8c8:cff:fe42:715d:65248`，手机 TAP 为 ifindex **55**。14:10 左右补启 180 秒 paired capture，过滤新 sender MAC；两进程按时退出并确认消失，无后台抓包残留。
+
+本次不是始终卡在第一条 TLS 记录：socket 接收量持续缓慢增长，最终 14:18:16.796818 报 `POST /Upload body read failed after 589.857465296s: chunk payload: read failed after 1916921 payload bytes: Try again (os error 11)`。即实际已读入 **1,916,921 字节文件内容**，随后读取超时，没有完整 DMG 落盘。持续传输期约 10 分钟，不能把 60 秒 socket idle timeout 当成整个传输的总时限。
+
+补抓窗口：原始 `awdlsink` 412 帧、207 A-MSDU，未检出尾截断；按 AWDL/IPv6/TCP 解出 590 个数据段，548 个唯一 `(seq,length)`、42 次重复，与 `awdl0` 的 590/548/42 **逐一一致**，双方没有仅在一侧出现的 TCP 数据段。序号覆盖 `[3100678033,3101352281)`，累计 674248 个唯一字节，区间连续；两侧 tcpdump 均无内核抓包丢包。该证据只能排除**捕获窗口内 monitor 交付→TAP 的可见缺失**，不能排除 awdlsink 之前的 RF/固件损失或窗口外问题。部署后的截断 debug 日志未出现。
+
+运行的 filin SHA=`53cb4eeadd48e1e3de3b1dfc5fa59f7eba52aea70f4a83e7595f7d72ade13656`、receiver SHA=`9c2420f63ce4b04bbed5594f54cd9c564d39890e92617c54418b702c7f90fef4`，均与包内资产一致。证据在 `build/airdrop/dual-live-1409/`（README、raw/tap pcap、日志与 SHA256SUMS）。用户当前 `resident_enabled=true`，**不要擅自关闭；STOP 不代表持续停止**，本次已观察到 STOP 后被看护重启。最终 Wi-Fi 10.12.1.61 正常、接收端 listening、抓包均已停。仍未修复大文件，下一步应检查无线吞吐/调度与 sender 重传，而不是对没有证据的解封装路径改驱动。
+
+## 2026-11-04 13:24 大文件重试：第一个 TLS 大记录不完整（历史对照）
+
+用户再次从原生 Mac 发送 81,746,134 字节的 DMG，使用已安装的接收诊断版，未开启 PINInfo/QUIC。`13:24:43.512427` 手机完整收到 `POST /Upload` 请求头；`13:25:46.968864` 报 `POST /Upload body read failed after 63.456068778s: chunk header read failed after 0 payload bytes: Try again (os error 11)`，没有文件落盘。这不是证书阻断：本次已完成 TLS、ASK 和 Upload 请求头，不能沿用此前“失败在 ASK 前”的判断。
+
+本次同时抓了当前 awdl0（ifindex **47**）的 TCP，77 包、snaplen=128、抓包内核丢包 0。不能把旧 **if37** 的 FIN-WAIT-1 当成本次 socket。当前 socket 为 Mac `fe80::f087:e3ff:fe5c:854:61530` → 手机 `fe80::1c5c:68ff:fe7b:e580:8771`，`bytes_received=16093`、Recv-Q=0。第一条大 TLS application record 从 TCP seq **390026695** 开始，头 `17 03 03 40 11`，密文长度 16401（含头总长 16406）。手机累计 ACK 到 **390036341**，即该记录只收到连续 9646 字节，还缺 6760 字节；接收窗口非零。Mac 日志持续重传的起始序号恰为 **390036341**，但这些重传未出现在手机 TAP 抓包中。Mac 最终 result=1、NWError-50。**已定位到 TLS 解密之前的 TCP 数据缺口，但尚未定位到具体驱动/信道/解封装层。**
+
+已改 `server.rs`：记录请求阶段；固定长度/chunk payload 按每次实际 `read` 更新进度（不再把不足 64KiB 的已读字节藏在 `read_exact` 中）；错误包含累计字节数、阶段及底层错误链；Interrupted 重试，WouldBlock/TimedOut 保留有界失败。socket 是阻塞模式并配置 60s SO_RCVTIMEO，Android/Linux 上 EAGAIN 可以是该读取超时，**不能无限重试或单凭 EAGAIN 认定应用 bug**。213 库测试、9 bin、1 集成测试和 clippy 通过，诊断版 Android/APK 已顺序构建、安装并运行；原生 DMG 仍未通过。
+
+重要修正：`decapsulate_amsdu_data_frames` 为保留完整前缀，在尾子帧截断时直接 `break` 并返回成功，所以**没有 TooShort 日志不能排除 A-MSDU 截断**。本轮给两个 break 分支补了 debug 日志，不改交付行为；4 项 A-MSDU 回归通过；该 filin 日志改动尚未部署。下一次必须同时捕获 awdlsink（原始 monitor，过滤实际 Mac MAC）和 awdl0（TAP），在缺失 TCP seq 上逐层对照，不能凭猜测再改驱动。
+
+证据：`build/airdrop/upload-diag-20261104/` 的 README、SHA256SUMS、tcp.pcap、transfer.log、filin.log、mac-connections.log。TCP 抓包进程已停止并确认消失；手机 Wi-Fi 10.12.1.61 保持连接，接收端 listening，无 PINInfo。捕获记录仅有有限 TLS 密文字节，不含完整文件内容。
+
+## 2026-11-04 QUIC 监听已接线；PINInfo 编解码（仍未宣告）
+
+`luftlift receive --quic-addr <ip:port>` 新增实验监听，默认 `off`，不改变 `_airdrop._tcp`/8771 的默认路径。它使用独立 tokio runtime，与 HTTPS 共享同一 approval 注册表：`/Ask` 的批准会被下一次 `/Upload` 消耗，QUIC 上传在无批准时返回 403；仅接受 loopback 或 link-local 对端。`--quic-addr` 非法值在启动时直接报错。
+
+本轮验证：199 个库测试、9 个二进制测试、1 个集成测试通过；Android aarch64 release 交叉编译通过。把 `luftlift` 与新增的 `quic_probe` example 推到手机后，在 `lo` 上跑 `receive --quic-addr 127.0.0.1:64021`，探针 `/Discover` 返回 `200 OK`、161 字节响应，接收端日志确认 QUIC 监听与 handler 被调用。**这不是 AWDL/Apple QUIC 握手**：未宣告 `_asquic`，未验证原生 Apple 客户端，也未做 QUIC 文件传输。
+
+从本机 `/usr/libexec/sharingd` 的字符串与 ObjC/Swift 元数据恢复出 `PINInfo` JSON 的键名：`deviceID`、`pairingID`、`applicationLabel`、`supportedApplicationLabels`、`pkData`、`publicKey`、`bonjourListenerUUID`、`endpoint`。新增 `luftlift-rs/src/pairing.rs`：JSON round-trip、未知键保留、广告前字段检查与错误 JSON 测试。`pkData`/`publicKey` 的传输编码（base64/hex）与必填字段集合仍未经真实配对确认，因此**不宣告 PINInfo**，避免让原生发送端进入未实现的配对流程。
+
+仍未完成：PIN 展示/输入与临时身份交换、`_applicationservicepairing`/`_appsvcprepair` TLV 流程、altDSID/Apple 身份语义，以及原生 Apple QUIC 文件验收。手机当前未启动 AirDrop 会话；本轮只做了 loopback 有界测试，完成后已清理推送的二进制与临时目录。
+
+补充：`receive` 新增隐藏参数 `--pin-info <JSON>`（默认不设置），仅在显式传入时把校验过的 `PINInfo` 写入 `_airdrop._tcp` TXT；启动日志会明确警告配对未实现。该参数用于有界协议观察，不是可用的配对实现。202 个库测试、9 个二进制测试、1 个集成测试通过，clippy `-D warnings` 通过，Android aarch64 release 与 Debug APK 重建通过。
+
+有界观察结果：在本机 `awdl0` 上以 `LUFTLIFT_NAME=pin-observe` 宣告带 `PINInfo` 的服务约 6 秒，接收端日志确认 TXT 已随服务宣告并由 SIGINT 正常发送 goodbye；但 `dns-sd -L` 未解析出记录，`sharingd` 日志也没有出现 `Decoded PIN info dictionary`。因此**没有证据**证明 macOS 接受了该 JSON，键名来自二进制字符串也不等于线上格式已确认；下一步仍需在能看到对端日志的真实 Mac↔手机会话中验证。
+
+补充 2026-11-04 的 `_asquic` 观察：`dns-sd -B _asquic._udp` 在本机发现两个 UUID 实例；解析得到 `MacBook.local.:55005`（10.12.1.64，en0/interface 11）和 `qianlichuanyinqi.local.:61702`（10.12.1.48，身份未确认，不能仅凭地址认定是手机）。用 `quic_probe` 对这两个端口尝试 SNI `MacBook.local`/`luftlift`、ALPN `h3`/`h3-29`，全部在 QUIC 握手阶段收到 **TLS alert 80 (internal_error)**，没有进入 HTTP/3 `/Discover`。这说明单靠 h3 ALPN/SNI 不足以与 Apple `_asquic` 端点通话，身份/配对仍是缺口；不能据此宣告 QUIC 可用。另在同一时段的 `sharingd` 日志里看到 `0.0.0.0:8770` TCP/TLS listener 绑定在 awdl0（AirDrop UI 打开时创建）；此前未打开 UI 时 `lsof` 看不到 8770。因此手机→Mac 的 8770 重试必须在 Mac AirDrop UI 打开期间进行，且手机当前 Wi-Fi 仍未连接。
+
+## 2026-10-29 原生失败定位与QUIC工作边界
+
+用户原生图片/大文件仍失败。Mac sharingd日志已将Rust端点成功与原生失败区分：C3657对手机8771完成TCP/TLS、POST /Discover 200、响应173B，随后 `Certificate chain not trusted ... Missing altDSID on certificate` 并取消。临时自签名TLS证书不等于Apple AirDrop身份；当前 `record_data=None`，不得伪造Apple账号/联系人身份。此前“缺Discover plist字段”的初步判断由完整连接日志修正。现代Apple设备间使用 `app_svc com.apple.sharingd.AirDrop`、QUIC/HTTP3/64020；这些连接有明确其他设备名，不能算到手机上。手机实际mDNS仍只有 `_airdrop._tcp`、flags=136、8771。
+
+开始实现QUIC：`luftlift-rs/src/quic.rs` 基于quinn/h3/h3-quinn，TLS1.3 ALPN h3、HTTP3请求适配和单连接服务；复用现有HttpRequest/Response路由，单元测试与Android交叉构建通过。尚未接入receive、无真机QUIC握手/文件验收，不能宣称升级完成。真实Mac `_asquic._udp` 实例为UUID、TXT空、端口57197；另有 `_applicationservicepairing`/`_appsvcprepair` 服务TLV。必须完成应用服务配对、身份与HTTP3实际请求语义后，才能开启宣告。当前默认保持legacy，不用未实现通道让原生设备失败更早。
+
+QUIC适配增加与legacy一致的128MiB body上限（超限413），本机QUIC/TLS1.3/HTTP3 `/Discover` 实际往返通过；仍不是Apple配对验收。对本机 `/usr/libexec/sharingd` 反汇编确定 `_airdrop._tcp` TXT的配对键为 `PINInfo`（立即数解码 `PINInfo`），值为UTF-8 JSON，经NSJSONSerialization解析后逐项构造 `SDTempPairingService`。连接要求 `deviceID` 与 `pkData`，临时服务包含applicationLabel/supportedApplicationLabels、公钥及bonjourListenerUUID；PIN由接收端展示、发送端输入，失败三次终止。JSON具体键/请求帧仍待恢复，不能仅靠这些字段开启宣告。
+
+动态ROC在传输固定peer之外另做严格选择：活跃peer独占决定slot0 home visit，其他新peer不可抢占；最新32MiB协议回归落盘 `3-large.bin` SHA同前。仍有 idle current_channel=0，长期信道稳定性与原生互通未验收。
+
+## 2026-10-29 真机双向32MiB打通；动态发现窗口与连接恢复
+
+在0058和浏览刷新基础上完成实际AWDL/TLS双向32MiB文件传输，两端SHA均为 `e09320c5b00b34bb704802136c599a95b3996332ba84d7c7f21112b6231b6bd0`。手机→Mac完整上传并获得HTTP成功，Mac→手机多次完整落盘；最新一次手机文件为 `2-large.bin`。证据保存在 `build/airdrop/20261029/SHA256SUMS` 与上述运行日志；该验收使用Rust协议端点与App接收端，不冒充原生Apple双向文件验收。
+
+确定并修复全149 peer的ROC调度遗漏：原固定home=52使slot-0发现窗口落在Mac不在的信道；现在按最新有效peer序列在52/149中选择home visit。null slot在home==ROC时代表回到同信道，不是不可用间隙；`remaining_slot_us`延续该驻留但到下一次显式social slot前结束，`RocCapture.tick`不再返回0。离线回归覆盖 freshest peer 和连续null驻留，最终手机采样current_channel=149且完整32MiB接收成功。仍保留既有52兼容路径。
+
+失败/超时连接后端新增 `idle` JSON事件，Kotlin在接收/发现/等待状态恢复ready；发送阶段与完成状态不被迟到的接收事件覆盖。`PROGRESS.md`同步契约。测试审批必须预先创建 `MARIONETTE_APPROVAL_DIR`；Mac探针输出目录与审批目录不同，旧脚本写错目录造成403，不是应用授权bug。最终485项Rust测试、Android JVM测试和lint通过，Debug APK已安装。
+
+原生边界：直接打开Finder AirDrop.app后，App明确收到unknown sender `/Discover`，随后看到Mac随机服务实例8770，证明原生发现手机成功。手机尝试连接本机Mac的8770返回ECONNREFUSED；sharingd确实在监听且DiscoverableMode=Everyone，Mac自身AWDL socket同样被拒绝。因此手机→原生Mac文件尚未验收，需下一步检查sharingd的AWDL ingress/legacy兼容监听及原生界面交互，不能用Rust接收端成功替代。停止后必须按RESIDENT_DISABLE、STOP顺序，检查monitor消失再stock恢复；当前正在收尾恢复。
+
+## 2026-10-28 续查：0058 完整 skb 交付；大文件仍未验收
+
+已 fetch 并快进到 origin/main `1376817`，此前本地工作完整保存于 stash `pre-sync local AirDrop work 2026-10-28`。其主要内容已包含在远端提交中，未将旧文件覆盖回最新代码。
+
+找到第二处确定的截断：远端 `dp_rx_mon.c` 重组后调用 `marionette_monitor_post_frame(data, qdf_nbuf_headlen(...), tsft)`，仅把线性头送入 awdlsink，遗漏 skb fragments/frag_list。0058 保留线性快路，非线性帧用 atomic allocation + `qdf_nbuf_copy_bits` 完整复制；失败只丢 sink 副本，不改变 monitor skb 所有权，长度限制 65535。用户空间 RX 缓冲从4096增至65535+256，容纳完整 MPDU/radiotap。正式补丁 `native/airdrop/driver/0058-deliver-full-monitor-skb-to-sink.patch`，前置为0057（本轮补归档 `0057-monitor-continuation-full-length.patch`）。实际代码块的 ASan/UBSan 测试覆盖线性/非线性、禁用、超限、分配与复制失败。完整模块编译exit0，候选SHA `e10e1d7b65ca730692df80e9b853429064f62abadd6a900747852c194a4e08a6`，24141624B。仍有既有浅Git版本脚本、root Module.symvers、缺vmlinux/BTF警告；未宣称全ABI/CFI运行路径已验证。两轮有界验证后已将APK内模块资产替换为0058，最终Debug APK已install -r；手机当前原厂、AirDrop停止，下次开启由App加载新资产。
+
+真机 `build/airdrop/full-skb-20261028/` 有实时kmsg、logcat、独立240秒guard。新抓包出现来自本机Mac的3010B完整聚合帧，超过原约1800B线性头；1MiB随机文件的Ask/100 Continue成功，但等待最终响应60秒仍超时，75秒抓包累计TCP ACK推进约258KiB，较原0057约124KiB增加，单轮环境不同不能据此量化提速。64KiB文件完整接收、HTTP200、手机与发送端SHA均 `56e0697a9510acd1c432ecb31cc2d1afeb9725ee8d6c17cff92918a980019394`。这是Python协议探针经真实AWDL/TLS向App接收，不是原生Finder大文件验收。首轮结束自动原厂恢复，网关3/3；boot_count仍80。
+
+旧交接“Mac不认手机TCP ACK”应撤销：本轮真实TCP连续接受ACK、重传并推进，校验和检查正确。旧FIN-WAIT-1还混有被删除旧ifindex（if35/37/43/47等）的连接，不能当作当前awdl0所有连接失败。`--http-addr off`关闭luftlift诊断HTTP监听，HTTPS8771仍绑定，三次Discover探针均HTTP200。
+
+发现方向：25秒TAP抓包含本机Mac的PTR查询，证明Mac→手机mDNS查询可达，不能把查询误作Mac服务宣告。源代码的mdns-sd browse指数退避到1小时，App长期驻留缺少主动重查；新增只对现存browse发送一次PTR查询的refresh_browse接口，App浏览线程每10秒调用，不替换listener、不清cache、不产生新重试链。另修稳定实例名变更后仍按PID前缀过滤自己的遗漏，改为与实际注册fullname比较。Rust接收路径/luftlift测试及Debug APK构建通过。第二轮 `build/airdrop/browse-refresh-20261028/` 真机抓包确认PTR重查，logcat确认两条真实Apple服务PEER事件（ce57dc8b326f/6c37aac50e60），无自身PEER；本机Mac的f82f:d3ff:feae:c4e3仍未解析，不能写成发现问题全部解决。第二轮结束原厂恢复、网关3/3、boot_count80，未见新RDDM/Oops。最终install -r后观察到重复启动加载器，回退后的ping先2/3、后0/3，不能将该阶段记为稳定恢复。查明 `AirDropResidentService.ensureEngine()` 每20秒重启引擎、KernelSU `airdrop-watchdog.sh` 每30秒恢复resident，原resident_enabled=true；仅ACTION_STOP并不能长期停住。最终发送RESIDENT_DISABLE，再STOP并等monitor消失后stock。当前常驻开关已关闭，保留HomeKit/配对数据；后续有界实验必须先处理resident看护，否则会与guard恢复竞态。下一步继续定位ROC预约实际延迟/收发窗口、peer时钟与本机Mac服务宣告，40–50MB原生Finder接收仍未通过。
 
 ## 2026-10-28 大文件传输根因与修复（A-MSDU 截断；仍止步于 TCP 层）
 
