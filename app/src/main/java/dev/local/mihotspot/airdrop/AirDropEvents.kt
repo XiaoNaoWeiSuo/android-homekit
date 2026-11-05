@@ -27,6 +27,7 @@ object AirDropEvents {
     const val STAGE = "stage"
     const val SENT = "sent"
     const val ERROR = "error"
+    const val IDLE = "idle"
 
     fun parse(line: String): JSONObject? {
         val trimmed = line.trim()
@@ -50,10 +51,29 @@ object AirDropEvents {
     )
 
     /** 附近设备。 */
-    data class Peer(val name: String, val address: String, val port: Int) {
-        /** mDNS 全名很长（`xxx._airdrop._tcp.local.`），界面只显示前半段。 */
+    data class Peer(
+        val name: String,
+        val address: String,
+        val port: Int,
+        /** mDNS SRV 主机名；Apple 常把可读设备名放在这里而不是随机实例名。 */
+        val display: String = "",
+        /** `airdrop`（旧版 `_airdrop._tcp`）或 `companion`（`_companion-link._tcp`，macOS 26/27）。 */
+        val kind: String = "airdrop"
+    ) {
+        /** mDNS 全名很长（`xxx._airdrop._tcp.local.`），界面只显示可读部分。 */
         val displayName: String
-            get() = name.substringBefore("._airdrop").ifBlank { name }
+            get() {
+                val host = display.trim().removeSuffix(".").removeSuffix(".local")
+                val hexToken = Regex("^[0-9a-f]{8,}$", RegexOption.IGNORE_CASE)
+                val uuid = Regex(
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    RegexOption.IGNORE_CASE
+                )
+                val readable = host.isNotBlank() && !hexToken.matches(host) && !uuid.matches(host)
+                if (readable) return host.replace('-', ' ')
+                val token = name.substringBefore("._airdrop").takeLast(4)
+                return if (token.isBlank()) "Apple 设备" else "Apple 设备 · $token"
+            }
     }
 
     /** 接收/发送进度。`total == 0` 表示总长未知（苹果固定用 chunked 上传）。 */
@@ -264,6 +284,9 @@ object AirDropState {
     }
 
     fun onSendStage(stage: String, fileName: String) {
+        // Receive/browse events run on another process; a late idle must not
+        // clobber an active sender's progress.
+        approval = null
         sendStage = stage
         if (fileName.isNotBlank()) sendingName = fileName
         val text = when (stage) {
@@ -292,6 +315,14 @@ object AirDropState {
         progress = null
         if (peer.isNotBlank()) peerName = peer
         set(Phase.DONE, "已发送到 $peer · ${AirDropStore.formatSize(bytes)}")
+    }
+
+    /** A failed/timed-out connection is over; receiving is not permanent. */
+    fun onConnectionIdle() {
+        if (phase != Phase.RECEIVING && phase != Phase.AWAITING && phase != Phase.SEEN) return
+        approval = null
+        progress = null
+        set(Phase.READY, "连接已结束 · 可以继续收发")
     }
 
     fun onError(message: String) {

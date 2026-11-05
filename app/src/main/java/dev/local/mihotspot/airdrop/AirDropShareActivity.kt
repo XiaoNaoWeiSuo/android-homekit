@@ -58,6 +58,11 @@ class AirDropShareActivity : Activity() {
     private lateinit var progressSection: LinearLayout
     private lateinit var progressBar: ProgressBar
     private lateinit var progressText: TextView
+    private lateinit var payloadCard: LinearLayout
+
+    private companion object {
+        const val REQUEST_PICK_FILE = 41
+    }
 
     /** 待发送文件（已复制到缓存）。 */
     private val staged = ArrayList<File>()
@@ -72,11 +77,12 @@ class AirDropShareActivity : Activity() {
         AirDropState.addListener(listener)
         collectShare(intent)
         if (staged.isEmpty()) {
-            payloadText.text = "没有收到可发送的文件"
-            statusText.text = "从其他应用分享文件时选择「隔空投送」即可。"
+            payloadText.text = "未选择文件 · 点此选择"
+            statusText.text = "点上面的卡片选择要发送的文件，或从其他应用分享时选择「隔空投送」。"
             statusBadge.text = "○ 无内容"
-            return
         }
+        payloadCard.setOnClickListener { pickFile() }
+        // 即使还没选文件也要起引擎：设备列表来自常驻接收端，先扫描才能选中设备。
         ensureEngine()
         awaitBrowsing()
     }
@@ -113,7 +119,30 @@ class AirDropShareActivity : Activity() {
             }
         }
         if (uris.isEmpty()) return
+        stageUris(uris)
+    }
 
+    /** 直接打开时没有分享内容：让用户自己选文件，而不是只能从分享面板进入。 */
+    private fun pickFile() {
+        if (sending) return
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        runCatching { startActivityForResult(intent, REQUEST_PICK_FILE) }
+            .onFailure { statusText.text = "没有可用的文件选择器" }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_PICK_FILE && resultCode == Activity.RESULT_OK) {
+            data?.data?.let { stageUris(listOf(it)) }
+        }
+    }
+
+    /** 把一个或多个 URI 复制到缓存，供后续点击设备发送。 */
+    private fun stageUris(uris: List<Uri>) {
         statusText.text = "正在准备文件…"
         Thread({
             val failures = ArrayList<String>()
@@ -131,6 +160,8 @@ class AirDropShareActivity : Activity() {
                     payloadText.text = failures.firstOrNull() ?: "无法读取所选文件"
                 } else {
                     payloadText.text = describePayload()
+                    ensureEngine()
+                    awaitBrowsing()
                     render()
                 }
             }
@@ -407,7 +438,7 @@ class AirDropShareActivity : Activity() {
 
         // 发送内容
         content.addView(createSectionHeader(this, "发送内容"))
-        val payloadCard = createCard(this)
+        payloadCard = createCard(this)
         payloadText = TextView(this).apply {
             text = describePayload()
             textSize = 14f

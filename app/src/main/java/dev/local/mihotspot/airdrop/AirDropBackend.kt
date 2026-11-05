@@ -67,6 +67,13 @@ object AirDropBackend {
             append(" --output ").append(AirDropStore.quote(outputDir.absolutePath))
             append(" --name ").append(AirDropStore.quote(name))
             append(" --http-addr off")
+            // Observation-only test hook: if this file exists, advertise its
+            // validated PINInfo JSON in the normal receiver announcement. The
+            // file is absent in production, so default behavior is unchanged.
+            val pinInfo = File(AirDropStore.base(context), "pin-info.json")
+            if (pinInfo.isFile) {
+                append(" --pin-info ").append(AirDropStore.quote(pinInfo.readText().trim()))
+            }
         }
         return spawn(command, Mode.RECEIVE, AirDropStore.log(context), onExit)
     }
@@ -81,9 +88,15 @@ object AirDropBackend {
         val command = buildString {
             append(AirDropStore.quote(AirDropStore.binary(context).absolutePath))
             append(" -i awdl0 send --progress")
-            append(' ').append(AirDropStore.quote(peer.name))
+            // Companion Link 对端（macOS 26/27）广告的是 Rapport 端口 61156，
+            // 不是旧版 AirDrop 的 HTTPS 端口；用 --address 会把发送器打到错误的服务上。
+            // 传可读名字，让后端 companion_fallback() 去解析旧版端点。
+            val recipient = if (peer.kind == "companion") peer.displayName else peer.name
+            append(' ').append(AirDropStore.quote(recipient))
             append(' ').append(AirDropStore.quote(file.absolutePath))
-            socketAddress(peer)?.let { append(" --address ").append(AirDropStore.quote(it)) }
+            if (peer.kind != "companion") {
+                socketAddress(peer)?.let { append(" --address ").append(AirDropStore.quote(it)) }
+            }
         }
         return spawn(command, Mode.SEND, null, onExit)
     }
@@ -187,9 +200,11 @@ object AirDropBackend {
                 val peer = AirDropEvents.Peer(
                     json.optString("name"),
                     json.optString("address"),
-                    json.optInt("port")
+                    json.optInt("port"),
+                    json.optString("display"),
+                    json.optString("kind", "airdrop")
                 )
-                Log.i(TAG, "PEER ${peer.name} @ ${peer.address}:${peer.port}")
+                Log.i(TAG, "PEER ${peer.name} @ ${peer.address}:${peer.port} display=${peer.display}")
                 AirDropState.onPeer(peer)
             }
             AirDropEvents.LOST -> {
@@ -201,6 +216,7 @@ object AirDropBackend {
                 if (mode == Mode.SEND) AirDropState.onSendStage(json.optString("stage"), "")
             }
             AirDropEvents.SENT -> AirDropState.onSent(json.optLong("bytes"), json.optString("peer"))
+            AirDropEvents.IDLE -> AirDropState.onConnectionIdle()
             AirDropEvents.ERROR -> AirDropState.onError(json.optString("message").ifBlank { "传输失败" })
             AirDropEvents.PROGRESS -> {
                 val done = json.optLong("received").takeIf { it > 0 } ?: json.optLong("sent")

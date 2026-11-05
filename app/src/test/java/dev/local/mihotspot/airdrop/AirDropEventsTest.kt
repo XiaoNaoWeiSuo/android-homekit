@@ -140,5 +140,6 @@ class AirDropEventsTest {
         assertEquals("stage", AirDropEvents.STAGE)
         assertEquals("sent", AirDropEvents.SENT)
         assertEquals("error", AirDropEvents.ERROR)
+        assertEquals("idle", AirDropEvents.IDLE)
     }
 }
