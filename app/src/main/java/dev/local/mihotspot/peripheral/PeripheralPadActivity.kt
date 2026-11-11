@@ -120,7 +120,9 @@ class PeripheralPadActivity : Activity() {
         keyboard = KeyboardPanel(this).apply {
             darkTheme = dark
             glow = dark
-            onKey = { usage, mods -> bridge.tap(usage, mods) }
+            onKeyboardState = { modifiers, usages ->
+                bridge.sendKeyboardState(modifiers, usages)
+            }
             onExit = { finish() }
         }
         touchpad = TouchpadView(this).apply {

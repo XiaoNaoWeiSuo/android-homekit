@@ -624,6 +624,23 @@ class BtHidPeripheral(context: Context) {
         }
     }
 
+    /**
+     * Send a complete keyboard state. The on-screen keyboard owns the chord
+     * state (multiple pointers, held modifiers), so it hands us the full set
+     * rather than individual taps: holding a key keeps it in the report and the
+     * host does the repeating.
+     */
+    fun sendKeyboardState(modifiers: Int, usages: IntArray) {
+        worker.post {
+            synchronized(pressedKeys) {
+                pressedKeys.clear()
+                usages.take(6).forEach { if (!pressedKeys.contains(it)) pressedKeys.add(it) }
+            }
+            this.modifiers = modifiers and 0xFF
+            sendKeyboardLocked()
+        }
+    }
+
     fun keyDown(usage: Int, withModifiers: Int = 0) {
         worker.post {
             synchronized(pressedKeys) {
