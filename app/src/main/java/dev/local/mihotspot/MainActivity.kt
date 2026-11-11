@@ -63,6 +63,11 @@ import dev.local.mihotspot.ui.createCardDivider
 import dev.local.mihotspot.ui.createStatusBadge
 import dev.local.mihotspot.ui.createPageHeader
 import dev.local.mihotspot.ui.onHapticClick
+import dev.local.mihotspot.peripheral.BtHidPeripheral
+import dev.local.mihotspot.peripheral.KeyHaptics
+import dev.local.mihotspot.peripheral.PeripheralHub
+import dev.local.mihotspot.peripheral.PeripheralPadActivity
+import dev.local.mihotspot.peripheral.PeripheralService
 
 private class SliderWriteState {
     val lock = Any()
@@ -79,6 +84,15 @@ class MainActivity : Activity() {
     private lateinit var rootBadge: TextView
     private lateinit var statusInfo: TextView
     private lateinit var serviceSwitch: Switch
+    private lateinit var hidSwitch: Switch
+    private lateinit var hidStatusBadge: TextView
+    private var peripheralModesCard: LinearLayout? = null
+    private var hidSettingsPage: View? = null
+    private var hidHapticsPage: View? = null
+    private var hidPageBadge: TextView? = null
+    private var hapticsSwitch: Switch? = null
+    private var updatingHidSwitch = false
+    private var pendingHidEnable = false
     private var brightnessSeek: SeekBar? = null
     private var volumeSeek: SeekBar? = null
     private var brightnessValueText: TextView? = null
@@ -148,6 +162,11 @@ class MainActivity : Activity() {
         setContentView(buildUi())
         updatePairingCard()
         updateConnectionStatus()
+        PeripheralHub.bridge(this).addListener(hidListener)
+        applyHidState(
+            PeripheralHub.bridge(this).state,
+            PeripheralHub.bridge(this).hostName
+        )
         log("PROBE_CREATED source=Apple_HomeKitADK_f201f98")
         if (ServiceControl.isEnabled(this)) ensurePermissionsAndStart()
     }
@@ -171,6 +190,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        PeripheralHub.bridge(this).removeListener(hidListener)
         stateRefreshHandler.removeCallbacks(stateRefreshRunnable)
         disableNfcForegroundDispatch()
         unregisterUiEvents()
@@ -180,10 +200,11 @@ class MainActivity : Activity() {
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
-        if (settingsPage?.visibility == View.VISIBLE) {
-            showMainPage()
-        } else {
-            super.onBackPressed()
+        when {
+            hidHapticsPage?.visibility == View.VISIBLE -> backFromHidHaptics()
+            hidSettingsPage?.visibility == View.VISIBLE -> backFromHidSettings()
+            settingsPage?.visibility == View.VISIBLE -> showMainPage()
+            else -> super.onBackPressed()
         }
     }
 
@@ -233,11 +254,18 @@ class MainActivity : Activity() {
         rootBadge = createStatusBadge(this, "Root检测中", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
         badgeRow.addView(rootBadge)
 
+        val badgeSpacer2 = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(6), 1)
+        }
+        badgeRow.addView(badgeSpacer2)
+        hidStatusBadge = createStatusBadge(this, "HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        badgeRow.addView(hidStatusBadge)
+
         titleCol.addView(badgeRow)
         topRow.addView(titleCol)
 
         serviceSwitch = Switch(this).apply {
-            text = "服务"
+            text = "HomeKit"
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
             isChecked = ServiceControl.isEnabled(this@MainActivity)
@@ -250,7 +278,6 @@ class MainActivity : Activity() {
                 }
             }
         }
-        topRow.addView(serviceSwitch)
 
         val settingsBtn = Button(this).apply {
             text = "设置"
@@ -268,6 +295,34 @@ class MainActivity : Activity() {
 
         headerCard.addView(topRow)
 
+        // Two product switches in the same header card: HomeKit and HID.
+        val switchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        switchRow.addView(
+            serviceSwitch,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        hidSwitch = Switch(this).apply {
+            text = "HID"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            isChecked = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                .getBoolean(BtHidPeripheral.KEY_ENABLED, false)
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            setOnCheckedChangeListener { _, checked ->
+                if (updatingHidSwitch) return@setOnCheckedChangeListener
+                if (checked) enableHidFromUi() else disableHidFromUi()
+            }
+        }
+        switchRow.addView(
+            hidSwitch,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        headerCard.addView(switchRow)
+
         statusInfo = TextView(this).apply {
             textSize = 12f
             typeface = Typeface.MONOSPACE
@@ -279,6 +334,10 @@ class MainActivity : Activity() {
 
         pairingCard = buildPairingCard()
         root.addView(pairingCard)
+
+        // === Bluetooth HID peripheral entry (keyboard + touchpad) ===
+        peripheralModesCard = buildPeripheralModesCard()
+        root.addView(peripheralModesCard)
 
         // === Device name card ===
         val nameCard = createCard(this, verticalPaddingDp = 10f, horizontalPaddingDp = 16f)
@@ -559,6 +618,7 @@ class MainActivity : Activity() {
         settingsScrollContent.addView(buildPairingSettings())
         settingsScrollContent.addView(buildHotspotSettings())
         settingsScrollContent.addView(buildNfcSettings())
+        settingsScrollContent.addView(buildHidSettingsEntry())
         settingsScrollContent.addView(buildDeviceManagement())
         val settingsScroll = ScrollView(this).apply {
             isFillViewport = true
@@ -575,9 +635,13 @@ class MainActivity : Activity() {
         }
         settingsPage = settingsContainer
 
+        hidSettingsPage = buildHidSettingsPage().apply { visibility = View.GONE }
+        hidHapticsPage = buildHidHapticsPage().apply { visibility = View.GONE }
         return FrameLayout(this).apply {
             addView(mainScroll, FrameLayout.LayoutParams(-1, -1))
             addView(settingsContainer, FrameLayout.LayoutParams(-1, -1))
+            addView(hidSettingsPage, FrameLayout.LayoutParams(-1, -1))
+            addView(hidHapticsPage, FrameLayout.LayoutParams(-1, -1))
         }
     }
 
@@ -1108,6 +1172,544 @@ class MainActivity : Activity() {
         addView(card)
     }
 
+    /** Two peripheral surfaces, shown only while a host is connected. */
+    private fun buildPeripheralModesCard(): LinearLayout = createCard(
+        this, verticalPaddingDp = 12f, horizontalPaddingDp = 16f
+    ).apply {
+        visibility = View.GONE
+        addView(TextView(this@MainActivity).apply {
+            text = "外设模式"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = "主机已连接，选择接下来在手机上使用的键鼠界面"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        addView(createCardDivider(this@MainActivity))
+        addView(buildModeRow(
+            "沉浸模式",
+            "纯黑界面 + 发光键帽 + 最低亮度，适合长时间当键鼠用",
+            immersive = true
+        ))
+        addView(createCardDivider(this@MainActivity))
+        addView(buildModeRow(
+            "默认模式",
+            "同样的键鼠界面，白色主题，正常亮度",
+            immersive = false
+        ))
+    }
+
+    private fun buildModeRow(title: String, desc: String, immersive: Boolean): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+            val col = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            col.addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            })
+            col.addView(TextView(this@MainActivity).apply {
+                text = desc
+                textSize = 12f
+                setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+                setPadding(0, dp(4), 0, 0)
+            })
+            addView(col)
+            addView(Button(this@MainActivity).apply {
+                text = "进入"
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(dp(64), dp(38)).apply {
+                    setMargins(dp(8), 0, 0, 0)
+                }
+                UiTheme.styleButton(
+                    this,
+                    if (immersive) UiTheme.COLOR_TEXT_PRIMARY else UiTheme.COLOR_ACCENT,
+                    Color.WHITE,
+                    radiusDp = 12f
+                )
+                onHapticClick {
+                    startActivity(PeripheralPadActivity.intent(this@MainActivity, immersive))
+                }
+            })
+        }
+
+    private val hidListener = object : BtHidPeripheral.Listener {
+        override fun onStateChanged(state: BtHidPeripheral.State, detail: String?) {
+            runOnUiThread { applyHidState(state, detail) }
+        }
+    }
+
+    private fun enableHidFromUi() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            val missing = mutableListOf<String>()
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                missing.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                missing.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            }
+            if (missing.isNotEmpty()) {
+                pendingHidEnable = true
+                updatingHidSwitch = true
+                hidSwitch.isChecked = false
+                updatingHidSwitch = false
+                requestPermissions(missing.toTypedArray(), REQUEST_HID)
+                return
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingHidEnable = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+            return
+        }
+        startHid()
+    }
+
+    private fun startHid() {
+        getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+            .edit().putBoolean(BtHidPeripheral.KEY_ENABLED, true).apply()
+        PeripheralService.start(this)
+        val bridge = PeripheralHub.bridge(this)
+        bridge.start()
+        applyHidState(bridge.state, bridge.hostName)
+    }
+
+    private fun disableHidFromUi() {
+        getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+            .edit().putBoolean(BtHidPeripheral.KEY_ENABLED, false).apply()
+        PeripheralHub.bridge(this).stop()
+        PeripheralService.stop(this)
+        applyHidState(BtHidPeripheral.State.STOPPED, null)
+    }
+
+    private fun applyHidState(state: BtHidPeripheral.State, detail: String?) {
+        updatingHidSwitch = true
+        hidSwitch.isChecked = state == BtHidPeripheral.State.REGISTERING ||
+            state == BtHidPeripheral.State.READY ||
+            state == BtHidPeripheral.State.CONNECTED
+        updatingHidSwitch = false
+
+        val (label, fg, bg) = when (state) {
+            BtHidPeripheral.State.CONNECTED ->
+                Triple("HID 已连接", UiTheme.COLOR_SUCCESS, UiTheme.COLOR_SUCCESS_LIGHT)
+            BtHidPeripheral.State.READY ->
+                Triple("HID 待机", UiTheme.COLOR_ACCENT, UiTheme.COLOR_ACCENT_LIGHT)
+            BtHidPeripheral.State.REGISTERING ->
+                Triple("HID 注册中", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+            BtHidPeripheral.State.FAILED ->
+                Triple("HID 失败", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
+            BtHidPeripheral.State.UNSUPPORTED ->
+                Triple("HID 不支持", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
+            BtHidPeripheral.State.STOPPED ->
+                Triple("HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        }
+        hidStatusBadge.text = label
+        hidStatusBadge.setTextColor(fg)
+        hidStatusBadge.background = UiTheme.createPillDrawable(this, bg)
+        hidPageBadge?.let {
+            it.text = label
+            it.setTextColor(fg)
+            it.background = UiTheme.createPillDrawable(this, bg)
+        }
+        peripheralModesCard?.visibility =
+            if (state == BtHidPeripheral.State.CONNECTED) View.VISIBLE else View.GONE
+    }
+
+    private fun buildHidSettingsEntry(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(createSectionHeader(
+            this@MainActivity,
+            "蓝牙键鼠",
+            "键鼠说明",
+            "手机作为标准蓝牙键盘 / 触控板，主机无需安装任何软件。开关在首页卡片里，这里放设备与手感设置。"
+        ))
+        val card = createCard(this@MainActivity)
+        val row = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val col = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        col.addView(TextView(this@MainActivity).apply {
+            text = "设备、触控与手感受设置"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        col.addView(TextView(this@MainActivity).apply {
+            text = "设备名 / 重新连接 / 重置蓝牙 / 灵敏度 / 按键震动"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        row.addView(col)
+        row.addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_chevron_right)
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginStart = dp(6) }
+        })
+        row.onHapticClick { showHidSettingsPage() }
+        card.addView(row)
+        addView(card)
+    }
+
+    private fun buildHidSettingsPage(): View {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(UiTheme.COLOR_BG)
+            setPadding(0, 0, 0, dp(24))
+        }
+
+        val statusCard = createCard(this, 14f, 16f)
+        hidPageBadge = createStatusBadge(this, "HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        statusCard.addView(hidPageBadge)
+        statusCard.addView(TextView(this).apply {
+            text = "开关在首页卡片；这里用于设备名、重连与故障恢复。"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(8), 0, 0)
+        })
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        actionRow.addView(Button(this).apply {
+            text = "允许被发现"
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
+            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 10f)
+            onHapticClick { requestHidDiscoverable() }
+        })
+        actionRow.addView(Button(this).apply {
+            text = "重新连接"
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { setMargins(dp(8), 0, 0, 0) }
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 10f)
+            onHapticClick {
+                val bridge = PeripheralHub.bridge(this@MainActivity)
+                bridge.start()
+                if (!bridge.connectBonded()) {
+                    Toast.makeText(this@MainActivity, "没有已配对主机", Toast.LENGTH_SHORT).show()
+                }
+            }
+        })
+        statusCard.addView(actionRow)
+        statusCard.addView(Button(this).apply {
+            text = "重置蓝牙（修复「已有另一个 app 注册」）"
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(-1, dp(38)).apply { topMargin = dp(8) }
+            UiTheme.styleButton(this, UiTheme.COLOR_INPUT_BG, UiTheme.COLOR_TEXT_SECONDARY, radiusDp = 10f)
+            onHapticClick {
+                Toast.makeText(this@MainActivity, "正在重置蓝牙…", Toast.LENGTH_SHORT).show()
+                Thread {
+                    val ok = PeripheralHub.bridge(this@MainActivity).resetBluetoothStack()
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            if (ok) "蓝牙已重置，正在重新注册" else "重置失败：需要 root",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }.start()
+            }
+        })
+        content.addView(statusCard)
+
+        val nameCard = createCard(this, 12f, 16f)
+        val nameRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        nameRow.addView(TextView(this).apply {
+            text = "设备名称"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        val nameEdit = EditText(this).apply {
+            setText(PeripheralHub.bridge(this@MainActivity).deviceName)
+            setSingleLine(true)
+            textSize = 13f
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = UiTheme.createCardDrawable(this@MainActivity, radiusDp = 8f, bgColor = UiTheme.COLOR_INPUT_BG)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(8), 0, dp(8), 0)
+            }
+        }
+        nameRow.addView(nameEdit)
+        nameRow.addView(Button(this).apply {
+            text = "保存"
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(dp(60), dp(36))
+            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 10f)
+            onHapticClick {
+                val name = nameEdit.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    PeripheralHub.bridge(this@MainActivity).deviceName = name
+                    Toast.makeText(this@MainActivity, "已保存", Toast.LENGTH_SHORT).show()
+                }
+            }
+        })
+        nameCard.addView(nameRow)
+        content.addView(nameCard)
+
+        val touchCard = createCard(this, 12f, 16f)
+        val sensRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        sensRow.addView(TextView(this).apply {
+            text = "触控板灵敏度"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        val sensValue = TextView(this).apply {
+            text = String.format("%.1fx", hidSensitivity())
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_ACCENT)
+            setPadding(dp(8), 0, 0, 0)
+        }
+        sensRow.addView(sensValue)
+        touchCard.addView(sensRow)
+        touchCard.addView(SeekBar(this).apply {
+            max = 250
+            progress = ((hidSensitivity() * 100).toInt() - 50).coerceAtLeast(0)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seek: SeekBar, p: Int, fromUser: Boolean) {
+                    val value = (p + 50) / 100f
+                    getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                        .edit().putInt(KEY_HID_SENSITIVITY, (value * 100).toInt()).apply()
+                    sensValue.text = String.format("%.1fx", value)
+                }
+                override fun onStartTrackingTouch(seek: SeekBar) = Unit
+                override fun onStopTrackingTouch(seek: SeekBar) = Unit
+            })
+        })
+
+        touchCard.addView(createCardDivider(this))
+        val keepAliveRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        val keepCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        keepCol.addView(TextView(this).apply {
+            text = "低延迟保活"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        keepCol.addView(TextView(this).apply {
+            text = "空闲时保持链路活跃，消除键盘首击延迟"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        keepAliveRow.addView(keepCol)
+        keepAliveRow.addView(Switch(this).apply {
+            isChecked = PeripheralHub.bridge(this@MainActivity).keepAliveEnabled
+            setOnCheckedChangeListener { _, checked ->
+                PeripheralHub.bridge(this@MainActivity).keepAliveEnabled = checked
+            }
+        })
+        touchCard.addView(keepAliveRow)
+
+        touchCard.addView(createCardDivider(this))
+        val hapticsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, dp(12))
+        }
+        val hapticsCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        hapticsCol.addView(TextView(this).apply {
+            text = "按键触感"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        hapticsCol.addView(TextView(this).apply {
+            text = "每次按键的轻微震动，强度可调"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        hapticsRow.addView(hapticsCol)
+        hapticsRow.addView(ImageView(this).apply {
+            setImageResource(R.drawable.ic_chevron_right)
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20))
+        })
+        hapticsRow.onHapticClick { showHidHapticsPage() }
+        touchCard.addView(hapticsRow)
+        content.addView(touchCard)
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(UiTheme.COLOR_BG)
+            addView(createPageHeader(this@MainActivity, "蓝牙键鼠", onBackClick = { backFromHidSettings() }))
+            addView(
+                ScrollView(this@MainActivity).apply {
+                    isFillViewport = true
+                    addView(content)
+                },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            )
+        }
+    }
+
+    private fun buildHidHapticsPage(): View {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(UiTheme.COLOR_BG)
+            setPadding(0, 0, 0, dp(24))
+        }
+        val card = createCard(this, 14f, 16f)
+        val enabledRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        enabledRow.addView(TextView(this).apply {
+            text = "启用按键震动"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        hapticsSwitch = Switch(this).apply {
+            isChecked = KeyHaptics.isEnabled(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                KeyHaptics.setEnabled(this@MainActivity, checked)
+                if (checked) KeyHaptics.tap(this@MainActivity)
+                hapticsSwitch?.isChecked = checked
+            }
+        }
+        enabledRow.addView(hapticsSwitch)
+        card.addView(enabledRow)
+
+        card.addView(createCardDivider(this))
+        val strengthHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        strengthHeader.addView(TextView(this).apply {
+            text = "震动强度"
+            textSize = 13f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+        })
+        val strengthValue = TextView(this).apply {
+            text = "${KeyHaptics.strength(this@MainActivity)}%"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_ACCENT)
+            setPadding(dp(8), 0, 0, 0)
+        }
+        strengthHeader.addView(strengthValue)
+        card.addView(strengthHeader)
+        card.addView(SeekBar(this).apply {
+            max = 99
+            progress = (KeyHaptics.strength(this@MainActivity) - 1).coerceIn(0, 99)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seek: SeekBar, p: Int, fromUser: Boolean) {
+                    val value = p + 1
+                    KeyHaptics.setStrength(this@MainActivity, value)
+                    strengthValue.text = "$value%"
+                }
+                override fun onStartTrackingTouch(seek: SeekBar) = Unit
+                override fun onStopTrackingTouch(seek: SeekBar) = Unit
+            })
+        })
+        card.addView(Button(this).apply {
+            text = "试一下"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(-1, dp(42)).apply { topMargin = dp(10) }
+            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT_LIGHT, UiTheme.COLOR_ACCENT, radiusDp = 10f)
+            onHapticClick { KeyHaptics.tap(this@MainActivity) }
+        })
+        content.addView(card)
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(UiTheme.COLOR_BG)
+            addView(createPageHeader(this@MainActivity, "按键触感", onBackClick = { backFromHidHaptics() }))
+            addView(
+                ScrollView(this@MainActivity).apply {
+                    isFillViewport = true
+                    addView(content)
+                },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            )
+        }
+    }
+
+    private fun hidSensitivity(): Float =
+        getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+            .getInt(KEY_HID_SENSITIVITY, 180) / 100f
+
+    private fun requestHidDiscoverable() {
+        try {
+            startActivityForResult(
+                Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                    .putExtra(android.bluetooth.BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120),
+                REQUEST_DISCOVERABLE
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开可发现设置：${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showHidSettingsPage() {
+        mainPage?.visibility = View.GONE
+        settingsPage?.visibility = View.GONE
+        hidHapticsPage?.visibility = View.GONE
+        hidSettingsPage?.visibility = View.VISIBLE
+        val bridge = PeripheralHub.bridge(this)
+        applyHidState(bridge.state, bridge.hostName)
+    }
+
+    private fun showHidHapticsPage() {
+        hidSettingsPage?.visibility = View.GONE
+        hidHapticsPage?.visibility = View.VISIBLE
+    }
+
+    private fun backFromHidSettings() {
+        hidSettingsPage?.visibility = View.GONE
+        showSettingsPage()
+    }
+
+    private fun backFromHidHaptics() {
+        hidHapticsPage?.visibility = View.GONE
+        hidSettingsPage?.visibility = View.VISIBLE
+    }
+
     private fun buildPairingCard(): LinearLayout = createCard(this, verticalPaddingDp = 16f, horizontalPaddingDp = 16f).apply {
         tag = "pairing_card_root"
 
@@ -1255,12 +1857,16 @@ class MainActivity : Activity() {
     private fun showSettingsPage() {
         updatePairingCard()
         updateBroadcastStrategySummary()
+        hidHapticsPage?.visibility = View.GONE
+        hidSettingsPage?.visibility = View.GONE
         mainPage?.visibility = View.GONE
         settingsPage?.visibility = View.VISIBLE
     }
 
     private fun showMainPage() {
         settingsPage?.visibility = View.GONE
+        hidHapticsPage?.visibility = View.GONE
+        hidSettingsPage?.visibility = View.GONE
         mainPage?.visibility = View.VISIBLE
         updateConnectionStatus(refreshRoot = false)
     }
@@ -1755,7 +2361,21 @@ class MainActivity : Activity() {
         } else if (requestCode == REQUEST_CAMERA) {
             if (requestNotificationPermissionIfNeeded()) startHomeKitService()
         } else if (requestCode == REQUEST_NOTIFICATIONS && grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            startHomeKitService()
+            if (pendingHidEnable) {
+                pendingHidEnable = false
+                startHid()
+            } else {
+                startHomeKitService()
+            }
+        } else if (requestCode == REQUEST_HID) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED } && pendingHidEnable) {
+                pendingHidEnable = false
+                enableHidFromUi()
+            } else {
+                pendingHidEnable = false
+                applyHidState(BtHidPeripheral.State.STOPPED, null)
+                Toast.makeText(this, "需要蓝牙权限才能作为外设使用", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -1768,6 +2388,9 @@ class MainActivity : Activity() {
         private const val REQUEST_BLUETOOTH = 100
         private const val REQUEST_NOTIFICATIONS = 101
         private const val REQUEST_CAMERA = 102
+        private const val REQUEST_HID = 103
+        private const val REQUEST_DISCOVERABLE = 104
+        private const val KEY_HID_SENSITIVITY = "touchpad_sensitivity"
         private const val SLIDER_UI_HOLD_MS = 1_200L
         private const val SLIDER_UI_SETTLE_MS = 700L
     }

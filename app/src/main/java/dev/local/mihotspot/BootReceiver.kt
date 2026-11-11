@@ -27,6 +27,18 @@ class BootReceiver : BroadcastReceiver() {
                     android.util.Log.e("MarionetteAirDrop", "RESIDENT_RECOVERY_FAILED", error)
                 }
             }
+            // The HID peripheral must re-register after a reboot, otherwise the
+            // host cannot reconnect and the SDP record is missing entirely.
+            val hidPrefs = context.getSharedPreferences(
+                dev.local.mihotspot.peripheral.BtHidPeripheral.PREFS, Context.MODE_PRIVATE
+            )
+            if (hidPrefs.getBoolean(dev.local.mihotspot.peripheral.BtHidPeripheral.KEY_ENABLED, false)) {
+                try {
+                    dev.local.mihotspot.peripheral.PeripheralService.start(context)
+                } catch (error: Exception) {
+                    android.util.Log.e("MiHotspotHid", "HID_BOOT_START_FAILED", error)
+                }
+            }
             if (!ServiceControl.isEnabled(context)) return
             android.util.Log.i("MiHotspotHap", "SERVICE_RECOVERY_REQUEST action=${intent.action}")
             ServiceControl.ensureRunning(context, intent.action)
