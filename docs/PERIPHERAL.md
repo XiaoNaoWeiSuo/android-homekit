@@ -49,7 +49,7 @@ app/src/main/java/dev/local/mihotspot/peripheral/
 ├── BtHidPeripheral.kt    # BluetoothHidDevice 注册、连接状态、报告发送、重连
 ├── PeripheralService.kt  # 前台服务（connectedDevice）+ PeripheralHub 单例
 ├── TouchpadView.kt       # 手势→相对鼠标/滚轮/点击
-├── KeyboardPanel.kt      # 屏上键帽，修饰键锁定
+├── KeyboardPanel.kt      # 屏上键帽，多指组合键 / 统一图标
 └── PeripheralActivity.kt # 外设页面（状态、配对、触控板、键盘、文本直通）
 ```
 
@@ -66,7 +66,7 @@ app/src/main/java/dev/local/mihotspot/peripheral/
 | 双指上下拖动 | 滚轮（26 dp 一格） |
 | 双指轻点 | 右键单击 |
 | 长按 420 ms 后移动 | 按住左键拖拽，抬手释放 |
-| 屏上键帽 | 标准 HID usage；**按下瞬间**发报告（不等抬手），⌃/⌥/⌘/⇧ 点一下锁定 |
+| 屏上键帽 | 标准 HID usage；按住即保持按下（主机自动重复），抬手才释放；支持多指和弦（如按住 ⌃ 再点 C），修饰键为按住语义 |
 | 文本框 | 逐字符转 HID；退格按删除数量回放；仅 ASCII |
 
 ## 5. 键盘延迟：为什么会“鼠标顺、键盘慢”
@@ -138,7 +138,10 @@ HID_CONNECTION state=2 device=<host> name=<host name>
 | 双击 bar | 50/50 共存；**只有该状态解锁竖屏** |
 | 方向 | 横屏「键盘左 / 触控板右」，竖屏「键盘上 / 触控板下」，顺序不变 |
 | 退出 | ✕ 不再悬浮，作为键帽并入键盘第一行最右侧，无独立背景 |
-| 键位 | 16 单位 ANSI 网格（tab/caps 2u、shift 2.5/3.5u、enter 3u、space 7.5u），字母大写，`sans-serif-medium`；沉浸模式下静止无键帽，**仅按下时显示半透明键帽** |
+| 键位 | 16 单位 ANSI 网格（tab/caps 2u、shift 2.5/3.5u、enter 3u、space 7.5u），字母大写，`sans-serif-medium`；沉浸模式下静止无填充，仅按下时显示浅色填充 |
+| 特色键 | tab / caps / enter / ⌫ / ⇧ / ⌃ / ⌥ / ⌘ / 方向键 / ✕ / esc 静止时带 1 px 浅色描边，按下补充浅色底与更亮描边 |
+| 图标 | 手绘统一线稿：1.5 dp 描边、17 dp 方框、同一风格；左侧键左下对齐、右侧键右下对齐，与键帽宽度无关（MacBook 式） |
+| 组合键 | 面板统一处理多指：每个指针独立按下/抬起，修饰键按住生效；长按不再被 40 ms 强制释放，主机自行重复 |
 | 触控板 | 无文字、无卡片；中心画一个小十字；可在设置 → 蓝牙键鼠 → 「拖尾轨迹」开启淡出轨迹 |
 
 ## 9. 验证记录（2026-11-11）
