@@ -6,38 +6,47 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Color
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
+import dev.local.mihotspot.R
 import dev.local.mihotspot.peripheral.PeripheralPadActivity
+import dev.local.mihotspot.ui.UiTheme
+import dev.local.mihotspot.ui.createCard
+import dev.local.mihotspot.ui.createCardDivider
+import dev.local.mihotspot.ui.createPageHeader
+import dev.local.mihotspot.ui.createSectionHeader
+import dev.local.mihotspot.ui.createStatusBadge
+import dev.local.mihotspot.ui.onHapticClick
 
 /**
- * Entry page for USB peripheral mode. HID is the first fully wired transport;
- * UVC/UAC2 share the same gadget composition and are enabled as their capture
- * pipelines are completed.
+ * USB peripheral settings. HID and UAC2 share one standard gadget composition;
+ * UVC is shown as in-progress until its capture pipeline is wired.
  */
 class UsbPeripheralActivity : Activity() {
 
     private lateinit var master: Switch
     private lateinit var audioSwitch: Switch
-    private lateinit var status: TextView
+    private lateinit var statusBadge: TextView
+    private lateinit var statusDetail: TextView
     private var suppressSwitch = false
     private var pendingAudio = false
 
-    private fun setSwitchSilently(checked: Boolean) {
+    private fun setSwitchSilently(view: Switch, checked: Boolean) {
         suppressSwitch = true
-        master.isChecked = checked
+        view.isChecked = checked
         suppressSwitch = false
     }
 
@@ -45,12 +54,22 @@ class UsbPeripheralActivity : Activity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.getStringExtra(UsbPeripheralService.EXTRA_STATE)) {
                 "ready" -> {
-                    status.text = "USB 键鼠已就绪，主机可直接使用"
-                    setSwitchSilently(true)
+                    setSwitchSilently(master, true)
+                    showStatus(
+                        "● 键鼠已就绪",
+                        UiTheme.COLOR_SUCCESS,
+                        UiTheme.COLOR_SUCCESS_LIGHT
+                    )
+                    statusDetail.text = "主机可直接使用 USB 键盘与触控板"
                 }
                 "error" -> {
-                    status.text = "USB 绑定失败，请重新插拔数据线后重试"
-                    setSwitchSilently(false)
+                    setSwitchSilently(master, false)
+                    showStatus(
+                        "● 绑定失败",
+                        UiTheme.COLOR_DANGER,
+                        UiTheme.COLOR_DANGER_LIGHT
+                    )
+                    statusDetail.text = "请重新插拔数据线后重试"
                 }
             }
         }
@@ -58,85 +77,150 @@ class UsbPeripheralActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val scroll = ScrollView(this).apply { setBackgroundColor(Color.WHITE) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(26), dp(22), dp(28))
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(UiTheme.COLOR_BG)
         }
-        scroll.addView(root)
+        root.addView(createPageHeader(this, "USB 外设", { finish() }))
 
-        root.addView(TextView(this).apply {
-            text = "USB 外设"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(0xFF111111.toInt())
-        })
-        root.addView(TextView(this).apply {
-            text = "手机通过标准 USB 协议变成主机的键鼠、摄像头与音频设备，主机无需安装软件。"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(0xFF666666.toInt())
-            setPadding(0, dp(6), 0, dp(18))
-        })
+        val scroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(24))
+        }
+        scroll.addView(content)
+        root.addView(scroll)
+        setContentView(root)
+
+        content.addView(
+            createSectionHeader(
+                this,
+                "连接模式",
+                "USB 外设说明",
+                "手机通过标准 USB 类协议（HID / UAC2 / UVC）作为主机外设。" +
+                    "主机使用系统自带驱动，无需安装任何软件。"
+            )
+        )
+
+        val modeCard = createCard(this)
+        statusBadge = createStatusBadge(
+            this, "● 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG
+        )
+        modeCard.addView(statusBadge)
 
         master = Switch(this).apply {
-            text = "USB 外设模式"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            contentDescription = "USB 外设模式"
             isChecked = UsbSession.isEnabled(this@UsbPeripheralActivity)
             setOnCheckedChangeListener { _, checked ->
                 if (suppressSwitch) return@setOnCheckedChangeListener
                 if (checked) {
                     UsbSession.setEnabled(this@UsbPeripheralActivity, true)
-                    status.text = "正在绑定 USB gadget…"
+                    showStatus(
+                        "● 正在绑定",
+                        UiTheme.COLOR_WARNING,
+                        UiTheme.COLOR_WARNING_LIGHT
+                    )
+                    statusDetail.text = "正在重组 USB gadget，请稍候…"
                     startUsb()
                 } else {
                     UsbSession.setEnabled(this@UsbPeripheralActivity, false)
-                    status.text = "正在恢复普通 USB 模式…"
-                    if (UsbPeripheralService.running) {
-                        UsbPeripheralService.stop(this@UsbPeripheralActivity)
-                    } else {
-                        // The service may have been killed by a reinstall; the
-                        // root daemon can still be alive. Always run recovery.
-                        val ctx = this@UsbPeripheralActivity
-                        Thread {
-                            UsbGadgetController(ctx).stop()
-                            runOnUiThread { status.text = "USB 外设已关闭" }
-                        }.start()
-                    }
+                    beginStop()
                 }
             }
         }
-        root.addView(master)
+        modeCard.addView(settingRow(
+            "USB 外设模式",
+            "手机作为标准 USB 键盘 / 触控板接入主机",
+            master
+        ))
 
         audioSwitch = Switch(this).apply {
-            text = "USB 麦克风 + 扬声器（UAC2）"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            contentDescription = "USB 麦克风与扬声器"
             isChecked = UsbSession.prefs(this@UsbPeripheralActivity)
                 .getBoolean(UsbSession.KEY_AUDIO, false)
             setOnCheckedChangeListener { _, checked ->
+                if (suppressSwitch) return@setOnCheckedChangeListener
                 UsbSession.prefs(this@UsbPeripheralActivity).edit()
                     .putBoolean(UsbSession.KEY_AUDIO, checked).apply()
                 if (master.isChecked) {
-                    status.text = "正在重启 USB 以应用音频设置…"
+                    showStatus(
+                        "● 正在重启",
+                        UiTheme.COLOR_WARNING,
+                        UiTheme.COLOR_WARNING_LIGHT
+                    )
+                    statusDetail.text = "正在应用音频设置…"
                     UsbPeripheralService.stop(this@UsbPeripheralActivity)
                     Handler(Looper.getMainLooper()).postDelayed({ startUsb() }, 1000)
                 }
             }
         }
-        root.addView(audioSwitch)
+        modeCard.addView(createCardDivider(this))
+        modeCard.addView(settingRow(
+            "麦克风 + 扬声器",
+            "UAC2 标准 USB 声卡：主机录音使用手机麦克风，主机播放从手机扬声器输出",
+            audioSwitch
+        ))
+        content.addView(modeCard)
 
-        status = TextView(this).apply {
-            text = if (UsbSession.isEnabled(this@UsbPeripheralActivity)) "USB 外设已开启" else "USB 外设已关闭"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(0xFF666666.toInt())
-            setPadding(0, dp(8), 0, dp(18))
+        statusDetail = TextView(this).apply {
+            text = if (UsbSession.isEnabled(this@UsbPeripheralActivity))
+                "USB 外设已开启" else "USB 外设已关闭"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(dp(22), dp(8), dp(22), dp(4))
         }
-        root.addView(status)
+        content.addView(statusDetail)
 
-        root.addView(Button(this).apply {
+        content.addView(
+            createSectionHeader(
+                this,
+                "使用",
+                "USB 使用说明",
+                "键鼠界面与蓝牙模式共用同一套 UI；USB 模式下不再依赖蓝牙连接。"
+            )
+        )
+        val useCard = createCard(this)
+        useCard.addView(navRow(
+            "USB 键鼠界面",
+            "键盘 + 触控板，点键盘上的 ✕ 退出",
+            "打开"
+        ) {
+            startActivity(
+                PeripheralPadActivity.intent(
+                    this@UsbPeripheralActivity,
+                    immersive = false,
+                    transport = PeripheralPadActivity.TRANSPORT_USB
+                )
+            )
+        })
+        useCard.addView(createCardDivider(this))
+        useCard.addView(navRow(
+            "摄像头（UVC）",
+            "前置 / 后置 / 屏幕画面，标准 USB Video 类",
+            "接入中"
+        ) {
+            Toast.makeText(
+                this@UsbPeripheralActivity,
+                "UVC 取流管线正在接入，完成前不会向主机暴露无画面的摄像头",
+                Toast.LENGTH_SHORT
+            ).show()
+        })
+        content.addView(useCard)
+
+        val actionCard = createCard(this)
+        val open = Button(this).apply {
             text = "打开 USB 键鼠界面"
-            setOnClickListener {
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
+            )
+            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, android.graphics.Color.WHITE, 12f)
+            onHapticClick {
                 startActivity(
                     PeripheralPadActivity.intent(
                         this@UsbPeripheralActivity,
@@ -145,57 +229,134 @@ class UsbPeripheralActivity : Activity() {
                     )
                 )
             }
-        })
-
-        root.addView(Button(this).apply {
+        }
+        actionCard.addView(open)
+        val stop = Button(this).apply {
             text = "停止并恢复普通 USB"
-            setOnClickListener {
-                master.isChecked = false
+            textSize = 14f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
+            ).apply { topMargin = dp(8) }
+            UiTheme.styleButton(
+                this,
+                UiTheme.COLOR_BTN_SECONDARY_BG,
+                UiTheme.COLOR_BTN_SECONDARY_TEXT,
+                12f
+            )
+            onHapticClick {
+                setSwitchSilently(master, false)
+                UsbSession.setEnabled(this@UsbPeripheralActivity, false)
+                beginStop()
             }
-        })
+        }
+        actionCard.addView(stop)
+        content.addView(actionCard)
 
-        root.addView(TextView(this).apply {
-            text = "摄像头 / 麦克风 / 扬声器\n" +
-                "UVC 与 UAC2 的标准协议通路已在真机打通；前置/后置/屏幕画面与音频采集管线正在接入，\n" +
-                "完成前不会向主机暴露无画面的摄像头设备。"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(0xFF888888.toInt())
-            setPadding(0, dp(24), 0, 0)
+        content.addView(TextView(this).apply {
+            text = "不安装软件、不伪造私有协议：HID 1.11、USB Audio Class 2、USB Video Class 均为标准设备类。"
+            textSize = 11f
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(dp(22), dp(14), dp(22), 0)
         })
-
-        setContentView(scroll)
 
         if (UsbSession.isEnabled(this) && UsbPeripheralService.running) {
-            // The service survived a configuration change; reflect the real state.
-            setSwitchSilently(true)
+            setSwitchSilently(master, true)
+            showStatus("● 运行中", UiTheme.COLOR_SUCCESS, UiTheme.COLOR_SUCCESS_LIGHT)
         } else if (UsbSession.isEnabled(this) && !UsbPeripheralService.running) {
-            setSwitchSilently(false)
-            status.text = "检测到上次 USB 会话未清理，正在恢复…"
+            setSwitchSilently(master, false)
+            showStatus("● 正在恢复", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+            statusDetail.text = "检测到上次 USB 会话未清理，正在恢复…"
             val ctx = this
             Thread {
                 UsbGadgetController(ctx).stop()
-                runOnUiThread { status.text = "USB 外设已关闭" }
+                runOnUiThread {
+                    showStatus("● 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+                    statusDetail.text = "USB 外设已关闭"
+                }
             }.start()
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        val filter = IntentFilter(UsbPeripheralService.ACTION_STATE)
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(receiver, filter)
+    private fun settingRow(title: String, desc: String, control: View): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, dp(12))
+            val col = LinearLayout(this@UsbPeripheralActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            col.addView(TextView(this@UsbPeripheralActivity).apply {
+                text = title
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            })
+            col.addView(TextView(this@UsbPeripheralActivity).apply {
+                text = desc
+                textSize = 12f
+                setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+                setPadding(0, dp(4), dp(8), 0)
+            })
+            addView(col)
+            addView(control)
         }
+
+    private fun navRow(title: String, desc: String, action: String, onClick: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, dp(12))
+            val col = LinearLayout(this@UsbPeripheralActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            col.addView(TextView(this@UsbPeripheralActivity).apply {
+                text = title
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+            })
+            col.addView(TextView(this@UsbPeripheralActivity).apply {
+                text = desc
+                textSize = 12f
+                setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+                setPadding(0, dp(4), dp(8), 0)
+            })
+            addView(col)
+            addView(TextView(this@UsbPeripheralActivity).apply {
+                text = action
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(
+                    if (action == "接入中") UiTheme.COLOR_WARNING else UiTheme.COLOR_ACCENT
+                )
+            })
+            addView(ImageView(this@UsbPeripheralActivity).apply {
+                setImageResource(R.drawable.ic_chevron_right)
+                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginStart = dp(4) }
+            })
+            onHapticClick(onClick)
+        }
+
+    private fun showStatus(text: String, textColor: Int, bgColor: Int) {
+        statusBadge.text = text
+        statusBadge.setTextColor(textColor)
+        statusBadge.background = UiTheme.createPillDrawable(this, bgColor)
     }
 
-    override fun onPause() {
-        try {
-            unregisterReceiver(receiver)
-        } catch (_: Exception) {
+    private fun beginStop() {
+        showStatus("● 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+        statusDetail.text = "正在恢复普通 USB 模式…"
+        if (UsbPeripheralService.running) {
+            UsbPeripheralService.stop(this)
+        } else {
+            val ctx = this
+            Thread {
+                UsbGadgetController(ctx).stop()
+                runOnUiThread { statusDetail.text = "已恢复普通 USB 模式" }
+            }.start()
         }
-        super.onPause()
     }
 
     private fun startUsb() {
@@ -220,11 +381,30 @@ class UsbPeripheralActivity : Activity() {
         val granted = grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         if (!granted) {
-            audioSwitch.isChecked = false
-            status.text = "未授予录音权限，只启用 USB 键鼠"
+            setSwitchSilently(audioSwitch, false)
+            statusDetail.text = "未授予录音权限，只启用 USB 键鼠"
         }
         UsbPeripheralService.start(this, false, granted)
         pendingAudio = false
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter(UsbPeripheralService.ACTION_STATE)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(receiver, filter)
+        }
+    }
+
+    override fun onPause() {
+        try {
+            unregisterReceiver(receiver)
+        } catch (_: Exception) {
+        }
+        super.onPause()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
