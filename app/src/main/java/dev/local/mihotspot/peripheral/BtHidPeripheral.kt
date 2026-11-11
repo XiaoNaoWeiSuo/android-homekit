@@ -137,6 +137,8 @@ class BtHidPeripheral(context: Context) {
     private var registerAttempts = 0
     @Volatile private var registering = false
     @Volatile private var pendingReRegister = false
+    private var registerRetry = 0
+    private var profileRetry = 0
 
     val isRunning: Boolean get() = running
     val isConnected: Boolean get() = host != null
@@ -195,24 +197,26 @@ class BtHidPeripheral(context: Context) {
                     worker.post {
                         proxy = null
                         registered = false
+                        registering = false
+                        profileRequested = false
                         host = null
+                        registerRetry = 0
+                        profileRetry = 0
                     }
                     publish(State.STOPPED)
                 }
                 BluetoothAdapter.STATE_ON -> {
                     log("BT_STATE_ON reacquire_profile")
-                    worker.post {
-                        if (!running) return@post
-                        val adapter = bluetoothManager?.adapter ?: return@post
-                        publish(State.REGISTERING)
-                        val ok = try {
-                            adapter.getProfileProxy(appContext, proxyListener, BluetoothProfile.HID_DEVICE)
-                        } catch (e: SecurityException) {
-                            log("HID_PROFILE_PROXY_DENIED ${e.message}")
-                            false
-                        }
-                        if (!ok) publish(State.FAILED, "蓝牙已开启但无法获取 HID profile")
-                    }
+                    // The stack restarts its HID service asynchronously; calling
+                    // registerApp a few milliseconds after STATE_ON returns a
+                    // silent false. Give it a moment, then re-acquire.
+                    worker.postDelayed({
+                        if (!running) return@postDelayed
+                        val adapter = bluetoothManager?.adapter ?: return@postDelayed
+                        if (!adapter.isEnabled) return@postDelayed
+                        if (proxy != null || profileRequested) return@postDelayed
+                        start()
+                    }, 2000L)
                 }
             }
         }
@@ -305,6 +309,19 @@ class BtHidPeripheral(context: Context) {
             // Adapter off or profile unavailable: keep `running` so the
             // Bluetooth state receiver can retry once the adapter is back.
             publish(State.FAILED, "无法获取 HID profile（蓝牙未开启或系统未开放）")
+            if (profileRetry < 5) {
+                profileRetry++
+                worker.postDelayed({
+                    if (running && proxy == null && !profileRequested &&
+                        bluetoothManager?.adapter?.isEnabled == true
+                    ) {
+                        log("HID_PROFILE_RETRY attempt=$profileRetry")
+                        start()
+                    }
+                }, 2500L)
+            }
+        } else {
+            profileRetry = 0
         }
     }
 
@@ -375,12 +392,22 @@ class BtHidPeripheral(context: Context) {
         log("HID_REGISTER_APP name=${deviceName} result=$ok")
         if (!ok) {
             // HyperOS/AOSP may return false while still delivering
-            // onAppStatusChanged(true) asynchronously. Trust the callback and
-            // only report failure if nothing arrives.
+            // onAppStatusChanged(true) asynchronously. Trust the callback; if
+            // nothing arrives (typical right after a Bluetooth restart), retry
+            // a few times before surfacing a failure.
             worker.postDelayed({
                 if (running && !registered) {
                     registering = false
-                    publish(State.FAILED, "HID 注册失败：系统里可能有残留的旧注册（进程被强杀后常见）")
+                    if (registerRetry < 3) {
+                        registerRetry++
+                        log("HID_REGISTER_RETRY attempt=$registerRetry")
+                        worker.postDelayed({ if (running && !registered) registerLocked() }, 1500L)
+                    } else {
+                        publish(
+                            State.FAILED,
+                            "HID 注册失败：蓝牙 HID 服务未就绪，请再点一次「重置蓝牙」或重新打开 HID"
+                        )
+                    }
                 }
             }, 2500)
         }
@@ -452,6 +479,7 @@ class BtHidPeripheral(context: Context) {
                 return
             }
             registerAttempts = 0
+            registerRetry = 0
             pendingReRegister = false
             host = null
             publish(State.READY)
