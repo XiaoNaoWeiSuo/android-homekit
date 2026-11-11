@@ -1042,6 +1042,16 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
         const uint8_t *p = static_cast<const uint8_t *>(v.buffers[buf.index].start);
         LOGI("UVC: qbuf idx=%u len=%zu used=%u y0=%u y1=%u y2=%u u=%u v=%u",
              buf.index, v.buffers[buf.index].len, buf.bytesused, p[0], p[2], p[4], p[1], p[3]);
+        // A panic takes logcat with it; keep a copy on disk so the next attempt
+        // still has data even if the phone reboots mid-stream.
+        static FILE *diag = nullptr;
+        if (!diag) diag = fopen("/data/local/tmp/uvc_qbuf.log", "a");
+        if (diag) {
+            fprintf(diag, "idx=%u len=%zu used=%u y0=%u y1=%u y2=%u u=%u v=%u\n",
+                    buf.index, v.buffers[buf.index].len, buf.bytesused, p[0], p[2], p[4],
+                    p[1], p[3]);
+            fflush(diag);
+        }
     }
     if (xioctl(v.fd, VIDIOC_QBUF, &buf) < 0) {
         if (errno == ENODEV) {
