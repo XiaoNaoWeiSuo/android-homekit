@@ -1448,6 +1448,108 @@ class MainActivity : Activity() {
         })
         content.addView(statusCard)
 
+        // Connection policy: keep the single HID link free for another host.
+        val policyCard = createCard(this, 12f, 16f)
+        val autoRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val autoCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        autoCol.addView(TextView(this).apply {
+            text = "自动重连上次主机"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        autoCol.addView(TextView(this).apply {
+            text = "关闭后手机只等待主机连入，不会主动回连 Mac，适合把键鼠交给 Windows 使用"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        autoRow.addView(autoCol)
+        autoRow.addView(Switch(this).apply {
+            isChecked = PeripheralHub.bridge(this@MainActivity).autoReconnectLastHost
+            setOnCheckedChangeListener { _, checked ->
+                PeripheralHub.bridge(this@MainActivity).autoReconnectLastHost = checked
+            }
+        })
+        policyCard.addView(autoRow)
+        content.addView(policyCard)
+
+        // Manual host picker: an HID device has one active host at a time.
+        val hostCard = createCard(this, 12f, 16f)
+        hostCard.addView(TextView(this).apply {
+            text = "已配对主机"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        hostCard.addView(TextView(this).apply {
+            text = "点「连接」把键鼠交给这台设备；Windows 需先在这里配对成功。"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, dp(6))
+        })
+        val bridge = PeripheralHub.bridge(this@MainActivity)
+        val bonded = bridge.bondedDevices()
+        if (bonded.isEmpty()) {
+            hostCard.addView(TextView(this).apply {
+                text = "暂无已配对设备"
+                textSize = 12f
+                setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            })
+        } else {
+            bonded.forEachIndexed { index, device ->
+                if (index > 0) hostCard.addView(createCardDivider(this))
+                val name = try {
+                    device.name?.takeIf { it.isNotBlank() } ?: device.address
+                } catch (e: SecurityException) {
+                    device.address
+                }
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(8), 0, dp(8))
+                }
+                val col = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                col.addView(TextView(this).apply {
+                    text = name
+                    textSize = 14f
+                    setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+                })
+                col.addView(TextView(this).apply {
+                    text = device.address
+                    textSize = 11f
+                    setTextColor(UiTheme.COLOR_TEXT_MUTED)
+                })
+                row.addView(col)
+                row.addView(Button(this).apply {
+                    text = "连接"
+                    textSize = 12f
+                    layoutParams = LinearLayout.LayoutParams(dp(64), dp(34))
+                    UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 10f)
+                    onHapticClick {
+                        PeripheralHub.bridge(this@MainActivity).start()
+                        val ok = PeripheralHub.bridge(this@MainActivity).connectTo(device.address)
+                        Toast.makeText(
+                            this@MainActivity,
+                            if (ok) "正在连接 $name" else "连接请求被系统拒绝",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                })
+                hostCard.addView(row)
+            }
+        }
+        content.addView(hostCard)
+
         val nameCard = createCard(this, 12f, 16f)
         val nameRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL

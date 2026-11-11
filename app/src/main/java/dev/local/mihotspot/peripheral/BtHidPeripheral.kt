@@ -42,6 +42,7 @@ class BtHidPeripheral(context: Context) {
         const val PREFS = "peripheral"
         const val KEY_DEVICE_NAME = "hid_device_name"
         const val KEY_LAST_HOST = "hid_last_host"
+        const val KEY_AUTO_RECONNECT = "hid_auto_reconnect"
         const val KEY_ENABLED = "hid_enabled"
         const val KEY_KEEP_ALIVE = "hid_keep_alive"
         const val DEFAULT_DEVICE_NAME = "Magic Keyboard"
@@ -577,9 +578,39 @@ class BtHidPeripheral(context: Context) {
         return attempted
     }
 
+    /** Bonded devices, for the manual host picker in settings. */
+    @SuppressLint("MissingPermission")
+    fun bondedDevices(): List<BluetoothDevice> = try {
+        bluetoothManager?.adapter?.bondedDevices?.toList().orEmpty()
+            .sortedBy { safeName(it) }
+    } catch (e: SecurityException) {
+        log("HID_BONDED_LIST_DENIED ${e.message}")
+        emptyList()
+    }
+
+    /** Try to connect to a specific bonded host (e.g. a Windows PC). */
+    @SuppressLint("MissingPermission")
+    fun connectTo(address: String): Boolean {
+        val hid = proxy ?: return false
+        return try {
+            val adapter = bluetoothManager?.adapter ?: return false
+            val device = adapter.getRemoteDevice(address)
+            val ok = hid.connect(device)
+            log("HID_CONNECT_MANUAL device=$address ok=$ok")
+            ok
+        } catch (e: Exception) {
+            log("HID_CONNECT_MANUAL_FAILED $address ${e.message}")
+            false
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun maybeReconnectLocked(hid: BluetoothHidDevice?) {
         if (hid == null) return
+        if (!autoReconnectLastHost) {
+            log("HID_AUTO_RECONNECT_SKIPPED disabled")
+            return
+        }
         val last = prefs.getString(KEY_LAST_HOST, null) ?: return
         try {
             val device = bluetoothManager?.adapter?.getRemoteDevice(last) ?: return
@@ -590,6 +621,14 @@ class BtHidPeripheral(context: Context) {
             log("HID_AUTO_RECONNECT_FAILED ${e.message}")
         }
     }
+
+    /** When off, the phone waits for a host to connect instead of calling the
+     *  last host itself — needed to hand the single HID link to another machine. */
+    var autoReconnectLastHost: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_AUTO_RECONNECT, value).apply()
+        }
 
     /** Drop the active host so another machine (e.g. Windows) can take over. */
     @SuppressLint("MissingPermission")
