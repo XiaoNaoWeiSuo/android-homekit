@@ -126,6 +126,20 @@ payload ...
 - 47834：守护进程 → App，S16LE stereo 48 kHz（主机播放）。
 - 守护进程用 `dlopen("libtinyalsa.so")`，参数可用命令行 `--pcm-card` 或自动探测 `UAC2Gadget`。
 
+**2026-11-11 实测（已验证，别再凭假设排查）**
+
+- 必须用自建实例 `functions/uac2.marionette`，不要复用 vendor 的 `uac2.0`：后者出现得晚，
+  且脚本里的属性写入会因目录不存在而静默失败（实测 `uac2.0` 一直是默认 `c_srate=64000`）。
+- 自建实例（`p_chmask=3 / p_srate=48000 / c_chmask=1 / c_srate=48000`）绑定后：
+  - `/proc/asound/pcm` 出现 `01-00: UAC2 PCM : UAC2 PCM : playback 1 : capture 1`；
+  - `/dev/snd/pcmC1D0c`、`pcmC1D0p` 存在，`tinycap -D 1 -d 0 -c 1 -r 48000` 能正常打开；
+  - `tinypcminfo -D 1 -d 0`：PCM out 2ch/48k、PCM in 1ch/48k，与配置一致；
+  - macOS `system_profiler SPAudioDataType` 出现 `Manufacturer: Xiaomi` 的 USB 播放/录音设备。
+- **坑：`/proc/asound/card1/` 只有 `id`，没有 `pcm0c/pcm0p` 条目。** 守护进程若按
+  `cardN/pcm*` 枚举会永远判为“没有 PCM 节点”（这正是之前反复打印
+  `UAC2Gadget card 1 has no pcm*p/pcm*c nodes yet` 的原因）。发现路径必须改为
+  `/proc/asound/pcm` 或直接探测 `/dev/snd/pcmC<card>D<dev>{c,p}`。
+
 ## 5. UVC 控制请求
 
 `UVC_EVENT_SETUP` 必须响应，否则主机会挂起控制传输。参考 `tools/usb/uvc-gadget.c` 的

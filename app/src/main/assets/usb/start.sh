@@ -4,7 +4,7 @@
 G=/config/usb_gadget/g1
 H=$G/functions/hid.marionette
 F=$G/functions/uvc.marionette
-A=$G/functions/uac2.0
+A=$G/functions/uac2.marionette
 
 killall -TERM marionette_usbd 2>/dev/null
 sleep 0.2
@@ -55,13 +55,22 @@ if [ "__ENABLE_CAMERA__" = "1" ]; then
 fi
 
 # ---- UAC2: 48 kHz stereo playback, mono capture ----
+# Use our own instance: the vendor's uac2.0 appears late (or not at all) after
+# boot, so writes to it landed on a missing directory, were swallowed by
+# 2>/dev/null, and f4 ended up linked to a function we never configured.
 if [ "__ENABLE_AUDIO__" = "1" ]; then
-  echo 3 > $A/p_chmask 2>/dev/null
-  echo 48000 > $A/p_srate 2>/dev/null
-  echo 2 > $A/p_ssize 2>/dev/null
-  echo 1 > $A/c_chmask 2>/dev/null
-  echo 48000 > $A/c_srate 2>/dev/null
-  echo 2 > $A/c_ssize 2>/dev/null
+  mkdir $A 2>/dev/null
+  # f_uac2 exposes the ALSA view inverted (verified with tinypcminfo and the
+  # host's own device list): p_chmask sizes ALSA playback, which is what the
+  # HOST RECORDS, while c_chmask sizes ALSA capture, which is what the HOST
+  # PLAYS. So: mono phone mic -> p_chmask=1, stereo speaker -> c_chmask=3.
+  echo 1 > $A/p_chmask
+  echo 48000 > $A/p_srate
+  echo 2 > $A/p_ssize
+  echo 3 > $A/c_chmask
+  echo 48000 > $A/c_srate
+  echo 2 > $A/c_ssize
+  echo 2 > $A/req_number 2>/dev/null
 fi
 
 # ---- links (adb stays as a development safety net) ----
@@ -69,7 +78,7 @@ cd $G/configs/b.1 || exit 11
 ln -s ../../functions/ffs.adb f1 2>/dev/null
 ln -s ../../functions/hid.marionette f2 2>/dev/null
 [ "__ENABLE_CAMERA__" = "1" ] && ln -s ../../functions/uvc.marionette f3 2>/dev/null
-[ "__ENABLE_AUDIO__" = "1" ] && ln -s ../../functions/uac2.0 f4 2>/dev/null
+[ "__ENABLE_AUDIO__" = "1" ] && ln -s ../../functions/uac2.marionette f4 2>/dev/null
 
 # ---- daemon before bind: it polls for the nodes and subscribes to UVC events ----
 killall -TERM marionette_usbd 2>/dev/null

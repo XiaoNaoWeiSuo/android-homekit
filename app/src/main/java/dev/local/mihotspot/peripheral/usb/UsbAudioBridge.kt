@@ -37,6 +37,13 @@ class UsbAudioBridge(private val token: String) {
     private var spkThread: Thread? = null
     @Volatile private var speaker = true
     private var audioManager: AudioManager? = null
+    // Held so stop() can unblock the loops: both threads sit in a blocking
+    // read (AudioRecord and the daemon socket), and a timed-out join would
+    // otherwise leak a thread that still owns its AudioTrack.
+    @Volatile private var micRecord: AudioRecord? = null
+    @Volatile private var micSocket: Socket? = null
+    @Volatile private var spkTrack: AudioTrack? = null
+    @Volatile private var spkSocket: Socket? = null
 
     val isRunning: Boolean get() = running.get()
 
@@ -59,6 +66,24 @@ class UsbAudioBridge(private val token: String) {
 
     fun stop() {
         if (!running.compareAndSet(true, false)) return
+        // Unblock the loops before joining so they reach their finally blocks
+        // and release AudioRecord/AudioTrack within the join budget.
+        try {
+            micRecord?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            micSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            spkSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            spkTrack?.pause()
+        } catch (_: Exception) {
+        }
         try {
             micThread?.join(600)
             spkThread?.join(600)
@@ -104,6 +129,7 @@ class UsbAudioBridge(private val token: String) {
                 Log.i(TAG, "USB_MIC_INIT_FAILED")
                 return
             }
+            micRecord = record
             record.startRecording()
             val buffer = ByteArray(MIC_CHUNK)
             while (running.get()) {
@@ -111,6 +137,7 @@ class UsbAudioBridge(private val token: String) {
                     socket = connect(MIC_PORT) ?: run {
                         Thread.sleep(400); null
                     }
+                    micSocket = socket
                     out = socket?.let { BufferedOutputStream(it.getOutputStream()) }
                 }
                 val n = record.read(buffer, 0, buffer.size)
@@ -122,6 +149,7 @@ class UsbAudioBridge(private val token: String) {
                         Log.i(TAG, "USB_MIC_SOCKET_LOST ${e.message}")
                         socket?.close()
                         socket = null
+                        micSocket = null
                         out = null
                     }
                 } else if (n < 0) {
@@ -168,6 +196,7 @@ class UsbAudioBridge(private val token: String) {
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setBufferSizeInBytes(maxOf(min, SPK_CHUNK * 4))
                 .build()
+            spkTrack = track
             track.play()
             val buffer = ByteArray(SPK_CHUNK)
             while (running.get()) {
@@ -175,6 +204,7 @@ class UsbAudioBridge(private val token: String) {
                     socket = connect(SPK_PORT) ?: run {
                         Thread.sleep(400); null
                     }
+                    spkSocket = socket
                     input = socket?.let { BufferedInputStream(it.getInputStream()) }
                 }
                 val stream = input

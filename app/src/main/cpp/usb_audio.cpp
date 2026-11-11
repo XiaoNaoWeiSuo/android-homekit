@@ -133,6 +133,59 @@ struct DeviceList {
 };
 
 // Enumerate cardN/pcm0p, pcm0c, pcm1p, ... (playback and capture device ids).
+//
+// This vendor kernel does not create per-card pcm entries at all: with a bound
+// f_uac2, /proc/asound/card1 contains only `id`, while /proc/asound/pcm lists
+// `01-00: UAC2 PCM : UAC2 PCM : playback 1 : capture 1` and /dev/snd carries
+// pcmC1D0c/pcmC1D0p. Scanning only the card directory therefore reports "no PCM
+// nodes" forever, which is what kept the audio bridge closed.
+int enumerate_pcms_global(int card, DeviceList *out) {
+    FILE *f = fopen("/proc/asound/pcm", "r");
+    if (!f) return out->count;
+    char line[256];
+    while (fgets(line, sizeof(line), f) && out->count < 8) {
+        int c = -1, d = -1;
+        if (sscanf(line, " %d-%d:", &c, &d) != 2) continue;
+        if (c != card || d < 0) continue;
+        bool seen = false;
+        for (int i = 0; i < out->count; i++)
+            if (out->index[i] == d) seen = true;
+        if (!seen) out->index[out->count++] = d;
+    }
+    fclose(f);
+    return out->count;
+}
+
+// Last resort: the device nodes exist even when /proc exposes no entry.
+int enumerate_pcms_from_dev(int card, DeviceList *out) {
+    char path[96];
+    for (int d = 0; d < 8 && out->count < 8; d++) {
+        bool present = false;
+        for (const char *dir : {"c", "p"}) {
+            snprintf(path, sizeof(path), "/dev/snd/pcmC%dD%d%s", card, d, dir);
+            if (access(path, F_OK) == 0) present = true;
+        }
+        if (!present) continue;
+        bool seen = false;
+        for (int i = 0; i < out->count; i++)
+            if (out->index[i] == d) seen = true;
+        if (!seen) out->index[out->count++] = d;
+    }
+    return out->count;
+}
+
+void sort_devices(DeviceList *out) {
+    for (int i = 1; i < out->count; i++) {
+        int v = out->index[i];
+        int j = i - 1;
+        while (j >= 0 && out->index[j] > v) {
+            out->index[j + 1] = out->index[j];
+            j--;
+        }
+        out->index[j + 1] = v;
+    }
+}
+
 void enumerate_pcms(int card, DeviceList *out) {
     char dir[64];
     snprintf(dir, sizeof(dir), "/proc/asound/card%d", card);
@@ -152,15 +205,9 @@ void enumerate_pcms(int card, DeviceList *out) {
         if (!seen) out->index[out->count++] = dev;
     }
     closedir(d);
-    for (int i = 1; i < out->count; i++) {
-        int v = out->index[i];
-        int j = i - 1;
-        while (j >= 0 && out->index[j] > v) {
-            out->index[j + 1] = out->index[j];
-            j--;
-        }
-        out->index[j + 1] = v;
-    }
+    if (out->count == 0) enumerate_pcms_global(card, out);
+    if (out->count == 0) enumerate_pcms_from_dev(card, out);
+    sort_devices(out);
 }
 
 struct Direction {
@@ -418,10 +465,12 @@ int audio_run(int mic_port, int spk_port, const char *token, std::atomic<bool> *
         DeviceList devs;
         enumerate_pcms(card, &devs);
         if (devs.count == 0) {
-            LOGW("UAC2Gadget card %d has no pcm*p/pcm*c nodes yet", card);
+            LOGW("UAC2Gadget card %d: no PCM in card dir, /proc/asound/pcm or /dev/snd (retrying)", card);
             sleep_for_stop(stop, 500);
             continue;
         }
+        LOGI("UAC2Gadget card %d: PCM devices %d,%d,...", card,
+             devs.count > 0 ? devs.index[0] : -1, devs.count > 1 ? devs.index[1] : -1);
 
         // f_uac2 inverts the ALSA view: what the host plays is ALSA capture
         // (PCM_IN, read by us); what the host records is ALSA playback
