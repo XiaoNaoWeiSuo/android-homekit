@@ -75,9 +75,10 @@ echo 1 > uac2.0/c_chmask; echo 48000 > uac2.0/c_srate; echo 2 > uac2.0/c_ssize
 ## 3. 安全规则（重要，已踩过 kernel panic）
 
 1. **绝不**在主机 SET_INTERFACE(alt=1) 之前调用 `VIDIOC_STREAMON`。内核 `uvc_v4l2_streamon()` 会调用 `uvc_function_setup_continue()`，没有 pending setup 时触发内核异常（曾导致整机 kpanic）。
-   - 正确顺序：打开 `/dev/videoN` → `S_FMT` → `REQBUFS`/`QBUF` → 订阅 UVC 事件 → 等 `UVC_EVENT_STREAMON` → 再 `STREAMON`。
+   - 正确顺序：打开 `/dev/videoN` → `S_FMT` → `REQBUFS` + mmap → 订阅 UVC 事件 → 等 `UVC_EVENT_STREAMON` → `STREAMON` → **再** `QBUF` 全部 buffer（顺序原因见 §9.3）。
+   - 同理，`VIDIOC_STREAMOFF` 也**只能**在 `UVC_EVENT_STREAMOFF` 回调里调用（vendor `uvc_v4l2_streamoff()` 同样调用 `uvc_function_setup_continue()`）。
 2. `/dev/hidg0` 的 `write()` 在主机没有读取请求时会**阻塞**；必须 `open(O_NONBLOCK)` 并处理 `EAGAIN`。关闭 fd 前不要 unbind。
-3. 停止顺序：停止采集 → 守护进程关闭所有节点（`STREAMOFF`、close）→ `echo "" > UDC` → 还原 links → `start vendor.usbgadget-hal-1-1`。
+3. 停止顺序：停止采集 → 守护进程只 **close** 节点（**不要** `STREAMOFF`：关闭 fd 会走 `uvc_v4l2_release()` → `uvcg_video_disable()`，没有 setup 握手）→ `echo "" > UDC` → 还原 links → `start vendor.usbgadget-hal-1-1`。
 4. 热拔插/热重绑期间不要让 V4L2 处于 streaming 状态。
 
 ## 4. 进程架构
@@ -169,6 +170,7 @@ payload ...
      要判定请查本轮 dmesg 的 `POWERUP_REASON kpanic`（`hardwareinfo` 驱动打印）。
      因此 **unbind 本身即风险点**，不要为了验证而反复启停；启动（bind）侧未观察到异常。
 - 事件通知必须使用 `POLLPRI`（已修）；否则守护进程收不到 `STREAMON/SETUP`，主机只能读到打开时预排队的空 buffer。
+- 2026-11-11 源码定位：除 POLLPRI 外还有两处致命缺陷（`UVCIOC_SEND_RESPONSE` ioctl 号写错、buffer 排队顺序反了），净效果与“收不到事件”完全一致。详见 §9。
 
 ## 8. 已知边界
 
@@ -176,3 +178,110 @@ payload ...
 - UVC 摄像头在主机端是一个标准摄像头；前三路（前置/后置/屏幕）在手机上切换，主机会看到画面源切换。
 - 隐藏系统导航条、音频路由（听筒）属于 Android 侧，另见主文档。
 - Windows 对 UVC/UAC2 的标准驱动支持良好；HID 已验证。
+
+## 9. 为什么永远 `streaming=0`（2026-11-11 源码定位）
+
+依据：AOSP `android13-5.15` 的 `drivers/usb/gadget/function/{f_uvc,uvc_v4l2,uvc_video,uvc_queue}.c`、
+`fs/select.c`、`drivers/media/common/videobuf2/*`。三处缺陷叠加，任意一处都能让主机走不到
+`SET_INTERFACE(alt=1)`，也就永远收不到 `UVC_EVENT_STREAMON`：
+
+1. **`UVCIOC_SEND_RESPONSE` 的 ioctl 号写错（致命）。** `uvc_stream.cpp` 里是
+   `_IOW('U', 3, ...)`，内核 UAPI（4.19～6.6、含 android13-5.15）是
+   `_IOW('U', 1, struct uvc_request_data)`。号不匹配时 `__video_do_ioctl()` 把它当
+   “未知 ioctl”丢给 `uvc_v4l2_ioctl_default()` 的 default 分支，返回 `ENOIOCTLCMD`→
+   用户态 `ENOTTY`。结果：**每一个 SETUP 都没有应答**，主机的
+   `GET_CUR/SET_CUR (VS_PROBE/COMMIT)` 控制传输挂起、超时，不会再发
+   `SET_INTERFACE(4, 1)`。日志特征：`UVC: SEND_RESPONSE: Inappropriate ioctl for device`。
+2. **事件队列从未被读。** `v4l2_poll()` 在 `fops->poll` 存在时用驱动返回值覆盖默认的
+   `EPOLLPRI`；UVC 的 `uvc_v4l2_poll()`= `uvcg_queue_poll()`→`vb2_poll()`，而
+   `vb2_core_poll()` 对 **output** 队列在未请求 `EPOLLOUT` 时直接 `return 0`，只有
+   `v4l2_event_pending(fh)` 才补 `EPOLLPRI`。`poll()` 又会按 `events` 掩掉未请求的位
+   （`fs/select.c: mask &= filter`），所以旧的 `POLLIN` 等待永远等不到事件。
+   24a82ab 加 `POLLPRI` 是对的；现在进一步改为 **每轮无条件 `VIDIOC_DQEVENT`**
+   （poll 超时 50 ms），不再依赖驱动的 poll 位。
+3. **buffer 排队顺序。** vendor `uvc_v4l2_qbuf()` 只在
+   `uvc->state == UVC_STATE_STREAMING`（即 `STREAMON` 之后）才 `queue_work(pump)`；
+   `uvcg_video_enable()` 只排 2 个零长度 isoc 请求，`uvc_video_complete()` 也只在
+   `req_ready` 非空时才重新排 pump。旧代码在 **open 节点时**就 QBUF 了 4 个 buffer，
+   早于 `STREAMON`，于是 pump 永远不跑：`streaming=1`、`DQBUF` 永远 `EAGAIN`
+   （`out=0`，`drop(nobuf=…)` 增长）。现在：open 只 REQBUFS+mmap，
+   **`STREAMON` 成功后再 QBUF 全部 buffer**（`handle_streamon()`）。
+
+附带修正：`UVC_EVENT_LAST` 在 5.15 是 `PRIVATE_START+5`，`UVC_EVENT_CONTROL(+6)`
+订阅必然 `EINVAL`（旧代码只是静默忽略），已从订阅表移除；`UVC_EVENT_DISCONNECT`
+现在触发“关 fd 重开”，因为 `uvc_function_disable()` 之后 vb2 队列被标
+`UVC_QUEUE_DISCONNECTED`，后续 QBUF 会一直 `-ENODEV`。
+
+## 10. 安全停用：可以不 unbind UDC 吗？
+
+a13-5.15 的 `uvc_v4l2.c` 里两个 ioctl 都带 setup 握手：
+
+```
+STREAMON : uvcg_video_enable()  + uvc_function_setup_continue(uvc, 0)
+STREAMOFF: uvcg_video_disable() + uvc_function_setup_continue(uvc, 1)
+```
+
+`uvc_function_setup_continue()` 无条件调用 `usb_composite_setup_continue()`，后者在
+`cdev->delayed_status == 0` 时执行 `WARN(cdev, "Unexpected call")`；本 ROM 通过
+`panic_on_warn` 把 WARN 变成 kpanic。所以**只有** host 发来 `SET_INTERFACE` 时对应的
+`UVC_EVENT_STREAMON/STREAMOFF` 才有“待完成的状态阶段”，也**只能**在那两个事件里调用
+STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
+
+关闭 fd 是安全的：`uvc_v4l2_release()` → `uvc_v4l2_disable()` →
+`uvcg_video_disable()`（无 setup 握手）+ `usb_function_deactivate()`。
+但它会让整个 composite 软断开（HID/UAC2 也一起从主机消失），重新 open 才恢复。
+
+结论：
+
+| 目标 | 做法 | 代价 / 风险 |
+| --- | --- | --- |
+| 暂停画面，主机仍认为相机在 | 守护进程停止投帧；保持 fd、`STREAMON`、configfs 不动（队列耗空后主机画面冻结） | 无内核风险，主机画面停住 |
+| 让主机看到“相机被拔掉” | 只能 unbind 函数 / 关 fd（软断开整个 gadget） | 需先让主机退出取流，否则回到 §7 |
+| 运行中切换手机侧画面源（前/后/屏） | 不用碰 USB：源在 App 侧，守护进程继续按 MRV1 收帧即可 | 不能走 `controller.start()` 重新 bind |
+
+两条硬性约束：
+
+- **同一时刻只允许一个进程打开 `/dev/videoN`。** `uvc_v4l2_open()` 每次都调用
+  `usb_function_activate()`，第二次 open 命中
+  `WARN_ON(cdev->deactivations == 0)` → panic_on_warn → kpanic。因此
+  **不要**在 `marionette_usbd` 运行时再用 `uvc_probe`/`v4l2-ctl`/任何工具打开节点。
+- UVC 函数是 `bind_deactivated`，**整个 gadget 的枚举依赖守护进程订阅
+  `UVC_EVENT_SETUP`**（`uvc_v4l2_subscribe_event()` 里调 `uvc_function_connect()`）。
+  守护进程一退出（关 fd → deactivate），HID/UAC2 也会一起消失。所以只要启用了摄像头，
+  就不能让守护进程退出；不需要摄像头时应在 `start.sh` 阶段就不链 `uvc.*`（现有
+  `__ENABLE_CAMERA__=0` 路径），而不是运行中“关掉”。
+
+`start.sh` 无需为出流改动；仅提醒：注释里“排队 V4L2 buffer”已不再需要，
+守护进程必须在 `echo UDC` 之前启动（现状就是这样，它负责等节点 + 订阅事件 + 激活 gadget）。
+
+## 11. 修复后的上机验证
+
+前置：**主机相机 App 已关闭**（FaceTime / Photo Booth / ffmpeg / 预览全部退出），
+再重启守护进程与 bind；不要在主机取流时 `killall` 或 unbind。
+
+1. 确认没有别的进程持有节点：`ls -l /proc/[0-9]*/fd 2>/dev/null | grep -E 'video[0-9]+'`，
+   只剩 `marionette_usbd` 一个持有者。
+2. 启动后看 `logcat -s marionette_usbd`（或 `/data/local/tmp/marionette_usbd.log`）：
+   - `UVC: /dev/videoN ready 640x480 YUYV, 4 buffers` — S_FMT/REQBUFS/mmaps/订阅全部成功；
+   - 没有 `subscribe 0x… failed`（尤其 `SETUP` 的 `-EBUSY` 说明有残留句柄）。
+3. 在主机侧打开相机（或 `ffmpeg -f avfoundation -framerate 30 -video_size 640x480 -i 1 -t 3 /tmp/uvc.mov`），
+   应依次看到：
+   ```
+   UVC: setup 21/01 v=0100 i=0001 l=34 -> 34    # SET_CUR(VS_PROBE)
+   UVC: setup a1/81 ...            -> 34        # GET_CUR(VS_PROBE)
+   UVC: setup 21/01 v=0200 ...     -> 34        # SET_CUR(VS_COMMIT)
+   UVC: host selected alt 1, streaming
+   UVC: in=… out=… drop(notstream=0,nobuf=…,bad=0) streaming=1
+   ```
+   内核 dmesg 此时应出现 `uvc_function_set_alt(4, 1)`（之前只有 `(3,0)`/`(4,0)`）。
+4. 主机退出相机 → `UVC_EVENT_STREAMOFF` → `UVC: host selected alt 0, stream stopped`；
+   此时才允许停服务（先关主机相机，再 `killall`/`echo "" > UDC`）。
+
+失败分支：
+
+- 只有 `setup …` 没有 `streaming`：看 `->` 的值。`-62`(`-EL2HLT`) 说明分类/应答错了；
+  `34` 但仍无 `alt 1`，说明主机拒绝了 probe 参数（对比 `dwMaxVideoFrameSize`=614400、
+  `dwMaxPayloadTransferSize`=3072，与 `streaming_maxpacket=3072` 一致）。
+- `streaming=1` 但 `out=0`：`DQBUF` 返回 `EAGAIN` 且 `nobuf` 增长 → QBUF/pump 顺序被打回
+  （不要改回“open 时预排队”）。
+- 任何 `SEND_RESPONSE: Inappropriate ioctl` → 跑的还是旧二进制。
