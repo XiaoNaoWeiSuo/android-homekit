@@ -14,6 +14,7 @@ object UsbSession {
     const val KEY_ENABLED = "usb_enabled"
     const val KEY_CAMERA = "usb_camera"
     const val KEY_AUDIO = "usb_audio"
+    const val KEY_CAMERA_SOURCE = "usb_camera_source"
 
     fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -67,7 +68,10 @@ class UsbGadgetController(private val context: Context) {
     ) {
         val bound: Boolean
             get() = state == "configured" || state == "addressed" || state == "powered"
-        val ready: Boolean get() = bound && hidNode != null && daemonPid != null
+        // A bound gadget with no host attached is still a valid session: the
+        // daemon stays up and the host can attach later. Only the daemon and the
+        // HID function node are required for the session to be usable.
+        val ready: Boolean get() = hidNode != null && daemonPid != null
     }
 
     fun start(token: String, options: Options): Status {
@@ -126,7 +130,14 @@ class UsbGadgetController(private val context: Context) {
     private fun pushDaemon() {
         val binary = File(context.applicationInfo.nativeLibraryDir, "libmarionette_usbd.so")
         require(binary.exists()) { "daemon binary missing: ${binary.absolutePath}" }
-        val out = runRoot("cp '${binary.absolutePath}' $DAEMON && chmod 755 $DAEMON && echo COPIED")
+        // Never cp over a running executable: Linux returns ETXTBSY. Copy to a
+        // sibling and rename atomically; the old process keeps its inode and the
+        // start script kills it before launching the new binary.
+        val tmp = "$DAEMON.new"
+        val out = runRoot(
+            "rm -f $tmp; cp '${binary.absolutePath}' $tmp && chmod 755 $tmp && " +
+                "mv -f $tmp $DAEMON && echo COPIED"
+        )
         require(out.contains("COPIED")) { "cannot copy daemon: $out" }
     }
 

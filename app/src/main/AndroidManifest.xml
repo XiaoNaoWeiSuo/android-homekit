@@ -109,7 +109,7 @@
             android:name=".peripheral.usb.UsbPeripheralService"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|mediaProjection|camera|microphone" />
         <service
             android:name=".HomeKitService"
             android:exported="false"

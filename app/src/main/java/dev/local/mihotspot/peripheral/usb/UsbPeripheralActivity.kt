@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -43,6 +44,11 @@ class UsbPeripheralActivity : Activity() {
     private lateinit var statusDetail: TextView
     private var suppressSwitch = false
     private var pendingAudio = false
+    private var cameraSource = UsbCameraSource.OFF
+    private var screenResultCode = 0
+    private var screenData: Intent? = null
+    private var pendingCamera: UsbCameraSource? = null
+    private val cameraButtons = mutableMapOf<UsbCameraSource, Button>()
 
     private fun setSwitchSilently(view: Switch, checked: Boolean) {
         suppressSwitch = true
@@ -62,6 +68,15 @@ class UsbPeripheralActivity : Activity() {
                     )
                     statusDetail.text = "主机可直接使用 USB 键盘与触控板"
                 }
+                "waiting" -> {
+                    setSwitchSilently(master, true)
+                    showStatus(
+                        "● 等待主机",
+                        UiTheme.COLOR_WARNING,
+                        UiTheme.COLOR_WARNING_LIGHT
+                    )
+                    statusDetail.text = "请将 USB 数据线连接到主机，连接后会自动生效"
+                }
                 "error" -> {
                     setSwitchSilently(master, false)
                     showStatus(
@@ -77,6 +92,13 @@ class UsbPeripheralActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        cameraSource = runCatching {
+            UsbCameraSource.valueOf(
+                UsbSession.prefs(this).getString(
+                    UsbSession.KEY_CAMERA_SOURCE, UsbCameraSource.OFF.name
+                ) ?: UsbCameraSource.OFF.name
+            )
+        }.getOrDefault(UsbCameraSource.OFF)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(UiTheme.COLOR_BG)
@@ -178,6 +200,55 @@ class UsbPeripheralActivity : Activity() {
         content.addView(
             createSectionHeader(
                 this,
+                "摄像头",
+                "摄像头说明",
+                "标准 USB Video 类（UVC）摄像头。前置 / 后置来自 Camera2，屏幕来自 MediaProjection；" +
+                    "主机会看到一个普通摄像头设备。"
+            )
+        )
+        val cameraCard = createCard(this)
+        cameraCard.addView(TextView(this).apply {
+            text = "画面来源"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        val cameraRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, dp(4))
+        }
+        val cameraLabels = mapOf(
+            UsbCameraSource.OFF to "关闭",
+            UsbCameraSource.FRONT to "前置",
+            UsbCameraSource.BACK to "后置",
+            UsbCameraSource.SCREEN to "屏幕"
+        )
+        for ((source, label) in cameraLabels) {
+            val button = Button(this).apply {
+                text = label
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                    marginEnd = dp(6)
+                }
+                onHapticClick { chooseCamera(source) }
+            }
+            cameraButtons[source] = button
+            cameraRow.addView(button)
+        }
+        cameraCard.addView(cameraRow)
+        cameraCard.addView(TextView(this).apply {
+            text = "640×480 · 30 fps · YUYV。屏幕模式需要系统录屏授权；切换来源会重启 USB 会话。"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        content.addView(cameraCard)
+        updateCameraButtons()
+
+        content.addView(
+            createSectionHeader(
+                this,
                 "使用",
                 "USB 使用说明",
                 "键鼠界面与蓝牙模式共用同一套 UI；USB 模式下不再依赖蓝牙连接。"
@@ -196,18 +267,6 @@ class UsbPeripheralActivity : Activity() {
                     transport = PeripheralPadActivity.TRANSPORT_USB
                 )
             )
-        })
-        useCard.addView(createCardDivider(this))
-        useCard.addView(navRow(
-            "摄像头（UVC）",
-            "前置 / 后置 / 屏幕画面，标准 USB Video 类",
-            "接入中"
-        ) {
-            Toast.makeText(
-                this@UsbPeripheralActivity,
-                "UVC 取流管线正在接入，完成前不会向主机暴露无画面的摄像头",
-                Toast.LENGTH_SHORT
-            ).show()
         })
         content.addView(useCard)
 
@@ -264,6 +323,7 @@ class UsbPeripheralActivity : Activity() {
             showStatus("● 运行中", UiTheme.COLOR_SUCCESS, UiTheme.COLOR_SUCCESS_LIGHT)
         } else if (UsbSession.isEnabled(this) && !UsbPeripheralService.running) {
             setSwitchSilently(master, false)
+            UsbSession.setEnabled(this, false)
             showStatus("● 正在恢复", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
             statusDetail.text = "检测到上次 USB 会话未清理，正在恢复…"
             val ctx = this
@@ -359,6 +419,60 @@ class UsbPeripheralActivity : Activity() {
         }
     }
 
+    private fun chooseCamera(source: UsbCameraSource) {
+        when (source) {
+            UsbCameraSource.OFF -> applyCamera(UsbCameraSource.OFF)
+            UsbCameraSource.SCREEN -> requestScreenConsent()
+            UsbCameraSource.FRONT, UsbCameraSource.BACK -> {
+                if (checkSelfPermission(Manifest.permission.CAMERA) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    pendingCamera = source
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), 52)
+                } else {
+                    applyCamera(source)
+                }
+            }
+        }
+    }
+
+    private fun applyCamera(source: UsbCameraSource) {
+        cameraSource = source
+        UsbSession.prefs(this).edit()
+            .putString(UsbSession.KEY_CAMERA_SOURCE, source.name).apply()
+        updateCameraButtons()
+        if (master.isChecked) {
+            showStatus("● 正在应用", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+            statusDetail.text = "正在应用摄像头设置…"
+            UsbPeripheralService.stop(this)
+            Handler(Looper.getMainLooper()).postDelayed({ startUsb() }, 1000)
+        } else {
+            statusDetail.text = when (source) {
+                UsbCameraSource.OFF -> "摄像头已关闭"
+                UsbCameraSource.FRONT -> "下次开启 USB 时使用前置摄像头"
+                UsbCameraSource.BACK -> "下次开启 USB 时使用后置摄像头"
+                UsbCameraSource.SCREEN -> "下次开启 USB 时共享屏幕画面"
+            }
+        }
+    }
+
+    private fun requestScreenConsent() {
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        startActivityForResult(manager.createScreenCaptureIntent(), 61)
+    }
+
+    private fun updateCameraButtons() {
+        cameraButtons.forEach { (source, button) ->
+            val selected = source == cameraSource
+            UiTheme.styleButton(
+                button,
+                if (selected) UiTheme.COLOR_ACCENT else UiTheme.COLOR_BTN_SECONDARY_BG,
+                if (selected) android.graphics.Color.WHITE else UiTheme.COLOR_BTN_SECONDARY_TEXT,
+                10f
+            )
+        }
+    }
+
     private fun startUsb() {
         val wantAudio = audioSwitch.isChecked
         if (wantAudio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
@@ -368,7 +482,33 @@ class UsbPeripheralActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 51)
             return
         }
-        UsbPeripheralService.start(this, false, wantAudio)
+        if ((cameraSource == UsbCameraSource.FRONT || cameraSource == UsbCameraSource.BACK) &&
+            checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingCamera = cameraSource
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), 52)
+            return
+        }
+        if (cameraSource == UsbCameraSource.SCREEN && screenData == null) {
+            requestScreenConsent()
+            return
+        }
+        UsbPeripheralService.start(
+            this, cameraSource, wantAudio, screenResultCode, screenData
+        )
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 61) return
+        if (resultCode == RESULT_OK && data != null) {
+            screenResultCode = resultCode
+            screenData = data
+            applyCamera(UsbCameraSource.SCREEN)
+        } else {
+            Toast.makeText(this, "未授权屏幕录制", Toast.LENGTH_SHORT).show()
+            if (cameraSource == UsbCameraSource.SCREEN) applyCamera(UsbCameraSource.OFF)
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -377,15 +517,28 @@ class UsbPeripheralActivity : Activity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != 51) return
         val granted = grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
-        if (!granted) {
-            setSwitchSilently(audioSwitch, false)
-            statusDetail.text = "未授予录音权限，只启用 USB 键鼠"
+        when (requestCode) {
+            51 -> {
+                if (!granted) {
+                    setSwitchSilently(audioSwitch, false)
+                    statusDetail.text = "未授予录音权限，只启用 USB 键鼠"
+                }
+                pendingAudio = false
+                if (granted) startUsb()
+            }
+            52 -> {
+                val pending = pendingCamera
+                pendingCamera = null
+                if (granted && pending != null) {
+                    applyCamera(pending)
+                } else {
+                    applyCamera(UsbCameraSource.OFF)
+                    Toast.makeText(this, "未授予相机权限", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
-        UsbPeripheralService.start(this, false, granted)
-        pendingAudio = false
     }
 
     override fun onResume() {
