@@ -1052,7 +1052,10 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
 
         struct pollfd pfds[3];
         pfds[0].fd = video.fd;
-        pfds[0].events = POLLIN;
+        // V4L2 delivers events (UVC SETUP / STREAMON / STREAMOFF) through
+        // POLLPRI, not POLLIN. Missing this bit leaves the daemon stuck at
+        // streaming=0 while the host reads only the initial blank buffers.
+        pfds[0].events = POLLIN | POLLPRI;
         pfds[0].revents = 0;
         pfds[1].fd = listen_fd;
         pfds[1].events = POLLIN;
@@ -1070,7 +1073,7 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
         }
 
         /* Control responses are latency critical, so events come first. */
-        if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+        if (pfds[0].revents & (POLLIN | POLLPRI | POLLERR | POLLHUP)) {
             if (!drain_events(video, ctl)) {
                 LOGW("UVC: node lost, re-polling");
                 release_node(video);

@@ -135,7 +135,18 @@ payload ...
 - 手机侧：`/dev/hidg0`、`/dev/videoN`（`name=dwc3-gadget`）、`/proc/asound/cards` 出现 `UAC2Gadget`。
 - 日志：`adb logcat -s MiHotspotUsb:I`，原生守护进程 `logcat -s marionette_usbd`。
 
-## 7. 已知边界
+## 7. UVC 真机风险（2026-11-11，重要）
+
+- 主机可以枚举出标准 `UVC Camera`（macOS `system_profiler` 可见），AVFoundation/ffmpeg 也能抓到 640x480 帧。
+- 但在 UVC 取流/热重绑过程中，真机出现过 `POWERUP_REASON: kpanic`，手机会重启；这是内核级问题，应用层无法保证规避。
+- 目前判断：vendor `f_uvc` 在主机仍持有 streaming 接口时执行 UDC unbind/rebind 会触发异常。
+- 安全规则：
+  1. UVC 仍视为实验性；不要在主机相机 App 打开时切换/停止 USB 外设。
+  2. 切换前先关闭主机相机 App，最好拔掉数据线再重新枚举。
+  3. HID/UAC2 不受此问题影响，可先作为稳定能力交付。
+- 事件通知必须使用 `POLLPRI`（已修）；否则守护进程收不到 `STREAMON/SETUP`，主机只能读到打开时预排队的空 buffer。
+
+## 8. 已知边界
 
 - 手机 USB 口是 USB 2.0：640x480 YUYV@30 约 18 MB/s，可靠；1280x720 需要 MJPEG。
 - UVC 摄像头在主机端是一个标准摄像头；前三路（前置/后置/屏幕）在手机上切换，主机会看到画面源切换。
