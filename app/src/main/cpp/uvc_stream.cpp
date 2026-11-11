@@ -13,11 +13,22 @@
  *
  *   Copyright (C) 2010 Ideas on board SPRL <laurent.pinchart@ideasonboard.com>
  *
- * SAFETY: VIDIOC_STREAMON must only be issued from UVC_EVENT_STREAMON. The
- * kernel's uvc_v4l2_streamon() calls uvc_function_setup_continue() to complete
- * the host's pending SET_INTERFACE(alt=1). With no pending setup this faults
- * and panics the phone (see docs/USB_PERIPHERAL.md section 3). Nothing in this
- * file calls STREAMON except handle_streamon(), driven by that event.
+ * SAFETY (vendor f_uvc as shipped in android13-5.15, see
+ * docs/USB_PERIPHERAL.md section 9):
+ *
+ *   - uvc_v4l2_streamon() ends with uvc_function_setup_continue(), which
+ *     completes the host's pending SET_INTERFACE(alt=1) status stage. It must
+ *     only be issued from UVC_EVENT_STREAMON; nothing else calls it.
+ *   - uvc_v4l2_streamoff() also calls uvc_function_setup_continue(), for the
+ *     pending SET_INTERFACE(alt=0). It must only be issued from
+ *     UVC_EVENT_STREAMOFF. Calling it on our own initiative is just as
+ *     dangerous as the STREAMON case.
+ *
+ * Both paths end in usb_composite_setup_continue(), which does
+ * WARN(cdev, "Unexpected call") when no delayed status is pending; this ROM
+ * panics on WARN (POWERUP_REASON=kpanic). Teardown therefore only closes the
+ * fd: uvc_v4l2_release() stops the queue through uvcg_video_disable(), which
+ * has no setup handshake, so it is safe at any time.
  */
 
 #include "usb_common.h"
@@ -71,7 +82,15 @@ struct uvc_event {
 static_assert(sizeof(uvc_request_data) == 64, "uvc_request_data ABI mismatch");
 static_assert(sizeof(uvc_event) == 64, "uvc_event ABI mismatch");
 
-#define UVCIOC_SEND_RESPONSE _IOW('U', 3, struct uvc_request_data)
+/*
+ * linux/usb/g_uvc.h has used _IOW('U', 1, ...) since at least 4.19, including
+ * AOSP android13-5.15. With the wrong number video_ioctl2() routes the call to
+ * uvc_v4l2_ioctl_default()'s default branch and returns -ENOTTY, so no class
+ * request is ever answered: the host hangs on GET_CUR/SET_CUR(PROBE/COMMIT),
+ * never issues SET_INTERFACE(alt=1) and UVC_EVENT_STREAMON never happens.
+ */
+#define UVCIOC_SEND_RESPONSE _IOW('U', 1, struct uvc_request_data)
+static_assert(UVCIOC_SEND_RESPONSE == 0x40405501u, "UVCIOC_SEND_RESPONSE ABI mismatch");
 
 enum : uint32_t {
     UVC_EVENT_FIRST = V4L2_EVENT_PRIVATE_START,
@@ -203,6 +222,7 @@ struct UvcControlState {
     Pending pending = PENDING_NONE;
     uint8_t pending_entity = 0;
     uint8_t pending_cs = 0;
+    unsigned setups = 0; /* diagnostics: first few class requests, then quiet */
 };
 
 struct Drops {
@@ -314,11 +334,13 @@ static void queue_blank(VideoNode &v, unsigned index) {
 
 static void release_node(VideoNode &v) {
     if (v.fd >= 0) {
-        if (v.streaming) {
-            /* Teardown stops an active stream; it never starts one. */
-            int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-            ioctl(v.fd, VIDIOC_STREAMOFF, &type);
-        }
+        /*
+         * Deliberately no VIDIOC_STREAMOFF here. Closing the fd runs
+         * uvc_v4l2_release() -> uvc_v4l2_disable() -> uvcg_video_disable(),
+         * which cancels the queue without a setup handshake. The ioctl would
+         * instead call uvc_function_setup_continue() and WARN (kpanic on this
+         * ROM) unless the host happened to have a SET_INTERFACE in flight.
+         */
         for (unsigned i = 0; i < kBufferCount; ++i) {
             if (v.buffers[i].start != nullptr) {
                 munmap(v.buffers[i].start, v.buffers[i].len);
@@ -383,13 +405,20 @@ static bool resolve_node(const char *node, char *out, size_t cap) {
 }
 
 static bool subscribe_events(VideoNode &v) {
+    /*
+     * UVC_EVENT_LAST is V4L2_EVENT_PRIVATE_START + 5 on 5.15, so there is no
+     * UVC_EVENT_CONTROL to subscribe to (that request is newer than this
+     * kernel and would only add noise). Subscribing UVC_EVENT_SETUP is also
+     * what activates the function: the vendor f_uvc calls
+     * uvc_function_connect() from uvc_v4l2_subscribe_event(), and fails with
+     * -EBUSY if another handle is already subscribed.
+     */
     static const uint32_t kEvents[] = {
-        UVC_EVENT_FIRST, /* == UVC_EVENT_CONNECT */
+        UVC_EVENT_CONNECT, /* == UVC_EVENT_FIRST */
         UVC_EVENT_SETUP,
         UVC_EVENT_DATA,
         UVC_EVENT_STREAMON,
         UVC_EVENT_STREAMOFF,
-        UVC_EVENT_CONTROL,
         UVC_EVENT_DISCONNECT,
     };
 
@@ -503,11 +532,17 @@ static bool open_uvc_node(const char *node, VideoNode &v, UvcControlState &st, b
     }
 
     /*
-     * Prime the queue before the host selects alt=1. Queuing is harmless;
-     * only VIDIOC_STREAMON touches the pending SETUP request.
+     * Do not queue anything yet. The vendor uvc_v4l2_qbuf() only kicks the
+     * video pump when uvc->state == UVC_STATE_STREAMING (i.e. after this
+     * STREAMON), and its completion handler re-arms the pump only out of
+     * req_ready. A buffer queued before STREAMON therefore sits in the vb2
+     * queue and the pump never runs: the stream is "on" but no frame is
+     * ever encoded or completed, so DQBUF keeps returning EAGAIN.
+     *
+     * The initial requests are queued by uvcg_video_enable() as zero-length
+     * isoc requests; the QBUF loop in handle_streamon() is what starts the
+     * actual data flow.
      */
-    for (unsigned i = 0; i < v.nbufs; ++i) queue_blank(v, i);
-
     if (v.dead || !subscribe_events(v)) {
         release_node(v);
         return false;
@@ -541,7 +576,14 @@ static bool handle_streamon(VideoNode &v) {
     v.streaming = true;
     LOGI("UVC: host selected alt 1, streaming");
 
-    /* STREAMOFF returned every buffer to userspace, so prime them again. */
+    /*
+     * Queue after STREAMON, never before it: uvc_v4l2_qbuf() only schedules
+     * the video pump while uvc->state is UVC_STATE_STREAMING, which the
+     * STREAMON above sets. Queuing first leaves the pump idle and every
+     * DQBUF returns EAGAIN, however many frames the app pushes. Every
+     * buffer was returned to userspace by the previous STREAMOFF (or by the
+     * initial REQBUFS), so this fills the whole queue again.
+     */
     for (unsigned i = 0; i < v.nbufs; ++i) {
         if (!v.queued[i]) queue_blank(v, i);
     }
@@ -549,8 +591,14 @@ static bool handle_streamon(VideoNode &v) {
 }
 
 static void handle_streamoff(VideoNode &v) {
+    /*
+     * The only place VIDIOC_STREAMOFF is allowed. The vendor f_uvc implements
+     * it with uvc_function_setup_continue(), completing the status stage of
+     * the host's SET_INTERFACE(alt=0); issuing it without that pending setup
+     * trips the WARN in usb_composite_setup_continue() and panics.
+     */
     if (!v.streaming) {
-        LOGI("UVC: STREAMOFF without streaming");
+        LOGI("UVC: STREAMOFF event without a stream, ignored");
         return;
     }
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -562,7 +610,7 @@ static void handle_streamoff(VideoNode &v) {
         LOGW("UVC: STREAMOFF: %s", strerror(errno));
     }
     v.streaming = false;
-    memset(v.queued, 0, sizeof v.queued);
+    memset(v.queued, 0, sizeof v.queued); /* STREAMOFF returns every buffer */
     LOGI("UVC: host selected alt 0, stream stopped");
 }
 
@@ -694,24 +742,30 @@ static void process_control(UvcControlState &st, uint8_t request, uint8_t cs, ui
 
 static bool classify_interface(UvcControlState &st, uint8_t iface, uint8_t entity, uint8_t cs,
                                uint8_t request, uint16_t wLength) {
+    /*
+     * Two numbering schemes must both work.
+     *
+     * The vendor f_uvc rewrites wIndex in uvc_function_setup() so the
+     * streaming interface is reported as 1 and the control interface as 0,
+     * whatever real interface numbers the composite core handed out. A
+     * kernel without that rewrite passes the raw numbers (3/4 on this
+     * phone), which the 34-byte probe/commit request identifies.
+     *
+     * VS requests always use bEntityID 0. VC requests carry an entity id,
+     * except the request error code control (cs 2, one byte) - and cs 2 is
+     * also VS commit control, so the length disambiguates the two.
+     */
     if (entity == 0 && iface == UVC_INTF_STREAMING) return true;
-    if (iface == UVC_INTF_CONTROL) return false;
     if ((int)iface == st.streaming_iface) return true;
     if (entity != 0) return false;
+    if (cs != UVC_VS_PROBE_CONTROL && cs != UVC_VS_COMMIT_CONTROL) return false;
 
-    /*
-     * Interface numbers are allocated by the composite core; UVC is neither
-     * function 0 nor 1 here, so 0/1 cannot be assumed. The host probes and
-     * commits the streaming format with a 34-byte request, which identifies
-     * the streaming interface unambiguously.
-     */
-    if (cs == UVC_VS_PROBE_CONTROL || cs == UVC_VS_COMMIT_CONTROL) {
-        if (wLength >= sizeof(UvcStreamingControl) || request == UVC_GET_LEN) {
-            st.streaming_iface = iface;
-            return true;
-        }
-    }
-    return false;
+    if (cs == UVC_VC_REQUEST_ERROR_CODE_CONTROL && request == UVC_GET_CUR && wLength <= 1)
+        return false; /* VC request error code, not VS commit */
+
+    if (wLength >= sizeof(UvcStreamingControl) || request == UVC_GET_LEN)
+        st.streaming_iface = iface;
+    return true;
 }
 
 static void process_setup(UvcControlState &st, const VideoNode &v, const struct usb_ctrlrequest &req,
@@ -774,7 +828,9 @@ static bool drain_events(VideoNode &v, UvcControlState &st) {
         struct v4l2_event ev;
         memset(&ev, 0, sizeof ev);
         if (xioctl(v.fd, VIDIOC_DQEVENT, &ev) < 0) {
-            if (errno == EAGAIN || errno == EINTR) return true;
+            // ENOENT is the normal "queue is empty" answer for DQEVENT; the loop
+            // polls unconditionally, so treating it as an error floods logcat.
+            if (errno == EAGAIN || errno == EINTR || errno == ENOENT) return true;
             if (errno == ENODEV) {
                 LOGW("UVC: node disappeared (DQEVENT)");
                 v.dead = true;
@@ -789,10 +845,19 @@ static bool drain_events(VideoNode &v, UvcControlState &st) {
             continue;
         }
         if (ev.type == UVC_EVENT_DISCONNECT) {
-            LOGI("UVC: host disconnected");
-            v.streaming = false;
-            memset(v.queued, 0, sizeof v.queued);
-            continue;
+            /*
+             * uvc_function_disable() disabled the endpoints, and the isoc
+             * requests came back with -ESHUTDOWN, which leaves the vb2 queue
+             * flagged UVC_QUEUE_DISCONNECTED. From then on every QBUF fails
+             * with -ENODEV, so the camera could never come back without a
+             * full teardown. Closing the fd does that teardown safely:
+             * uvc_v4l2_release() -> uvc_v4l2_disable() -> uvcg_video_disable()
+             * clears the flag and the loop reopens the node once the gadget
+             * is bound again.
+             */
+            LOGI("UVC: host disconnected, recycling node");
+            v.dead = true;
+            return false;
         }
         if (ev.type == UVC_EVENT_STREAMON) {
             if (!handle_streamon(v)) return false;
@@ -816,12 +881,20 @@ static bool drain_events(VideoNode &v, UvcControlState &st) {
             resp.length = -EL2HLT; /* stall unless a handler fills the data */
             process_setup(st, v, uev.u.req, resp);
 
+            if (st.setups < 16) {
+                st.setups++;
+                LOGI("UVC: setup %02x/%02x v=%04x i=%04x l=%u -> %d", uev.u.req.bRequestType,
+                     uev.u.req.bRequest, (unsigned)uev.u.req.wValue, (unsigned)uev.u.req.wIndex,
+                     (unsigned)uev.u.req.wLength, resp.length);
+            }
+
             if (xioctl(v.fd, UVCIOC_SEND_RESPONSE, &resp) < 0) {
                 if (errno == ENODEV) {
                     v.dead = true;
                     return false;
                 }
-                LOGW("UVC: SEND_RESPONSE: %s", strerror(errno));
+                LOGW("UVC: SEND_RESPONSE: %s (host control transfer left unanswered)",
+                     strerror(errno));
             }
             continue;
         }
@@ -943,6 +1016,13 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
     }
     v.queued[buf.index] = false;
 
+    if (buf.flags & V4L2_BUF_FLAG_ERROR) {
+        /* The gadget cancelled the queue (host stop/disconnect): refill it. */
+        stats.drops.bad++;
+        queue_blank(v, buf.index);
+        return;
+    }
+
     if (!convert_frame(map, payload, length, sw, sh, format,
                        static_cast<uint8_t *>(v.buffers[buf.index].start), (int)v.width,
                        (int)v.height)) {
@@ -1052,9 +1132,11 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
 
         struct pollfd pfds[3];
         pfds[0].fd = video.fd;
-        // V4L2 delivers events (UVC SETUP / STREAMON / STREAMOFF) through
-        // POLLPRI, not POLLIN. Missing this bit leaves the daemon stuck at
-        // streaming=0 while the host reads only the initial blank buffers.
+        // V4L2 signals queued events through POLLPRI; vb2_poll() only sets it
+        // for a v4l2_fh device (this one) when v4l2_event_pending() is true.
+        // It is requested as an optimisation only - the event queue is
+        // drained unconditionally below, because an unread UVC_EVENT_SETUP
+        // leaves the host's control transfer hanging.
         pfds[0].events = POLLIN | POLLPRI;
         pfds[0].revents = 0;
         pfds[1].fd = listen_fd;
@@ -1065,22 +1147,28 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
         pfds[2].revents = 0;
         const nfds_t nfds = client_fd >= 0 ? 3 : 2;
 
-        const int pr = poll(pfds, nfds, 200);
+        const int pr = poll(pfds, nfds, 50);
         if (pr < 0) {
             if (errno == EINTR) continue;
             LOGW("UVC: poll: %s", strerror(errno));
             break;
         }
 
-        /* Control responses are latency critical, so events come first. */
-        if (pfds[0].revents & (POLLIN | POLLPRI | POLLERR | POLLHUP)) {
-            if (!drain_events(video, ctl)) {
-                LOGW("UVC: node lost, re-polling");
-                release_node(video);
-                rx.clear();
-                if (!wait_ms(stop, 200)) break;
-                continue;
-            }
+        /*
+         * Control responses are latency critical, so events come first - and
+         * they are drained on every iteration instead of only when poll()
+         * reports POLLPRI. For a video *output* queue vb2_core_poll() returns
+         * 0 unless EPOLLOUT was requested, so the event bits are not a
+         * reliable wakeup source; with the old POLLIN-only wait the daemon
+         * never dequeued a single UVC_EVENT_SETUP, the host's PROBE/COMMIT
+         * transfers timed out, and the camera never reached alt 1.
+         */
+        if (!drain_events(video, ctl)) {
+            LOGW("UVC: node lost, re-polling");
+            release_node(video);
+            rx.clear();
+            if (!wait_ms(stop, 200)) break;
+            continue;
         }
         if (video.dead) {
             release_node(video);
