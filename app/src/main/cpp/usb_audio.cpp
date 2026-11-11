@@ -45,18 +45,25 @@ struct pcm_config {
     unsigned int start_threshold;
     unsigned int stop_threshold;
     unsigned int silence_threshold;
-    // tinyalsa reads this last field; omitting it made pcm_open read past our
-    // struct and fail with "cannot set sw params: Invalid argument".
+    // Layout must match <tinyalsa/asoundlib.h> exactly: pcm_open() does
+    // `pcm->config = *config`, i.e. it copies sizeof(struct pcm_config) bytes
+    // out of this object. silence_size sits between silence_threshold and
+    // avail_min; leaving it out shifted avail_min by 4 bytes and made pcm_open
+    // read past the end of the struct.
+    unsigned int silence_size;
     int avail_min;
 };
 
 struct pcm;
 
 struct TinyAlsa {
-    using OpenFn = pcm *(*)(unsigned int, unsigned int, unsigned int, const pcm_config *);
+    // Signatures are taken verbatim from <tinyalsa/asoundlib.h>: pcm_open()
+    // writes the negotiated params back into *config, and pcm_is_ready() /
+    // pcm_get_error() take a non-const handle.
+    using OpenFn = pcm *(*)(unsigned int, unsigned int, unsigned int, pcm_config *);
     using CloseFn = int (*)(pcm *);
-    using IsReadyFn = int (*)(const pcm *);
-    using ErrorFn = const char *(*)(const pcm *);
+    using IsReadyFn = int (*)(pcm *);
+    using ErrorFn = const char *(*)(pcm *);
     using WriteFn = int (*)(pcm *, const void *, unsigned int);
     using ReadFn = int (*)(pcm *, void *, unsigned int);
     using PrepareFn = int (*)(pcm *);
@@ -251,6 +258,9 @@ pcm *open_ready(TinyAlsa &alsa, int card, int device, unsigned flags, unsigned c
         alsa.close_fn(h);
         return nullptr;
     }
+    // pcm_open() writes the negotiated hw params back into the config struct.
+    LOGI("pcm_open ok card=%d dev=%d %s ch=%u rate=%u period=%u frames x%u", card, device,
+         direction_name(flags), channels, cfg.rate, cfg.period_size, cfg.period_count);
     return h;
 }
 
@@ -275,6 +285,76 @@ bool pcm_recover(TinyAlsa &alsa, pcm *h, int err) {
     if (!alsa.prepare_fn) return false;
     LOGW("pcm error %d, attempting pcm_prepare", err);
     return alsa.prepare_fn(h) == 0;
+}
+
+// Transfer `frames` frames and report how many frames moved (negative = error).
+//
+// This libtinyalsa only exports the byte-count variants pcm_write()/pcm_read()
+// (<tinyalsa/asoundlib.h>): `count` is a byte count and the call returns 0 on
+// success, negative on failure — it never returns a frame count, and it blocks
+// until the whole request is transferred. Treating 0 as "no data" is what made
+// the speaker path drop every period. pcm_writei()/pcm_readi() (frame counts,
+// return frames transferred) are used when the library exports them.
+int pcm_transfer(TinyAlsa &alsa, bool write, pcm *h, void *buf, unsigned frames,
+                 unsigned channels) {
+    const unsigned frame_bytes = channels * sizeof(int16_t);
+    if (alsa.byte_io) {
+        unsigned bytes = frames * frame_bytes;
+        int r = write ? alsa.writei_fn(h, buf, bytes) : alsa.readi_fn(h, buf, bytes);
+        if (r == 0) return static_cast<int>(frames);            // full transfer
+        if (r > 0) return r / static_cast<int>(frame_bytes);    // bytes, defensively
+        return r;
+    }
+    return write ? alsa.writei_fn(h, buf, frames) : alsa.readi_fn(h, buf, frames);
+}
+
+bool read_uint_file(const char *path, unsigned *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    unsigned v = 0;
+    int ok = fscanf(f, "%u", &v);
+    fclose(f);
+    if (ok != 1) return false;
+    *out = v;
+    return true;
+}
+
+// Diagnostic only: when the PCM nodes exist but no direction opens, the usual
+// cause is that the uac2 function instance is configured for another rate or
+// channel mask (configfs writes in start.sh can fail silently; the vendor
+// default for c_srate is 64000). Print what the live instances actually hold
+// so the mismatch is obvious in logcat.
+void log_gadget_rate_hint(int card) {
+    DIR *g = opendir("/config/usb_gadget");
+    if (!g) return;
+    dirent *e;
+    while ((e = readdir(g)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        char functions[256];
+        snprintf(functions, sizeof(functions), "/config/usb_gadget/%s/functions",
+                 e->d_name);
+        DIR *f = opendir(functions);
+        if (!f) continue;
+        dirent *fe;
+        while ((fe = readdir(f)) != nullptr) {
+            if (strncmp(fe->d_name, "uac", 3) != 0) continue;
+            char path[384];
+            unsigned p_mask = 0, p_rate = 0, c_mask = 0, c_rate = 0;
+            snprintf(path, sizeof(path), "%s/%s/p_chmask", functions, fe->d_name);
+            read_uint_file(path, &p_mask);
+            snprintf(path, sizeof(path), "%s/%s/p_srate", functions, fe->d_name);
+            read_uint_file(path, &p_rate);
+            snprintf(path, sizeof(path), "%s/%s/c_chmask", functions, fe->d_name);
+            read_uint_file(path, &c_mask);
+            snprintf(path, sizeof(path), "%s/%s/c_srate", functions, fe->d_name);
+            read_uint_file(path, &c_rate);
+            LOGW("card %d: %s/functions/%s p_chmask=0x%x p_srate=%u c_chmask=0x%x "
+                 "c_srate=%u (daemon needs %u Hz on both)",
+                 card, e->d_name, fe->d_name, p_mask, p_rate, c_mask, c_rate, kRate);
+        }
+        closedir(f);
+    }
+    closedir(g);
 }
 
 bool send_all(int fd, const void *data, size_t len, std::atomic<bool> *stop) {
@@ -308,10 +388,11 @@ struct WorkerCtx {
     std::atomic<bool> *stop = nullptr;
     std::atomic<bool> failed{false};
     std::atomic<int> finished{0};
+    int expected = 2;  // workers actually started (1 when only one direction exists)
 };
 
 // 47833: app sends S16LE mono 48 kHz phone-mic PCM. Host recording is fed by
-// ALSA playback (PCM_OUT + pcm_writei). Upmix to stereo when the gadget asks
+// ALSA playback (PCM_OUT + pcm_write). Upmix to stereo when the gadget asks
 // for two channels.
 void mic_worker(std::shared_ptr<WorkerCtx> ctx) {
     TinyAlsa &alsa = *ctx->alsa;
@@ -358,19 +439,17 @@ void mic_worker(std::shared_ptr<WorkerCtx> ctx) {
                 }
                 data = stereo;
             }
-            int w = alsa.byte_io
-                ? alsa.writei_fn(h, data, kPeriodFrames * channels * sizeof(int16_t))
-                : alsa.writei_fn(h, data, kPeriodFrames);
-            if (alsa.byte_io && w > 0) w /= static_cast<int>(channels * sizeof(int16_t));
+            int w = pcm_transfer(alsa, /*write=*/true, h, const_cast<void *>(data),
+                                 kPeriodFrames, channels);
             if (w < 0) {
                 const char *err = alsa.error_fn(h);
-                LOGW("pcm_writei: %s (%d)", err ? err : "error", w);
+                LOGW("pcm_write: %s (%d)", err ? err : "error", w);
                 if (!pcm_recover(alsa, h, w)) {
                     ctx->failed.store(true);
                     break;
                 }
             } else if (static_cast<unsigned>(w) < kPeriodFrames) {
-                LOGW("pcm_writei short write: %d/%u frames", w, kPeriodFrames);
+                LOGW("pcm_write short write: %d/%u frames", w, kPeriodFrames);
             }
             continue;
         }
@@ -385,7 +464,7 @@ void mic_worker(std::shared_ptr<WorkerCtx> ctx) {
     ctx->finished.fetch_add(1);
 }
 
-// 47834: host playback arrives on ALSA capture (PCM_IN + pcm_readi); forward it
+// 47834: host playback arrives on ALSA capture (PCM_IN + pcm_read); forward it
 // to the app as S16LE stereo 48 kHz, upmixing if the gadget is mono.
 void spk_worker(std::shared_ptr<WorkerCtx> ctx) {
     TinyAlsa &alsa = *ctx->alsa;
@@ -401,21 +480,18 @@ void spk_worker(std::shared_ptr<WorkerCtx> ctx) {
             LOGI("spk client connected (port %d)", 47834);
         }
 
-        int n = alsa.byte_io
-            ? alsa.readi_fn(h, in, kPeriodFrames * channels * sizeof(int16_t))
-            : alsa.readi_fn(h, in, kPeriodFrames);
-        if (alsa.byte_io && n > 0) n /= static_cast<int>(channels * sizeof(int16_t));
+        int n = pcm_transfer(alsa, /*write=*/false, h, in, kPeriodFrames, channels);
         if (n < 0) {
             const char *err = alsa.error_fn(h);
-            LOGW("pcm_readi: %s (%d)", err ? err : "error", n);
+            LOGW("pcm_read: %s (%d)", err ? err : "error", n);
             if (!pcm_recover(alsa, h, n)) {
                 ctx->failed.store(true);
                 break;
             }
             continue;
         }
-        if (n == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (n == 0) {  // a blocking read cannot return empty; never spin on it
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
@@ -459,6 +535,7 @@ int audio_run(int mic_port, int spk_port, const char *token, std::atomic<bool> *
 
     bool waiting_logged = false;
     bool abandoned = false;
+    int hint_card = -1;
 
     while (!stop->load()) {
         int card = find_uac2_card();
@@ -485,20 +562,30 @@ int audio_run(int mic_port, int spk_port, const char *token, std::atomic<bool> *
         // f_uac2 inverts the ALSA view: what the host plays is ALSA capture
         // (PCM_IN, read by us); what the host records is ALSA playback
         // (PCM_OUT, written by us). Probe instead of guessing device numbers.
+        // Either direction may legitimately be absent (p_chmask or c_chmask 0),
+        // so a missing half is a warning, not a reason to keep re-probing.
         Direction host_playback;
         Direction host_record;
-        bool ok = probe_direction(*alsa, card, devs, kPCMIn, &host_playback);
-        ok = ok && probe_direction(*alsa, card, devs, kPCMOut, &host_record);
-        if (!ok) {
-            if (host_playback.handle) alsa->close_fn(host_playback.handle);
-            if (host_record.handle) alsa->close_fn(host_record.handle);
-            LOGW("UAC2Gadget card %d: no usable PCM pair yet (retrying)", card);
+        bool have_playback = probe_direction(*alsa, card, devs, kPCMIn, &host_playback);
+        bool have_record = probe_direction(*alsa, card, devs, kPCMOut, &host_record);
+        if (!have_playback && !have_record) {
+            if (hint_card != card) {
+                hint_card = card;
+                log_gadget_rate_hint(card);
+            }
+            LOGW("UAC2Gadget card %d: PCM nodes exist but no direction opened (retrying)", card);
             sleep_for_stop(stop, 500);
             continue;
         }
-        LOGI("audio mapping: host playback -> PCM_IN card=%d dev=%d ch=%u (pcm_readi); "
-             "host recording -> PCM_OUT card=%d dev=%d ch=%u (pcm_writei)",
-             host_playback.card, host_playback.device, host_playback.channels,
+        hint_card = -1;
+        if (!have_playback)
+            LOGW("UAC2Gadget card %d: no ALSA capture PCM (host playback disabled?)", card);
+        if (!have_record)
+            LOGW("UAC2Gadget card %d: no ALSA playback PCM (host recording disabled?)", card);
+        LOGI("audio mapping: host playback -> %s card=%d dev=%d ch=%u (pcm_read); "
+             "host recording -> %s card=%d dev=%d ch=%u (pcm_write)",
+             have_playback ? "PCM_IN" : "n/a", host_playback.card, host_playback.device,
+             host_playback.channels, have_record ? "PCM_OUT" : "n/a",
              host_record.card, host_record.device, host_record.channels);
 
         auto ctx = std::make_shared<WorkerCtx>();
@@ -509,9 +596,12 @@ int audio_run(int mic_port, int spk_port, const char *token, std::atomic<bool> *
         ctx->spk_listen = spk_listen;
         ctx->token = token;
         ctx->stop = stop;
+        ctx->expected = (have_playback ? 1 : 0) + (have_record ? 1 : 0);
 
-        std::thread spk(spk_worker, ctx);
-        std::thread mic(mic_worker, ctx);
+        std::thread spk;
+        std::thread mic;
+        if (have_playback) spk = std::thread(spk_worker, ctx);
+        if (have_record) mic = std::thread(mic_worker, ctx);
 
         unsigned ticks = 0;
         while (!stop->load() && !ctx->failed.load()) {
@@ -527,23 +617,23 @@ int audio_run(int mic_port, int spk_port, const char *token, std::atomic<bool> *
             LOGW("audio PCM error on card %d; re-probing", card);
         }
 
-        // A blocking pcm_readi/pcm_writei can outlive *stop when the host has
+        // A blocking pcm_read/pcm_write can outlive *stop when the host has
         // no active stream. Wait a bounded time, then abandon the handles
         // (the process is on its way out) instead of wedging the daemon.
         int waited = 0;
-        while (ctx->finished.load() < 2 && waited < 2000) {
+        while (ctx->finished.load() < ctx->expected && waited < 2000) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             waited += 50;
         }
-        if (ctx->finished.load() < 2) {
+        if (ctx->finished.load() < ctx->expected) {
             LOGW("audio workers stuck in PCM I/O; abandoning handles");
-            spk.detach();
-            mic.detach();
+            if (spk.joinable()) spk.detach();
+            if (mic.joinable()) mic.detach();
             abandoned = true;
             break;
         }
-        spk.join();
-        mic.join();
+        if (spk.joinable()) spk.join();
+        if (mic.joinable()) mic.join();
     }
 
     if (!abandoned) {
