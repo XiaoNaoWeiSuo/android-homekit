@@ -30,6 +30,8 @@ class UsbPeripheralService : Service() {
 
         const val ACTION_START = "dev.local.mihotspot.usb.START"
         const val ACTION_STOP = "dev.local.mihotspot.usb.STOP"
+        /** Re-own a session whose gadget/daemon survived a process restart. */
+        const val ACTION_ATTACH = "dev.local.mihotspot.usb.ATTACH"
         const val ACTION_STATE = "dev.local.mihotspot.usb.STATE"
         const val EXTRA_CAMERA_SOURCE = "camera_source"
         const val EXTRA_AUDIO = "audio"
@@ -48,6 +50,9 @@ class UsbPeripheralService : Service() {
             screenResultCode: Int = 0,
             screenData: Intent? = null
         ) {
+            // Tells UsbPeripheralStatus.verify() that an off state is not a
+            // stale record but provisioning in flight.
+            UsbPeripheralStatus.markStartRequested()
             val intent = Intent(context, UsbPeripheralService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_CAMERA_SOURCE, camera.name)
@@ -62,6 +67,25 @@ class UsbPeripheralService : Service() {
             }
         }
 
+        /**
+         * Adopt an already-provisioned session (daemon + HID node still alive)
+         * without touching configfs. Used after a process restart, when the
+         * gadget outlived the service that created it.
+         */
+        fun attach(context: Context) {
+            val intent = Intent(context, UsbPeripheralService::class.java)
+                .setAction(ACTION_ATTACH)
+            try {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                Log.i(TAG, "USB_ATTACH_FAILED ${e.message}")
+            }
+        }
+
         fun stop(context: Context) {
             context.stopService(Intent(context, UsbPeripheralService::class.java))
         }
@@ -73,6 +97,12 @@ class UsbPeripheralService : Service() {
     private var videoLink: UsbVideoLink? = null
     private var videoSource: UsbVideoSource? = null
 
+    /** Set in onDestroy so an in-flight provisioning task cannot re-publish "running". */
+    @Volatile private var destroyed = false
+
+    /** False when this service never owned the configfs composition (attach probe only). */
+    @Volatile private var teardownOnDestroy = true
+
     override fun onCreate() {
         super.onCreate()
         controller = UsbGadgetController(this)
@@ -83,6 +113,10 @@ class UsbPeripheralService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_ATTACH) {
+            attachSession()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_START) {
@@ -125,6 +159,7 @@ class UsbPeripheralService : Service() {
                 )
             )
             if (status.ready || status.bound) {
+                if (destroyed) return@execute
                 UsbSession.setEnabled(this, true)
                 UsbHub.link(this).start()
                 running = true
@@ -152,7 +187,11 @@ class UsbPeripheralService : Service() {
                         else -> "USB 外设运行中 · 摄像头已开启"
                     }
                 )
-                publish(if (status.bound) "ready" else "waiting", status.raw)
+                publish(
+                    if (status.bound) "ready" else "waiting",
+                    status.raw,
+                    hostAttached = status.bound
+                )
                 Log.i(
                     TAG,
                     "USB_SESSION_READY state=${status.state} hid=${status.hidNode} " +
@@ -162,10 +201,58 @@ class UsbPeripheralService : Service() {
                 running = false
                 UsbSession.setEnabled(this, false)
                 updateNotification("USB 外设绑定失败")
-                publish("error", status.raw)
+                publish("error", status.raw, hostAttached = false)
                 Log.i(TAG, "USB_SESSION_FAILED ${status.raw}")
                 stopSelf()
             }
+        }
+    }
+
+    /**
+     * Adopt a session whose gadget is still bound and whose daemon is still
+     * running (the process was killed, the root-side session was not). Only
+     * reads state: re-provisioning would unbind the gadget, which can panic the
+     * vendor kernel, and it would interrupt a working host connection.
+     */
+    private fun attachSession() {
+        executor.execute {
+            val status = controller.status()
+            if (destroyed) return@execute
+            if (!status.ready) {
+                running = false
+                UsbSession.setEnabled(this, false)
+                // Nothing of ours to tear down: the session expired before we
+                // could adopt it, and unbinding a gadget can wedge the vendor
+                // kernel, so never write configfs from this path.
+                teardownOnDestroy = false
+                publish("error", "USB 会话已结束：${status.raw}", hostAttached = false)
+                Log.i(TAG, "USB_ATTACH_FAILED ${status.raw}")
+                stopSelf()
+                return@execute
+            }
+            UsbSession.setEnabled(this, true)
+            UsbHub.link(this).start()
+            running = true
+            // The video/audio pipelines cannot be restored without re-running the
+            // provisioning script, so say so instead of leaving a silent black
+            // camera on the host.
+            val cameraWanted = UsbSession.prefs(this).getString(
+                UsbSession.KEY_CAMERA_SOURCE, UsbCameraSource.OFF.name
+            ) != UsbCameraSource.OFF.name
+            val audioWanted = UsbSession.prefs(this).getBoolean(UsbSession.KEY_AUDIO, false)
+            updateNotification(
+                when {
+                    cameraWanted || audioWanted -> "键鼠已接管 · 摄像头/音频需重新开启"
+                    status.bound -> "USB 键鼠已就绪 · 点按进入设置"
+                    else -> "等待主机连接 · 插入数据线后自动生效"
+                }
+            )
+            publish(
+                if (status.bound) "ready" else "waiting",
+                status.raw,
+                hostAttached = status.bound
+            )
+            Log.i(TAG, "USB_SESSION_ATTACHED state=${status.state} hid=${status.hidNode}")
         }
     }
 
@@ -221,7 +308,12 @@ class UsbPeripheralService : Service() {
         }
     }
 
-    private fun publish(state: String, detail: String) {
+    private fun publish(state: String, detail: String, hostAttached: Boolean? = null) {
+        // Only session-lifecycle states define "is USB usable"; ancillary
+        // broadcasts (camera_error) must not hide the peripheral entry.
+        if (state == "ready" || state == "waiting" || state == "error") {
+            UsbPeripheralStatus.onServiceState(this, state, detail, hostAttached)
+        }
         sendBroadcast(
             Intent(ACTION_STATE)
                 .setPackage(packageName)
@@ -231,6 +323,7 @@ class UsbPeripheralService : Service() {
     }
 
     override fun onDestroy() {
+        destroyed = true
         videoSource?.stop()
         videoSource = null
         videoLink?.stop()
@@ -238,10 +331,11 @@ class UsbPeripheralService : Service() {
         audioBridge?.stop()
         audioBridge = null
         UsbHub.link(this).stop()
-        executor.execute { controller.stop() }
+        if (teardownOnDestroy) executor.execute { controller.stop() }
         executor.shutdown()
         running = false
         UsbSession.setEnabled(this, false)
+        UsbPeripheralStatus.onServiceStopped(this)
         super.onDestroy()
     }
 

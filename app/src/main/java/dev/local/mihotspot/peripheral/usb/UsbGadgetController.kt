@@ -16,6 +16,17 @@ object UsbSession {
     const val KEY_AUDIO = "usb_audio"
     const val KEY_CAMERA_SOURCE = "usb_camera_source"
 
+    /**
+     * Persisted record of the last published session state. The kernel gadget and
+     * the root daemon outlive this process, so this is the only thing the UI can
+     * consult after a process restart; [UsbPeripheralStatus] verifies it against
+     * the real daemon before trusting it.
+     */
+    const val KEY_STATE = "usb_state"
+    const val KEY_STATE_DETAIL = "usb_state_detail"
+    const val KEY_STATE_HOST = "usb_state_host_attached"
+    const val KEY_STATE_AT = "usb_state_at"
+
     fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -33,6 +44,27 @@ object UsbSession {
     fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY_ENABLED, false)
     fun setEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_ENABLED, enabled).apply()
+    }
+
+    fun state(context: Context): String =
+        prefs(context).getString(KEY_STATE, null) ?: "off"
+
+    fun stateDetail(context: Context): String? =
+        prefs(context).getString(KEY_STATE_DETAIL, null)
+
+    fun hostAttached(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_STATE_HOST, false)
+
+    fun stateUpdatedAt(context: Context): Long =
+        prefs(context).getLong(KEY_STATE_AT, 0L)
+
+    fun setState(context: Context, state: String, hostAttached: Boolean, detail: String?) {
+        prefs(context).edit()
+            .putString(KEY_STATE, state)
+            .putBoolean(KEY_STATE_HOST, hostAttached)
+            .putString(KEY_STATE_DETAIL, detail)
+            .putLong(KEY_STATE_AT, System.currentTimeMillis())
+            .apply()
     }
 }
 

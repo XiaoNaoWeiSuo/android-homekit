@@ -56,6 +56,70 @@ class UsbPeripheralActivity : Activity() {
         suppressSwitch = false
     }
 
+    /** True while a root probe is running, so resumes cannot pile up su calls. */
+    private var probing = false
+    /** Last confirmed session state; beginStop() needs it before the intent is cleared. */
+    private var lastStatus: UsbPeripheralStatus.Snapshot? = null
+
+    /**
+     * The switch must show the real session, not the in-memory static: after a
+     * process restart the gadget can still be bound while UsbPeripheralService is
+     * gone. The cheap snapshot paints instantly, then the worker probe corrects
+     * it — and adopts a session that outlived the process instead of tearing it
+     * down (unbinding the gadget can wedge the vendor kernel).
+     */
+    private fun refreshFromRealState() {
+        renderStatus(UsbPeripheralStatus.snapshot(this))
+        if (probing) return
+        probing = true
+        Thread {
+            val snapshot = try {
+                UsbPeripheralStatus.verify(this)
+            } catch (e: Throwable) {
+                UsbPeripheralStatus.snapshot(this)
+            }
+            runOnUiThread {
+                probing = false
+                if (!isFinishing) renderStatus(snapshot)
+            }
+        }.start()
+    }
+
+    private fun renderStatus(snapshot: UsbPeripheralStatus.Snapshot) {
+        lastStatus = snapshot
+        when {
+            snapshot.state == "error" -> {
+                setSwitchSilently(master, false)
+                showStatus("● 绑定失败", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
+                statusDetail.text = "请重新插拔数据线后重试"
+            }
+            snapshot.active -> {
+                setSwitchSilently(master, true)
+                if (snapshot.hostAttached) {
+                    showStatus("● 运行中", UiTheme.COLOR_SUCCESS, UiTheme.COLOR_SUCCESS_LIGHT)
+                    statusDetail.text = "主机已识别 USB 键盘与触控板"
+                } else {
+                    showStatus(
+                        "● 已就绪，等待主机",
+                        UiTheme.COLOR_ACCENT,
+                        UiTheme.COLOR_ACCENT_LIGHT
+                    )
+                    statusDetail.text = "插上数据线后自动生效，无需再次开启"
+                }
+            }
+            snapshot.pending -> {
+                setSwitchSilently(master, true)
+                showStatus("● 正在绑定", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+                statusDetail.text = "正在重组 USB gadget，请稍候…"
+            }
+            else -> {
+                setSwitchSilently(master, false)
+                showStatus("● 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+                statusDetail.text = "USB 外设已关闭"
+            }
+        }
+    }
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.getStringExtra(UsbPeripheralService.EXTRA_STATE)) {
@@ -283,23 +347,7 @@ class UsbPeripheralActivity : Activity() {
             setPadding(dp(22), dp(14), dp(22), 0)
         })
 
-        if (UsbSession.isEnabled(this) && UsbPeripheralService.running) {
-            setSwitchSilently(master, true)
-            showStatus("● 运行中", UiTheme.COLOR_SUCCESS, UiTheme.COLOR_SUCCESS_LIGHT)
-        } else if (UsbSession.isEnabled(this) && !UsbPeripheralService.running) {
-            setSwitchSilently(master, false)
-            UsbSession.setEnabled(this, false)
-            showStatus("● 正在恢复", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
-            statusDetail.text = "检测到上次 USB 会话未清理，正在恢复…"
-            val ctx = this
-            Thread {
-                UsbGadgetController(ctx).stop()
-                runOnUiThread {
-                    showStatus("● 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-                    statusDetail.text = "USB 外设已关闭"
-                }
-            }.start()
-        }
+        refreshFromRealState()
     }
 
     private fun settingRow(title: String, desc: String, control: View): LinearLayout =
@@ -373,15 +421,23 @@ class UsbPeripheralActivity : Activity() {
     private fun beginStop() {
         showStatus("● 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
         statusDetail.text = "正在恢复普通 USB 模式…"
-        if (UsbPeripheralService.running) {
-            UsbPeripheralService.stop(this)
-        } else {
-            val ctx = this
-            Thread {
-                UsbGadgetController(ctx).stop()
-                runOnUiThread { statusDetail.text = "已恢复普通 USB 模式" }
-            }.start()
+        val ownedByService = UsbPeripheralService.running || lastStatus?.pending == true
+        // Clear the record first so the home entry and this switch agree at once.
+        UsbPeripheralStatus.forget(this)
+        UsbPeripheralService.stop(this)
+        if (ownedByService) {
+            statusDetail.text = "已恢复普通 USB 模式"
+            return
         }
+        // A live session with no service (it outlived the process) still has to
+        // release configfs, otherwise the phone stays in gadget mode.
+        val ctx = this
+        Thread {
+            UsbGadgetController(ctx).stop()
+            runOnUiThread {
+                if (!isFinishing) statusDetail.text = "已恢复普通 USB 模式"
+            }
+        }.start()
     }
 
     private fun chooseCamera(source: UsbCameraSource) {
@@ -515,6 +571,9 @@ class UsbPeripheralActivity : Activity() {
             @Suppress("DEPRECATION")
             registerReceiver(receiver, filter)
         }
+        // Missed broadcasts (and a process restart) must not leave the switch
+        // showing a state the daemon does not have.
+        refreshFromRealState()
     }
 
     override fun onPause() {

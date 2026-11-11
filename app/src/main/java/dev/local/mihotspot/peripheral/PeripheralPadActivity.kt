@@ -18,6 +18,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.Toast
+import dev.local.mihotspot.peripheral.usb.UsbHidLink
 import dev.local.mihotspot.peripheral.usb.UsbHub
 import dev.local.mihotspot.ui.UiTheme
 import kotlin.math.abs
@@ -94,6 +95,7 @@ class PeripheralPadActivity : Activity() {
     private var dark = true
     private var backInvoker: android.window.OnBackInvokedCallback? = null
     private var lastBackHintAt = 0L
+    private var warnedUsb = false
 
     private val stateListener = object : BtHidPeripheral.Listener {
         override fun onStateChanged(state: BtHidPeripheral.State, detail: String?) {
@@ -105,6 +107,25 @@ class PeripheralPadActivity : Activity() {
                     finish()
                 }
             }
+        }
+    }
+
+    private val usbLinkListener = object : UsbHidLink.Listener {
+        override fun onStateChanged(connected: Boolean, detail: String?) {
+            if (!connected) warnUsb(detail)
+        }
+    }
+
+    /** Surface a dead USB transport instead of a pad that silently types nowhere. */
+    private fun warnUsb(detail: String?) {
+        runOnUiThread {
+            if (isFinishing || warnedUsb) return@runOnUiThread
+            warnedUsb = true
+            Toast.makeText(
+                this@PeripheralPadActivity,
+                "USB 外设未就绪：${detail ?: "守护进程无响应"}",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
@@ -127,7 +148,13 @@ class PeripheralPadActivity : Activity() {
             registerBackSwallow()
         }
         if (usbMode) {
+            usbLink.addListener(usbLinkListener)
             usbLink.start()
+            // The link only reports a *lost* connection; a link that never
+            // comes up (daemon gone after a restart) would stay silent.
+            android.os.Handler(mainLooper).postDelayed({
+                if (!isFinishing && !usbLink.isConnected) warnUsb(null)
+            }, 2_500L)
         } else {
             bridge.addListener(stateListener)
             bridge.start()
@@ -135,7 +162,9 @@ class PeripheralPadActivity : Activity() {
     }
 
     override fun onPause() {
-        if (usbMode) usbLink.releaseAll()
+        // Release held keys/buttons on both transports: Bluetooth hosts
+        // auto-repeat a key whose release never arrives, exactly like USB ones.
+        if (usbMode) usbLink.releaseAll() else bridge.releaseAll()
         super.onPause()
     }
 
@@ -143,7 +172,14 @@ class PeripheralPadActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) {
             backInvoker?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         }
-        if (usbMode) usbLink.stop() else bridge.removeListener(stateListener)
+        if (usbMode) {
+            usbLink.removeListener(usbLinkListener)
+            usbLink.releaseAll()
+            usbLink.stop()
+        } else {
+            bridge.releaseAll()
+            bridge.removeListener(stateListener)
+        }
         super.onDestroy()
     }
 

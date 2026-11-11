@@ -37,6 +37,7 @@ import java.util.concurrent.TimeUnit
 import dev.local.mihotspot.domain.HomeKitFeature
 import dev.local.mihotspot.peripheral.usb.UsbPeripheralActivity
 import dev.local.mihotspot.peripheral.usb.UsbPeripheralService
+import dev.local.mihotspot.peripheral.usb.UsbPeripheralStatus
 import dev.local.mihotspot.ui.MainViewModel
 import dev.local.mihotspot.data.HotspotConfiguration
 import dev.local.mihotspot.homekit.commands.CommandResult
@@ -88,7 +89,13 @@ class MainActivity : Activity() {
     private lateinit var serviceSwitch: Switch
     private lateinit var hidSwitch: Switch
     private lateinit var hidStatusBadge: TextView
+    private lateinit var hidDetailText: TextView
+    /** Last HID state seen, so the peripheral entry can be re-evaluated without a new event. */
+    private var hidState: BtHidPeripheral.State = BtHidPeripheral.State.STOPPED
+    private var lastHidFailure: String? = null
+    private val usbStateProbe = AtomicBoolean(false)
     private var peripheralModesCard: LinearLayout? = null
+    private var peripheralModesHint: TextView? = null
     private var hidSettingsPage: View? = null
     private var hidHapticsPage: View? = null
     private var hidPageBadge: TextView? = null
@@ -111,6 +118,8 @@ class MainActivity : Activity() {
             if (!isFinishing) {
                 updateConnectionStatus(refreshRoot = false)
                 refreshDeviceState()
+                // Cheap re-read of the single USB source; heals a missed broadcast.
+                refreshPeripheralEntry()
                 stateRefreshHandler.postDelayed(this, 3_000L)
             }
         }
@@ -155,6 +164,11 @@ class MainActivity : Activity() {
                 HomeKitUiEvents.ACTION_STATE_CHANGED -> {
                     applyStateEvent(intent)
                 }
+                UsbPeripheralService.ACTION_STATE -> {
+                    // The service just published into UsbPeripheralStatus, so the
+                    // cheap snapshot is already up to date.
+                    refreshPeripheralEntry()
+                }
             }
         }
     }
@@ -165,10 +179,14 @@ class MainActivity : Activity() {
         updatePairingCard()
         updateConnectionStatus()
         PeripheralHub.bridge(this).addListener(hidListener)
+        // Restore before painting: applyHidState() retires a stored "on" intent
+        // when the bridge is idle, and that must not race the restore.
+        ensureHidRunningIfEnabled()
         applyHidState(
             PeripheralHub.bridge(this).state,
             PeripheralHub.bridge(this).hostName
         )
+        refreshUsbPeripheralState(verify = true)
         log("PROBE_CREATED source=Apple_HomeKitADK_f201f98")
         if (ServiceControl.isEnabled(this)) ensurePermissionsAndStart()
     }
@@ -180,6 +198,11 @@ class MainActivity : Activity() {
         updateConnectionStatus(refreshRoot = false)
         updateNfcStatus()
         refreshDeviceState()
+        // The USB session can have been started/changed while this activity was
+        // paused (or the process restarted); re-derive both entries from state.
+        ensureHidRunningIfEnabled()
+        applyHidState(PeripheralHub.bridge(this).state, PeripheralHub.bridge(this).hostName)
+        refreshUsbPeripheralState(verify = true)
         stateRefreshHandler.removeCallbacks(stateRefreshRunnable)
         stateRefreshHandler.postDelayed(stateRefreshRunnable, 3_000L)
     }
@@ -324,6 +347,16 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         )
         headerCard.addView(switchRow)
+
+        // Reason shown when HID registration fails; silence used to leave the
+        // user with a switch that did nothing.
+        hidDetailText = TextView(this).apply {
+            textSize = 11f
+            setTextColor(UiTheme.COLOR_DANGER)
+            setPadding(0, dp(6), 0, 0)
+            visibility = View.GONE
+        }
+        headerCard.addView(hidDetailText)
 
         statusInfo = TextView(this).apply {
             textSize = 12f
@@ -1175,7 +1208,10 @@ class MainActivity : Activity() {
         addView(card)
     }
 
-    /** Two peripheral surfaces, shown only while a host is connected. */
+    /**
+     * Two peripheral surfaces. Shown while a Bluetooth host is connected or the
+     * USB session is usable; the pad picks its transport from the same state.
+     */
     private fun buildPeripheralModesCard(): LinearLayout = createCard(
         this, verticalPaddingDp = 12f, horizontalPaddingDp = 16f
     ).apply {
@@ -1186,12 +1222,13 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
         })
-        addView(TextView(this@MainActivity).apply {
+        peripheralModesHint = TextView(this@MainActivity).apply {
             text = "主机已连接，选择接下来在手机上使用的键鼠界面"
             textSize = 12f
             setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
             setPadding(0, dp(4), 0, 0)
-        })
+        }
+        addView(peripheralModesHint)
         addView(createCardDivider(this@MainActivity))
         addView(buildModeRow(
             "沉浸模式",
@@ -1292,11 +1329,15 @@ class MainActivity : Activity() {
     }
 
     private fun startHid() {
+        val bridge = PeripheralHub.bridge(this)
+        // A failed registration leaves the bridge "running" without a HID
+        // record, so the next start() returned early and the switch became a
+        // no-op. Reset the session before asking for a new registration.
+        if (bridge.state == BtHidPeripheral.State.FAILED) bridge.stop()
+        PeripheralService.start(this)
+        bridge.start()
         getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
             .edit().putBoolean(BtHidPeripheral.KEY_ENABLED, true).apply()
-        PeripheralService.start(this)
-        val bridge = PeripheralHub.bridge(this)
-        bridge.start()
         applyHidState(bridge.state, bridge.hostName)
     }
 
@@ -1309,10 +1350,20 @@ class MainActivity : Activity() {
     }
 
     private fun applyHidState(state: BtHidPeripheral.State, detail: String?) {
+        val bridge = PeripheralHub.bridge(this)
+        val stillRunning = bridge.isRunning
+        hidState = state
         updatingHidSwitch = true
-        hidSwitch.isChecked = state == BtHidPeripheral.State.REGISTERING ||
-            state == BtHidPeripheral.State.READY ||
-            state == BtHidPeripheral.State.CONNECTED
+        hidSwitch.isChecked = when (state) {
+            BtHidPeripheral.State.CONNECTED,
+            BtHidPeripheral.State.READY,
+            BtHidPeripheral.State.REGISTERING -> true
+            // STOPPED while the bridge still runs is a transient re-acquire
+            // (Bluetooth restart); the switch must not flicker off.
+            BtHidPeripheral.State.STOPPED -> stillRunning
+            BtHidPeripheral.State.FAILED,
+            BtHidPeripheral.State.UNSUPPORTED -> false
+        }
         updatingHidSwitch = false
 
         val (label, fg, bg) = when (state) {
@@ -1327,7 +1378,11 @@ class MainActivity : Activity() {
             BtHidPeripheral.State.UNSUPPORTED ->
                 Triple("HID 不支持", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
             BtHidPeripheral.State.STOPPED ->
-                Triple("HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+                if (stillRunning) {
+                    Triple("HID 重连中", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+                } else {
+                    Triple("HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
+                }
         }
         hidStatusBadge.text = label
         hidStatusBadge.setTextColor(fg)
@@ -1337,16 +1392,96 @@ class MainActivity : Activity() {
             it.setTextColor(fg)
             it.background = UiTheme.createPillDrawable(this, bg)
         }
-        peripheralModesCard?.visibility =
-            if (state == BtHidPeripheral.State.CONNECTED || UsbPeripheralService.running) {
-                View.VISIBLE
-            } else {
-                View.GONE
+
+        // Keep the stored intent equal to the real bridge, so the switch value
+        // after the next launch and the boot recovery do not lie to the user.
+        val gaveUp = (state == BtHidPeripheral.State.STOPPED && !stillRunning) ||
+            state == BtHidPeripheral.State.UNSUPPORTED
+        if (gaveUp) {
+            getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                .edit().putBoolean(BtHidPeripheral.KEY_ENABLED, false).apply()
+        }
+
+        val problem = when (state) {
+            BtHidPeripheral.State.FAILED -> detail ?: "HID 注册失败：蓝牙 HID 服务未就绪"
+            BtHidPeripheral.State.UNSUPPORTED -> detail ?: "系统不支持蓝牙 HID Device"
+            else -> null
+        }
+        hidDetailText.text = problem.orEmpty()
+        hidDetailText.visibility = if (problem == null) View.GONE else View.VISIBLE
+        if (problem != null) {
+            if (problem != lastHidFailure) {
+                lastHidFailure = problem
+                Toast.makeText(this, "HID 失败：$problem", Toast.LENGTH_LONG).show()
             }
+        } else {
+            lastHidFailure = null
+        }
+
+        refreshPeripheralEntry()
+    }
+
+    /**
+     * Single place that decides whether the peripheral entry is shown and which
+     * transport the pad will use. It reads both live transports instead of only
+     * the in-memory Bluetooth state, so a USB session that is alive but whose
+     * service was restarted still keeps its entry.
+     */
+    private fun refreshPeripheralEntry(
+        usb: UsbPeripheralStatus.Snapshot = UsbPeripheralStatus.snapshot(this)
+    ) {
+        val card = peripheralModesCard ?: return
+        val btConnected = hidState == BtHidPeripheral.State.CONNECTED
+        val wanted = if (btConnected || usb.active) View.VISIBLE else View.GONE
+        if (card.visibility != wanted) card.visibility = wanted
+        peripheralModesHint?.text = when {
+            usb.active && btConnected -> "USB 与蓝牙主机均可用，进入后使用 USB 键鼠"
+            usb.active -> "USB 键鼠已就绪，选择接下来在手机上使用的键鼠界面"
+            else -> "主机已连接，选择接下来在手机上使用的键鼠界面"
+        }
+    }
+
+    /**
+     * Re-derives the USB half of the entry. [verify] probes the daemon on a
+     * worker thread (and adopts a session that outlived the process); the plain
+     * form only re-reads the cached/persisted snapshot on the caller thread.
+     */
+    private fun refreshUsbPeripheralState(verify: Boolean) {
+        refreshPeripheralEntry()
+        if (!verify || isFinishing) return
+        if (!usbStateProbe.compareAndSet(false, true)) return
+        Thread {
+            val snapshot = try {
+                UsbPeripheralStatus.verify(this)
+            } catch (e: Throwable) {
+                log("USB_STATE_VERIFY_FAILED ${e.javaClass.simpleName}: ${e.message}")
+                UsbPeripheralStatus.snapshot(this)
+            }
+            runOnUiThread {
+                usbStateProbe.set(false)
+                if (!isFinishing) refreshPeripheralEntry(snapshot)
+            }
+        }.start()
+    }
+
+    /**
+     * The HID switch is persisted, but nothing restored it after a process
+     * restart: the switch said "on" while no registration existed. Start the
+     * sticky service again when the stored intent is on but the bridge is idle.
+     */
+    private fun ensureHidRunningIfEnabled() {
+        val wanted = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+            .getBoolean(BtHidPeripheral.KEY_ENABLED, false)
+        val bridge = PeripheralHub.bridge(this)
+        if (!wanted || bridge.isRunning) return
+        log("HID_RESTORE_ENABLED state=${bridge.state}")
+        runCatching { PeripheralService.start(this) }
+            .onFailure { log("HID_RESTORE_START_FAILED ${it.javaClass.simpleName}") }
+        bridge.start()
     }
 
     private fun activePeripheralTransport(): String =
-        if (UsbPeripheralService.running) {
+        if (UsbPeripheralStatus.snapshot(this).active) {
             PeripheralPadActivity.TRANSPORT_USB
         } else {
             PeripheralPadActivity.TRANSPORT_BT
@@ -2518,6 +2653,7 @@ class MainActivity : Activity() {
         val filter = IntentFilter().apply {
             addAction(HomeKitUiEvents.ACTION_RUNTIME_STATUS)
             addAction(HomeKitUiEvents.ACTION_STATE_CHANGED)
+            addAction(UsbPeripheralService.ACTION_STATE)
         }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(uiEventReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
