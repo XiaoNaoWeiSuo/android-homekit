@@ -886,6 +886,17 @@ static bool drain_events(VideoNode &v, UvcControlState &st) {
                 LOGI("UVC: setup %02x/%02x v=%04x i=%04x l=%u -> %d", uev.u.req.bRequestType,
                      uev.u.req.bRequest, (unsigned)uev.u.req.wValue, (unsigned)uev.u.req.wIndex,
                      (unsigned)uev.u.req.wLength, resp.length);
+                // logcat dies with a panic; keep the request trail on disk so a
+                // reboot still shows which setup preceded it.
+                static FILE *slog = nullptr;
+                if (!slog) slog = fopen("/data/local/tmp/uvc_setup.log", "a");
+                if (slog) {
+                    fprintf(slog, "%02x/%02x v=%04x i=%04x l=%u -> %d\n",
+                            uev.u.req.bRequestType, uev.u.req.bRequest,
+                            (unsigned)uev.u.req.wValue, (unsigned)uev.u.req.wIndex,
+                            (unsigned)uev.u.req.wLength, resp.length);
+                    fflush(slog);
+                }
             }
 
             if (xioctl(v.fd, UVCIOC_SEND_RESPONSE, &resp) < 0) {

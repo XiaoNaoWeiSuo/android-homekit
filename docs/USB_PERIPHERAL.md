@@ -194,6 +194,12 @@ payload ...
      主机开始枚举时真机 `POWERUP_REASON kpanic` 重启（`/proc/uptime` 归零）。
      所以不能把“启动安全、停止危险”当成定论；只要涉及 UVC 的 configfs 重绑，
      两侧都可能触发。重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
+  6. 待验证的嫌疑（代码审得出，尚未上机证实）：`process_setup()` 对**标准请求**
+     （例如 `SET_INTERFACE`）也保持 `resp.length = -EL2HLT` 并随后调用
+     `UVCIOC_SEND_RESPONSE`。`uvc_send_response()` 会走 `usb_composite_setup_continue()`，
+     若此时没有 delayed status，就命中 `WARN` → panic_on_warn。若后续抓到
+     `/data/local/tmp/uvc_setup.log` 的末尾是 `00/0b ... -34`（`SET_INTERFACE` 被 stall），
+     基本可以坐实。
 - 事件通知必须使用 `POLLPRI`（已修）；否则守护进程收不到 `STREAMON/SETUP`，主机只能读到打开时预排队的空 buffer。
 - 2026-11-11 源码定位：除 POLLPRI 外还有两处致命缺陷（`UVCIOC_SEND_RESPONSE` ioctl 号写错、buffer 排队顺序反了），净效果与“收不到事件”完全一致。详见 §9。
 
