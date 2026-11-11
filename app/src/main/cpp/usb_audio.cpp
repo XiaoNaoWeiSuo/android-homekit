@@ -24,7 +24,10 @@ namespace {
 
 constexpr unsigned kRate = 48000;
 constexpr unsigned kPeriodFrames = 1024;
-constexpr unsigned kPeriodCount = 2;
+// f_uac2 on this kernel advertises "Period count: min=4 max=16"; the old value
+// of 2 made every pcm_open fail with "cannot set hw params: Invalid argument"
+// (tinypcminfo reports the range, tinycap opens fine once count >= 4).
+constexpr unsigned kPeriodCount = 4;
 constexpr unsigned kAppChannels = 2;  // the app always gets S16LE stereo
 
 // tinyalsa flags and format (include/tinyalsa/pcm.h). libtinyalsa is not part
@@ -42,6 +45,9 @@ struct pcm_config {
     unsigned int start_threshold;
     unsigned int stop_threshold;
     unsigned int silence_threshold;
+    // tinyalsa reads this last field; omitting it made pcm_open read past our
+    // struct and fail with "cannot set sw params: Invalid argument".
+    int avail_min;
 };
 
 struct pcm;
@@ -229,8 +235,12 @@ pcm *open_ready(TinyAlsa &alsa, int card, int device, unsigned flags, unsigned c
     cfg.period_count = kPeriodCount;
     cfg.format = kFormatS16LE;
     cfg.start_threshold = 0;
-    cfg.stop_threshold = 0;
+    cfg.stop_threshold = kPeriodFrames * kPeriodCount;
     cfg.silence_threshold = 0;
+    // Measured with a probe against the vendor libtinyalsa: avail_min must be 0.
+    // Any non-zero value makes SNDRV_PCM_IOCTL_SW_PARAMS fail with EINVAL on
+    // this gadget PCM, while 0 lets the driver pick its own default.
+    cfg.avail_min = 0;
 
     pcm *h = alsa.open_fn(static_cast<unsigned>(card), static_cast<unsigned>(device), flags, &cfg);
     if (!h) return nullptr;  // wrong direction or device busy: expected while probing
