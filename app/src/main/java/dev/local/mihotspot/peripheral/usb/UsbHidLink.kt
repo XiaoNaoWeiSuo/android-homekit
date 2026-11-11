@@ -10,6 +10,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Loopback transport to the root daemon. Reports are framed as
@@ -38,6 +39,7 @@ class UsbHidLink(private val port: Int, private val token: String) {
     @Volatile private var output: BufferedOutputStream? = null
     @Volatile private var buttons = 0
     @Volatile private var connected = false
+    private val keyboardGeneration = AtomicInteger()
 
     fun addListener(listener: Listener) {
         if (!listeners.contains(listener)) listeners.add(listener)
@@ -60,9 +62,16 @@ class UsbHidLink(private val port: Int, private val token: String) {
 
     @Synchronized
     fun stop() {
-        if (!running.compareAndSet(true, false)) return
-        // Give the daemon one last chance to clear any held key/button.
+        if (!running.get()) return
+        // Send the release while the worker is still alive. Setting running to
+        // false first would make enqueue() drop the release, leaving the host
+        // with a held key that auto-repeats forever.
         enqueue(releaseReport())
+        try {
+            Thread.sleep(120)
+        } catch (_: InterruptedException) {
+        }
+        if (!running.compareAndSet(true, false)) return
         try {
             worker?.join(350)
         } catch (_: InterruptedException) {
@@ -76,8 +85,19 @@ class UsbHidLink(private val port: Int, private val token: String) {
     }
 
     fun sendKeyboardState(modifiers: Int, usages: IntArray) {
+        val generation = keyboardGeneration.incrementAndGet()
         enqueue(byteArrayOf(HidProtocol.REPORT_ID_KEYBOARD.toByte()) +
             HidProtocol.keyboardReport(modifiers, usages))
+        // The on-screen panel is tap-driven. If ACTION_UP is lost (focus loss,
+        // OEM gesture interception), a held key would auto-repeat forever; a
+        // short release watchdog makes that failure self-healing.
+        if (usages.isNotEmpty() || modifiers != 0) {
+            scheduler.schedule({
+                if (keyboardGeneration.get() == generation) {
+                    enqueue(byteArrayOf(HidProtocol.REPORT_ID_KEYBOARD.toByte(), 0, 0, 0, 0, 0, 0, 0, 0))
+                }
+            }, 1500, TimeUnit.MILLISECONDS)
+        }
     }
 
     fun mouseMove(dx: Int, dy: Int) {

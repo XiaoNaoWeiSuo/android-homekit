@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
 import dev.local.mihotspot.domain.HomeKitFeature
 import dev.local.mihotspot.peripheral.usb.UsbPeripheralActivity
+import dev.local.mihotspot.peripheral.usb.UsbPeripheralService
 import dev.local.mihotspot.ui.MainViewModel
 import dev.local.mihotspot.data.HotspotConfiguration
 import dev.local.mihotspot.homekit.commands.CommandResult
@@ -1241,7 +1242,13 @@ class MainActivity : Activity() {
                     radiusDp = 12f
                 )
                 onHapticClick {
-                    startActivity(PeripheralPadActivity.intent(this@MainActivity, immersive))
+                    startActivity(
+                        PeripheralPadActivity.intent(
+                            this@MainActivity,
+                            immersive,
+                            activePeripheralTransport()
+                        )
+                    )
                 }
             })
         }
@@ -1331,8 +1338,19 @@ class MainActivity : Activity() {
             it.background = UiTheme.createPillDrawable(this, bg)
         }
         peripheralModesCard?.visibility =
-            if (state == BtHidPeripheral.State.CONNECTED) View.VISIBLE else View.GONE
+            if (state == BtHidPeripheral.State.CONNECTED || UsbPeripheralService.running) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
     }
+
+    private fun activePeripheralTransport(): String =
+        if (UsbPeripheralService.running) {
+            PeripheralPadActivity.TRANSPORT_USB
+        } else {
+            PeripheralPadActivity.TRANSPORT_BT
+        }
 
     private fun buildHidSettingsEntry(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL

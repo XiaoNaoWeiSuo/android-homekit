@@ -134,6 +134,11 @@ class PeripheralPadActivity : Activity() {
         }
     }
 
+    override fun onPause() {
+        if (usbMode) usbLink.releaseAll()
+        super.onPause()
+    }
+
     override fun onDestroy() {
         if (Build.VERSION.SDK_INT >= 33) {
             backInvoker?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }

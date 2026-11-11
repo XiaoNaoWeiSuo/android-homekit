@@ -23,7 +23,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import dev.local.mihotspot.R
-import dev.local.mihotspot.peripheral.PeripheralPadActivity
+
 import dev.local.mihotspot.ui.UiTheme
 import dev.local.mihotspot.ui.createCard
 import dev.local.mihotspot.ui.createCardDivider
@@ -246,50 +246,15 @@ class UsbPeripheralActivity : Activity() {
         content.addView(cameraCard)
         updateCameraButtons()
 
-        content.addView(
-            createSectionHeader(
-                this,
-                "使用",
-                "USB 使用说明",
-                "键鼠界面与蓝牙模式共用同一套 UI；USB 模式下不再依赖蓝牙连接。"
-            )
-        )
-        val useCard = createCard(this)
-        useCard.addView(navRow(
-            "USB 键鼠界面",
-            "键盘 + 触控板，点键盘上的 ✕ 退出",
-            "打开"
-        ) {
-            startActivity(
-                PeripheralPadActivity.intent(
-                    this@UsbPeripheralActivity,
-                    immersive = false,
-                    transport = PeripheralPadActivity.TRANSPORT_USB
-                )
-            )
+        content.addView(TextView(this).apply {
+            text = "键鼠面板与蓝牙共用：开启 USB 外设后，从首页「外设模式」进入，" +
+                "使用同一个键盘/触控板界面。这里不再单独提供 USB 键盘入口。"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(dp(22), dp(14), dp(22), dp(4))
         })
-        content.addView(useCard)
 
         val actionCard = createCard(this)
-        val open = Button(this).apply {
-            text = "打开 USB 键鼠界面"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
-            )
-            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, android.graphics.Color.WHITE, 12f)
-            onHapticClick {
-                startActivity(
-                    PeripheralPadActivity.intent(
-                        this@UsbPeripheralActivity,
-                        immersive = false,
-                        transport = PeripheralPadActivity.TRANSPORT_USB
-                    )
-                )
-            }
-        }
-        actionCard.addView(open)
         val stop = Button(this).apply {
             text = "停止并恢复普通 USB"
             textSize = 14f
@@ -523,7 +488,7 @@ class UsbPeripheralActivity : Activity() {
             51 -> {
                 if (!granted) {
                     setSwitchSilently(audioSwitch, false)
-                    statusDetail.text = "未授予录音权限，只启用 USB 键鼠"
+                    statusDetail.text = "未授予录音权限，音频关闭"
                 }
                 pendingAudio = false
                 if (granted) startUsb()
