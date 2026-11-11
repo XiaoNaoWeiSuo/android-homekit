@@ -326,31 +326,35 @@ class KeyboardPanel(context: Context) : LinearLayout(context) {
 
         private fun drawBackground(canvas: Canvas) {
             val radius = UiTheme.dp(context, 8f).toFloat()
+            // Stroking on the exact view bounds clips half the stroke, which made
+            // the special-key borders almost invisible on black. Inset it.
+            val inset = UiTheme.dp(context, 0.75f).toFloat()
             rect.set(0f, 0f, width.toFloat(), height.toFloat())
+            val strokeRect = RectF(inset, inset, width - inset, height - inset)
+            val strokeRadius = (radius - inset).coerceAtLeast(1f)
             if (darkTheme) {
                 when {
                     keyPressed -> {
-                        bgPaint.color = 0x30FFFFFF
+                        bgPaint.color = 0x3DFFFFFF
                         canvas.drawRoundRect(rect, radius, radius, bgPaint)
-                        strokePaint.strokeWidth = UiTheme.dp(context, 1f).toFloat()
-                        strokePaint.color = 0x70FFFFFF
-                        canvas.drawRoundRect(rect, radius, radius, strokePaint)
+                        drawBorder(canvas, strokeRect, strokeRadius, 0xB3FFFFFF.toInt())
                     }
-                    spec.special -> {
-                        strokePaint.strokeWidth = UiTheme.dp(context, 1f).toFloat()
-                        strokePaint.color = 0x33FFFFFF
-                        canvas.drawRoundRect(rect, radius, radius, strokePaint)
-                    }
+                    spec.special -> drawBorder(canvas, strokeRect, strokeRadius, 0x66FFFFFF)
                 }
             } else {
                 bgPaint.color = if (keyPressed) UiTheme.COLOR_ACCENT_LIGHT else UiTheme.COLOR_BTN_SECONDARY_BG
                 canvas.drawRoundRect(rect, radius, radius, bgPaint)
-                if (keyPressed || spec.special) {
-                    strokePaint.strokeWidth = UiTheme.dp(context, 1f).toFloat()
-                    strokePaint.color = if (keyPressed) UiTheme.COLOR_ACCENT else 0xFFE2E4E8.toInt()
-                    canvas.drawRoundRect(rect, radius, radius, strokePaint)
+                when {
+                    keyPressed -> drawBorder(canvas, strokeRect, strokeRadius, UiTheme.COLOR_ACCENT)
+                    spec.special -> drawBorder(canvas, strokeRect, strokeRadius, 0xFFD2D7DE.toInt())
                 }
             }
+        }
+
+        private fun drawBorder(canvas: Canvas, target: RectF, borderRadius: Float, color: Int) {
+            strokePaint.strokeWidth = UiTheme.dp(context, 1.1f).toFloat()
+            strokePaint.color = color
+            canvas.drawRoundRect(target, borderRadius, borderRadius, strokePaint)
         }
 
         private fun drawText(canvas: Canvas, label: String) {
