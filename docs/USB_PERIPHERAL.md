@@ -164,7 +164,9 @@ payload ...
   表现为主机停在 alt 0、抓帧阻塞（容易误判成“还是不出流”）。
 - UAC2：往 47833 灌入 440 Hz，主机录音测得 `mean -22.5 dB`；日志为
   `pcm_open ok card=1 dev=0 PCM_IN ch=1` / `PCM_OUT ch=2`，均 48 kHz。
-- 扬声器方向：PCM 已打开，**内容未验证**（需要主机播放到非默认输出设备）。
+- 扬声器方向：主机把默认输出切到该 USB 声卡并播放 440 Hz，手机侧从 47834 收流
+  得到 2.79 s、`mean -25.5 dB / max -21.1 dB` 的 PCM，确认 主机播放 → PCM_IN →
+  守护进程 这一段可用（App 的 AudioTrack 消费端本次未参与，因为测试时 `usb_audio` 为关）。
 - UI：App 可认领存活会话（日志 `USB_SESSION_ADOPTED`），首页在未触碰 HID 开关时
   即显示「外设模式」。注意验证时的残留：应用偏好里的 `usb_token` 被写成测试值，
   后续启动会沿用。
