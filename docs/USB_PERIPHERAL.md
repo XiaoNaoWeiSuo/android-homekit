@@ -155,6 +155,20 @@ payload ...
 - 手机侧：`/dev/hidg0`、`/dev/videoN`（`name=dwc3-gadget`）、`/proc/asound/cards` 出现 `UAC2Gadget`。
 - 日志：`adb logcat -s MiHotspotUsb:I`，原生守护进程 `logcat -s marionette_usbd`。
 
+**2026-11-11 实测（完整组合 HID + UVC + UAC2 同时绑定）**
+
+- HID：面板点一次 `q`，主机只收到一个字符，3 秒无重复。
+- UVC：`ffmpeg -pixel_format yuyv422 -framerate 30 -video_size 640x480` 收到 30 帧、
+  平均亮度 121（非黑帧）、约 23 fps，守护进程日志出现 `host selected alt 1`。
+  **不指定 `-pixel_format yuyv422` 时 ffmpeg 会选 UYVY**，与本 gadget 的 YUYV 不匹配，
+  表现为主机停在 alt 0、抓帧阻塞（容易误判成“还是不出流”）。
+- UAC2：往 47833 灌入 440 Hz，主机录音测得 `mean -22.5 dB`；日志为
+  `pcm_open ok card=1 dev=0 PCM_IN ch=1` / `PCM_OUT ch=2`，均 48 kHz。
+- 扬声器方向：PCM 已打开，**内容未验证**（需要主机播放到非默认输出设备）。
+- UI：App 可认领存活会话（日志 `USB_SESSION_ADOPTED`），首页在未触碰 HID 开关时
+  即显示「外设模式」。注意验证时的残留：应用偏好里的 `usb_token` 被写成测试值，
+  后续启动会沿用。
+
 ## 7. UVC 真机风险（2026-11-11，重要）
 
 - 主机可以枚举出标准 `UVC Camera`（macOS `system_profiler` 可见），AVFoundation/ffmpeg 也能抓到 640x480 帧。
