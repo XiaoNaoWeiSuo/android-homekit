@@ -136,6 +136,7 @@ class BtHidPeripheral(context: Context) {
     @Volatile private var buttons = 0
     private var registerAttempts = 0
     @Volatile private var registering = false
+    @Volatile private var pendingReRegister = false
 
     val isRunning: Boolean get() = running
     val isConnected: Boolean get() = host != null
@@ -144,14 +145,33 @@ class BtHidPeripheral(context: Context) {
         get() = prefs.getString(KEY_DEVICE_NAME, DEFAULT_DEVICE_NAME)
             ?.takeIf { it.isNotBlank() } ?: DEFAULT_DEVICE_NAME
         set(value) {
-            prefs.edit().putString(KEY_DEVICE_NAME, value).apply()
-            if (registered) {
-                // The SDP record carries the name; re-register to apply it.
-                worker.post {
+            val trimmed = value.trim().ifEmpty { DEFAULT_DEVICE_NAME }
+            prefs.edit().putString(KEY_DEVICE_NAME, trimmed).apply()
+            if (!running) return
+            // The SDP record carries the name, so applying it needs a fresh
+            // registerApp(). The stack finishes unregisterApp() asynchronously;
+            // registering in the same tick returns false and leaves the phone
+            // with no HID record at all — which is exactly what made the UI
+            // report "HID 失败" and hosts fail to reconnect.
+            pendingReRegister = true
+            worker.post {
+                if (registered) {
+                    registering = false
                     unregisterLocked()
+                } else {
+                    registering = false
                     registerLocked()
                 }
             }
+            worker.postDelayed({
+                if (pendingReRegister) {
+                    pendingReRegister = false
+                    if (running && !registered) {
+                        registering = false
+                        registerLocked()
+                    }
+                }
+            }, 1500L)
         }
 
     private fun log(message: String) {
@@ -400,6 +420,7 @@ class BtHidPeripheral(context: Context) {
             log("HID_UNREGISTER_FAILED ${e.message}")
         }
         registered = false
+        registering = false
     }
 
     private val callback = object : BluetoothHidDevice.Callback() {
@@ -409,6 +430,15 @@ class BtHidPeripheral(context: Context) {
             log("HID_APP_STATUS registered=$isRegistered plugged=${pluggedDevice?.address}")
             if (!isRegistered) {
                 host = null
+                if (pendingReRegister && running) {
+                    // Deliberate rename: wait for the stack to finish the
+                    // unregister, then register with the new SDP name.
+                    pendingReRegister = false
+                    registerAttempts = 0
+                    publish(State.REGISTERING)
+                    worker.postDelayed({ if (running && !registered) registerLocked() }, 250L)
+                    return
+                }
                 if (running && registerAttempts < 3) {
                     // The stack can drop our app (e.g. after a Bluetooth reset)
                     // while the service is still meant to be on. Re-register,
@@ -422,6 +452,7 @@ class BtHidPeripheral(context: Context) {
                 return
             }
             registerAttempts = 0
+            pendingReRegister = false
             host = null
             publish(State.READY)
             maybeReconnectLocked(hid = proxy)
@@ -529,6 +560,21 @@ class BtHidPeripheral(context: Context) {
             log("HID_AUTO_RECONNECT device=$last ok=$ok")
         } catch (e: Exception) {
             log("HID_AUTO_RECONNECT_FAILED ${e.message}")
+        }
+    }
+
+    /** Drop the active host so another machine (e.g. Windows) can take over. */
+    @SuppressLint("MissingPermission")
+    fun disconnectHost(): Boolean {
+        val hid = proxy ?: return false
+        val device = host ?: return false
+        return try {
+            val ok = hid.disconnect(device)
+            log("HID_DISCONNECT host=${device.address} ok=$ok")
+            ok
+        } catch (e: Exception) {
+            log("HID_DISCONNECT_FAILED ${e.message}")
+            false
         }
     }
 

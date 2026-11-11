@@ -1414,6 +1414,20 @@ class MainActivity : Activity() {
         })
         statusCard.addView(actionRow)
         statusCard.addView(Button(this).apply {
+            text = "断开当前主机（切换到另一台电脑）"
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(-1, dp(38)).apply { topMargin = dp(8) }
+            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 10f)
+            onHapticClick {
+                val ok = PeripheralHub.bridge(this@MainActivity).disconnectHost()
+                Toast.makeText(
+                    this@MainActivity,
+                    if (ok) "已断开，可在另一台电脑上连接" else "当前没有已连接主机",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        })
+        statusCard.addView(Button(this).apply {
             text = "重置蓝牙（修复「已有另一个 app 注册」）"
             textSize = 12f
             layoutParams = LinearLayout.LayoutParams(-1, dp(38)).apply { topMargin = dp(8) }
