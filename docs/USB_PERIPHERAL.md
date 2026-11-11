@@ -194,12 +194,16 @@ payload ...
      主机开始枚举时真机 `POWERUP_REASON kpanic` 重启（`/proc/uptime` 归零）。
      所以不能把“启动安全、停止危险”当成定论；只要涉及 UVC 的 configfs 重绑，
      两侧都可能触发。重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
-  6. 待验证的嫌疑（代码审得出，尚未上机证实）：`process_setup()` 对**标准请求**
-     （例如 `SET_INTERFACE`）也保持 `resp.length = -EL2HLT` 并随后调用
-     `UVCIOC_SEND_RESPONSE`。`uvc_send_response()` 会走 `usb_composite_setup_continue()`，
-     若此时没有 delayed status，就命中 `WARN` → panic_on_warn。若后续抓到
-     `/data/local/tmp/uvc_setup.log` 的末尾是 `00/0b ... -34`（`SET_INTERFACE` 被 stall），
-     基本可以坐实。
+  6. panic 触发条件（已从同族内核源码 `f_uvc.c` 确认，修正早期推测）：
+     `uvc_function_setup()` 对**非 class** 请求直接 `return -EINVAL`，标准请求
+     （含 `SET_INTERFACE`）**永远不会**送到用户态，所以“stall 标准请求导致 WARN”不成立。
+     真正的条件是 `usb_composite_setup_continue()` 在 `delayed_status == 0` 时被调用，
+     即用户态的 `VIDIOC_STREAMON/STREAMOFF` 找不到待完成的状态阶段。
+     而 `set_alt(0)` 在 `uvc->state != UVC_STATE_STREAMING` 时**直接 return 0**：
+     主机先 alt=1、紧接着 alt=0 时，内核不发 STREAMOFF、也不留 delayed status，
+     若我们此时才为之前的 STREAMON 调 `VIDIOC_STREAMON`，就会踩中 WARN。
+     这是厂商驱动的固有脆弱点，应用层只能缩小窗口（收到事件后立即 STREAMON），
+     无法根除；在能确认主机不会中途重选 alt 之前，摄像头应默认关闭。
 - 事件通知必须使用 `POLLPRI`（已修）；否则守护进程收不到 `STREAMON/SETUP`，主机只能读到打开时预排队的空 buffer。
 - 2026-11-11 源码定位：除 POLLPRI 外还有两处致命缺陷（`UVCIOC_SEND_RESPONSE` ioctl 号写错、buffer 排队顺序反了），净效果与“收不到事件”完全一致。详见 §9。
 
