@@ -316,3 +316,34 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 - `streaming=1` 但 `out=0`：`DQBUF` 返回 `EAGAIN` 且 `nobuf` 增长 → QBUF/pump 顺序被打回
   （不要改回“open 时预排队”）。
 - 任何 `SEND_RESPONSE: Inappropriate ioctl` → 跑的还是旧二进制。
+
+## 12. 当前状态与恢复步骤（2026-11-11 21:10）
+
+已在真机验证（完整组合 HID + UVC + UAC2 同时绑定）：
+
+- 键盘/触控板：面板点一次 `q` 只出 1 个字符，3 秒无重复。
+- 麦克风（手机→主机）：47833 灌 440 Hz，macOS 录音 `mean -22.5 dB`。
+- 扬声器（主机→手机）：主机默认输出临时切到本设备播 2 s，手机侧从 47834
+  收到 2.79 s PCM，`mean -25.5 dB`（播完已还原默认输出）。
+
+**未通过**：摄像头画面。控制握手已通（`host selected alt 1, streaming`，
+`out` 递增），但主机拿到的是空白帧：
+
+- 灌入亮度 235 的 NV21 合成帧，主机抓到的仍是 `0`（`fill_black` 的 Y=16）
+  或 `122`（未初始化）——都不是我们的内容。
+- 反差线索：**不喂帧**时主机能连收 93 帧空白；**一喂帧**流反而卡住（只取到 1 帧）。
+
+继续排查只需要一次「绑定 → 抓日志」，日志已落盘、不会随 panic 丢失：
+
+1. `binduvc.sh`（HID+UVC+UAC2）→ 启动守护进程 → 确认 `UVC: /dev/videoN ready`。
+2. 手机侧持续灌合成帧：`sh /data/local/tmp/feedvid2.sh`（Y=235、UV=128）。
+3. 主机侧：`ffmpeg -f avfoundation -pixel_format yuyv422 -framerate 30 -video_size 640x480 -i 1 -t 3 /tmp/t.mkv`。
+4. 读 `/data/local/tmp/uvc_qbuf.log`：
+   - `y0=235` → 缓冲区里是我们的帧，问题在内核没有把它发出去（isoc/泵）；
+   - `y0=16` → 转换/排队路径写错了。
+5. 读 `/data/local/tmp/uvc_setup.log` 末尾：若出现 `00/0b ... -> -34`
+   （`SET_INTERFACE` 被 stall），基本坐实「标准请求被应答 → `setup_continue` WARN → kpanic」
+   这条嫌疑。
+
+风险：绑定/激活 UVC 侧今天已 3 次触发 `POWERUP_REASON kpanic`；
+重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
