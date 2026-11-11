@@ -1,0 +1,152 @@
+package dev.local.mihotspot.peripheral.usb
+
+import android.content.Context
+import android.util.Base64
+import android.util.Log
+import dev.local.mihotspot.peripheral.HidProtocol
+import java.io.File
+import java.security.SecureRandom
+import java.util.concurrent.TimeUnit
+
+object UsbSession {
+    const val PREFS = "usb_peripheral"
+    const val KEY_TOKEN = "usb_token"
+    const val KEY_ENABLED = "usb_enabled"
+    const val KEY_CAMERA = "usb_camera"
+    const val KEY_AUDIO = "usb_audio"
+
+    fun prefs(context: Context) =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun token(context: Context): String =
+        prefs(context).getString(KEY_TOKEN, null) ?: newToken(context)
+
+    fun newToken(context: Context): String {
+        val bytes = ByteArray(8)
+        SecureRandom().nextBytes(bytes)
+        val token = bytes.joinToString("") { "%02x".format(it) }
+        prefs(context).edit().putString(KEY_TOKEN, token).apply()
+        return token
+    }
+
+    fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY_ENABLED, false)
+    fun setEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ENABLED, enabled).apply()
+    }
+}
+
+/**
+ * Owns the configfs composition. The daemon binary is packaged as a native
+ * library (so the APK extracts it with exec permission) and copied to
+ * /data/local/tmp before the root shell starts it.
+ */
+class UsbGadgetController(private val context: Context) {
+
+    companion object {
+        private const val TAG = "MiHotspotUsb"
+        const val HID_PORT = 47831
+        const val VIDEO_PORT = 47832
+        const val MIC_PORT = 47833
+        const val SPEAKER_PORT = 47834
+        const val DAEMON = "/data/local/tmp/marionette_usbd"
+        const val HID_REPORT = "/data/local/tmp/marionette_hid.bin"
+        const val START_SCRIPT = "/data/local/tmp/marionette_usb_start.sh"
+        const val STOP_SCRIPT = "/data/local/tmp/marionette_usb_stop.sh"
+        const val UDC = "/sys/class/udc/a600000.dwc3/state"
+    }
+
+    data class Options(val camera: Boolean = false, val audio: Boolean = false)
+
+    data class Status(
+        val state: String = "unknown",
+        val hidNode: String? = null,
+        val videoNode: String? = null,
+        val card: String? = null,
+        val daemonPid: Int? = null,
+        val raw: String = ""
+    ) {
+        val bound: Boolean
+            get() = state == "configured" || state == "addressed" || state == "powered"
+        val ready: Boolean get() = bound && hidNode != null && daemonPid != null
+    }
+
+    fun start(token: String, options: Options): Status {
+        pushHidDescriptor()
+        pushDaemon()
+        val script = asset("usb/start.sh")
+            .replace("__TOKEN__", token)
+            .replace("__ENABLE_CAMERA__", if (options.camera) "1" else "0")
+            .replace("__ENABLE_AUDIO__", if (options.audio) "1" else "0")
+        writeRootFile(START_SCRIPT, script)
+        val out = runRoot("chmod 755 $START_SCRIPT; sh $START_SCRIPT")
+        Log.i(TAG, "USB_START ${out.lineSequence().take(20).joinToString(" | ")}")
+        return parse(out)
+    }
+
+    fun stop(): Status {
+        val script = asset("usb/stop.sh")
+        writeRootFile(STOP_SCRIPT, script)
+        val out = runRoot("chmod 755 $STOP_SCRIPT; sh $STOP_SCRIPT")
+        Log.i(TAG, "USB_STOP ${out.lineSequence().take(8).joinToString(" | ")}")
+        return parse(out)
+    }
+
+    fun status(): Status {
+        val command = """
+            echo STATE=${'$'}(cat $UDC 2>/dev/null)
+            echo HID=${'$'}(cat /config/usb_gadget/g1/functions/hid.marionette/dev 2>/dev/null)
+            echo VIDEO=${'$'}(for v in /sys/class/video4linux/video*; do [ "${'$'}(cat ${'$'}v/name 2>/dev/null)" = "dwc3-gadget" ] && echo /dev/${'$'}(basename ${'$'}v); done | head -1)
+            echo CARD=${'$'}(grep -q UAC2Gadget /proc/asound/cards 2>/dev/null && echo UAC2Gadget)
+            echo PID=${'$'}(cat /data/local/tmp/marionette_usbd.pid 2>/dev/null)
+        """.trimIndent()
+        return parse(runRoot(command))
+    }
+
+    private fun parse(out: String): Status {
+        fun value(key: String): String? = Regex("(?m)^$key=(.*)$")
+            .find(out)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+        val hidDev = value("HID")
+        val hidMinor = hidDev?.substringAfter(':', "")
+        val hidNode = if (!hidMinor.isNullOrEmpty()) "/dev/hidg$hidMinor" else value("HID_NODE")
+        return Status(
+            state = value("STATE") ?: "unknown",
+            hidNode = hidNode,
+            videoNode = value("VIDEO"),
+            card = value("CARD"),
+            daemonPid = value("DAEMON")?.toIntOrNull() ?: value("PID")?.toIntOrNull(),
+            raw = out
+        )
+    }
+
+    private fun pushHidDescriptor() {
+        val b64 = Base64.encodeToString(HidProtocol.reportDescriptor, Base64.NO_WRAP)
+        runRoot("printf %s '$b64' | base64 -d > $HID_REPORT")
+    }
+
+    private fun pushDaemon() {
+        val binary = File(context.applicationInfo.nativeLibraryDir, "libmarionette_usbd.so")
+        require(binary.exists()) { "daemon binary missing: ${binary.absolutePath}" }
+        val out = runRoot("cp '${binary.absolutePath}' $DAEMON && chmod 755 $DAEMON && echo COPIED")
+        require(out.contains("COPIED")) { "cannot copy daemon: $out" }
+    }
+
+    private fun asset(name: String): String =
+        context.assets.open(name).bufferedReader().use { it.readText() }
+
+    private fun writeRootFile(path: String, content: String) {
+        val process = ProcessBuilder("su", "-c", "cat > $path").start()
+        process.outputStream.use { it.write(content.toByteArray()) }
+        process.waitFor(10, TimeUnit.SECONDS)
+    }
+
+    private fun runRoot(command: String): String = try {
+        val process = ProcessBuilder("su", "-c", command)
+            .redirectErrorStream(true)
+            .start()
+        val text = process.inputStream.bufferedReader().use { it.readText() }
+        process.waitFor(35, TimeUnit.SECONDS)
+        text
+    } catch (e: Exception) {
+        "ERROR ${e.javaClass.simpleName}: ${e.message}"
+    }
+}

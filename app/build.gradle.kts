@@ -57,6 +57,14 @@ dependencies {
     testImplementation("org.json:json:20240303")
 }
 
+val buildUsbDaemon by tasks.registering(Exec::class) {
+    inputs.files(fileTree("src/main/cpp") { include("*.cpp", "*.h") })
+    inputs.file(rootProject.file("build-tools/usb/build_native.sh"))
+    outputs.file("src/main/jniLibs/arm64-v8a/libmarionette_usbd.so")
+    commandLine("sh", rootProject.file("build-tools/usb/build_native.sh").absolutePath)
+}
+tasks.named("preBuild").configure { dependsOn(buildUsbDaemon) }
+
 val buildAirDropBackend by tasks.registering(Exec::class) {
     inputs.files(fileTree("../native/airdrop") { exclude("target/**") })
     inputs.file("../build-airdrop-backend.sh")

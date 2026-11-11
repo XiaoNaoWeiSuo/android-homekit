@@ -24,6 +24,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <!-- 屏上键盘的轻微按键震动 -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- 收到文件时在其他应用之上弹确认/进度悬浮窗（和系统 AirDrop 一样）。
@@ -93,6 +98,15 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|fontScale|layoutDirection|density" />
         <service
             android:name=".peripheral.PeripheralService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="connectedDevice" />
+        <activity
+            android:name=".peripheral.usb.UsbPeripheralActivity"
+            android:exported="false"
+            android:label="USB 外设" />
+        <service
+            android:name=".peripheral.usb.UsbPeripheralService"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="connectedDevice" />

@@ -18,6 +18,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.Toast
+import dev.local.mihotspot.peripheral.usb.UsbHub
 import dev.local.mihotspot.ui.UiTheme
 import kotlin.math.abs
 
@@ -44,16 +45,49 @@ class PeripheralPadActivity : Activity() {
         const val EXTRA_THEME = "peripheral_theme"
         const val THEME_IMMERSIVE = "immersive"
         const val THEME_DEFAULT = "default"
+        const val EXTRA_TRANSPORT = "peripheral_transport"
+        const val TRANSPORT_BT = "bt"
+        const val TRANSPORT_USB = "usb"
         const val PREFS = BtHidPeripheral.PREFS
         const val KEY_SENSITIVITY = "touchpad_sensitivity"
         const val KEY_TRAIL = "touchpad_trail"
 
-        fun intent(context: Context, immersive: Boolean): Intent =
+        fun intent(
+            context: Context,
+            immersive: Boolean,
+            transport: String = TRANSPORT_BT
+        ): Intent =
             Intent(context, PeripheralPadActivity::class.java)
                 .putExtra(EXTRA_THEME, if (immersive) THEME_IMMERSIVE else THEME_DEFAULT)
+                .putExtra(EXTRA_TRANSPORT, transport)
     }
 
     private val bridge by lazy { PeripheralHub.bridge(this) }
+    private val usbMode: Boolean by lazy {
+        intent.getStringExtra(EXTRA_TRANSPORT) == TRANSPORT_USB
+    }
+    private val usbLink by lazy { UsbHub.link(this) }
+
+    private fun sendKeyboardState(modifiers: Int, usages: IntArray) {
+        if (usbMode) usbLink.sendKeyboardState(modifiers, usages)
+        else bridge.sendKeyboardState(modifiers, usages)
+    }
+
+    private fun moveMouse(dx: Int, dy: Int) {
+        if (usbMode) usbLink.mouseMove(dx, dy) else bridge.mouseMove(dx, dy)
+    }
+
+    private fun scrollMouse(steps: Int) {
+        if (usbMode) usbLink.mouseScroll(steps) else bridge.mouseScroll(steps)
+    }
+
+    private fun mouseButton(button: Int, down: Boolean) {
+        if (usbMode) usbLink.mouseButton(button, down) else bridge.mouseButton(button, down)
+    }
+
+    private fun clickMouse(button: Int) {
+        if (usbMode) usbLink.click(button) else bridge.click(button)
+    }
     private lateinit var split: SplitLayout
     private lateinit var keyboard: KeyboardPanel
     private lateinit var touchpad: TouchpadView
@@ -92,15 +126,19 @@ class PeripheralPadActivity : Activity() {
             excludeSystemBackGesture()
             registerBackSwallow()
         }
-        bridge.addListener(stateListener)
-        bridge.start()
+        if (usbMode) {
+            usbLink.start()
+        } else {
+            bridge.addListener(stateListener)
+            bridge.start()
+        }
     }
 
     override fun onDestroy() {
         if (Build.VERSION.SDK_INT >= 33) {
             backInvoker?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         }
-        bridge.removeListener(stateListener)
+        if (usbMode) usbLink.stop() else bridge.removeListener(stateListener)
         super.onDestroy()
     }
 
@@ -180,7 +218,7 @@ class PeripheralPadActivity : Activity() {
             darkTheme = dark
             glow = dark
             onKeyboardState = { modifiers, usages ->
-                bridge.sendKeyboardState(modifiers, usages)
+                sendKeyboardState(modifiers, usages)
             }
             onExit = { finish() }
         }
@@ -191,11 +229,11 @@ class PeripheralPadActivity : Activity() {
             sensitivity = getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getInt(KEY_SENSITIVITY, 180) / 100f
             listener = object : TouchpadView.Listener {
-                override fun onMove(dx: Int, dy: Int) = bridge.mouseMove(dx, dy)
-                override fun onScroll(steps: Int) = bridge.mouseScroll(steps)
-                override fun onDragStart() = bridge.mouseButton(HidProtocol.BUTTON_LEFT, true)
-                override fun onDragEnd() = bridge.mouseButton(HidProtocol.BUTTON_LEFT, false)
-                override fun onClick(button: Int) = bridge.click(button)
+                override fun onMove(dx: Int, dy: Int) = moveMouse(dx, dy)
+                override fun onScroll(steps: Int) = scrollMouse(steps)
+                override fun onDragStart() = mouseButton(HidProtocol.BUTTON_LEFT, true)
+                override fun onDragEnd() = mouseButton(HidProtocol.BUTTON_LEFT, false)
+                override fun onClick(button: Int) = clickMouse(button)
             }
         }
 

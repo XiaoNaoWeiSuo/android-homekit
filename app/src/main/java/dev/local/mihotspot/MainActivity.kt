@@ -35,6 +35,7 @@ import android.provider.Settings
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
 import dev.local.mihotspot.domain.HomeKitFeature
+import dev.local.mihotspot.peripheral.usb.UsbPeripheralActivity
 import dev.local.mihotspot.ui.MainViewModel
 import dev.local.mihotspot.data.HotspotConfiguration
 import dev.local.mihotspot.homekit.commands.CommandResult
@@ -619,6 +620,7 @@ class MainActivity : Activity() {
         settingsScrollContent.addView(buildHotspotSettings())
         settingsScrollContent.addView(buildNfcSettings())
         settingsScrollContent.addView(buildHidSettingsEntry())
+        settingsScrollContent.addView(buildUsbSettingsEntry())
         settingsScrollContent.addView(buildDeviceManagement())
         val settingsScroll = ScrollView(this).apply {
             isFillViewport = true
@@ -1368,6 +1370,48 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginStart = dp(6) }
         })
         row.onHapticClick { showHidSettingsPage() }
+        card.addView(row)
+        addView(card)
+    }
+
+    private fun buildUsbSettingsEntry(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(createSectionHeader(
+            this@MainActivity,
+            "USB 外设",
+            "USB 外设说明",
+            "手机通过标准 USB 协议作为键盘 / 触控板 / 摄像头 / 麦克风 / 扬声器，主机无需安装任何软件或驱动。"
+        ))
+        val card = createCard(this@MainActivity)
+        val row = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val col = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        col.addView(TextView(this@MainActivity).apply {
+            text = "USB 外设模式"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        col.addView(TextView(this@MainActivity).apply {
+            text = "USB 键鼠已可用 · 摄像头 / 麦克风 / 扬声器接入中"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        row.addView(col)
+        row.addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_chevron_right)
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginStart = dp(6) }
+        })
+        row.onHapticClick {
+            startActivity(Intent(this@MainActivity, UsbPeripheralActivity::class.java))
+        }
         card.addView(row)
         addView(card)
     }
