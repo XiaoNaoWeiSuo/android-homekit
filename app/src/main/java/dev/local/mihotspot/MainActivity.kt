@@ -1554,6 +1554,39 @@ class MainActivity : Activity() {
         touchCard.addView(keepAliveRow)
 
         touchCard.addView(createCardDivider(this))
+        val trailRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        val trailCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        trailCol.addView(TextView(this).apply {
+            text = "拖尾轨迹"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        trailCol.addView(TextView(this).apply {
+            text = "在触控板上显示手指滑过的淡出轨迹"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        trailRow.addView(trailCol)
+        trailRow.addView(Switch(this).apply {
+            isChecked = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                .getBoolean(KEY_TOUCHPAD_TRAIL, false)
+            setOnCheckedChangeListener { _, checked ->
+                getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                    .edit().putBoolean(KEY_TOUCHPAD_TRAIL, checked).apply()
+            }
+        })
+        touchCard.addView(trailRow)
+
+        touchCard.addView(createCardDivider(this))
         val hapticsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -2405,6 +2438,7 @@ class MainActivity : Activity() {
         private const val REQUEST_HID = 103
         private const val REQUEST_DISCOVERABLE = 104
         private const val KEY_HID_SENSITIVITY = "touchpad_sensitivity"
+        private const val KEY_TOUCHPAD_TRAIL = "touchpad_trail"
         private const val SLIDER_UI_HOLD_MS = 1_200L
         private const val SLIDER_UI_SETTLE_MS = 700L
     }

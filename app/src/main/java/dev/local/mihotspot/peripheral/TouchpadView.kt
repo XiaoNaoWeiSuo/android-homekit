@@ -3,9 +3,9 @@ package dev.local.mihotspot.peripheral
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
@@ -14,11 +14,11 @@ import dev.local.mihotspot.ui.UiTheme
 import kotlin.math.abs
 
 /**
- * Touchpad surface: finger travel becomes relative HID mouse motion, taps become
- * clicks, two-finger drag becomes the wheel, long-press-and-move becomes a drag.
+ * Borderless touchpad surface: pure background with a small crosshair in the
+ * middle (no text, no card). Finger travel becomes relative HID mouse motion;
+ * taps become clicks, two-finger drag scrolls, long-press-and-move drags.
  *
- * This mirrors what a physical trackpad sends over standard HID; macOS applies
- * its own pointer acceleration on top of these relative reports.
+ * An optional fading trail visualises the finger path.
  */
 class TouchpadView @JvmOverloads constructor(
     context: Context,
@@ -38,32 +38,31 @@ class TouchpadView @JvmOverloads constructor(
     /** Pointer gain; 1.0 ≈ one screen pixel per finger pixel. */
     var sensitivity: Float = 1.8f
 
-    /** Dark "immersive" theme: black glass, dim hints. */
+    /** Dark "immersive" theme: faint light crosshair. */
     var darkTheme: Boolean = false
         set(value) {
             if (field == value) return
             field = value
-            applyTheme()
             invalidate()
         }
 
+    /** Fading finger trail (opt-in). */
+    var trailEnabled: Boolean = false
+
+    private class TrailPoint(val x: Float, val y: Float, val at: Long)
+
+    private val trail = ArrayList<TrailPoint>(48)
+    private val crossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val trailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
     private val handler = Handler(Looper.getMainLooper())
-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xFFF5F6F8.toInt()
-        style = Paint.Style.FILL
-    }
-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xFFE2E4E8.toInt()
-        style = Paint.Style.STROKE
-        strokeWidth = UiTheme.dp(context, 1f).toFloat()
-    }
-    private val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = UiTheme.COLOR_TEXT_MUTED
-        textSize = UiTheme.dp(context, 12f).toFloat()
-        textAlign = Paint.Align.CENTER
-    }
-    private val rect = RectF()
 
     private var downTime = 0L
     private var downX = 0f
@@ -86,14 +85,6 @@ class TouchpadView @JvmOverloads constructor(
     init {
         isClickable = true
         isFocusable = true
-        applyTheme()
-    }
-
-    private fun applyTheme() {
-        fillPaint.color = if (darkTheme) 0xFF06080B.toInt() else 0xFFF5F6F8.toInt()
-        strokePaint.color = if (darkTheme) 0xFF1A2531.toInt() else 0xFFE2E4E8.toInt()
-        hintPaint.color = if (darkTheme) 0xFF5C7488.toInt() else UiTheme.COLOR_TEXT_MUTED
-        hintPaint.textSize = UiTheme.dp(context, if (darkTheme) 11f else 12f).toFloat()
     }
 
     private fun beginDrag() {
@@ -105,15 +96,36 @@ class TouchpadView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        rect.set(0f, 0f, width.toFloat(), height.toFloat())
-        canvas.drawRoundRect(rect, UiTheme.dp(context, 16f).toFloat(), UiTheme.dp(context, 16f).toFloat(), fillPaint)
-        canvas.drawRoundRect(rect, UiTheme.dp(context, 16f).toFloat(), UiTheme.dp(context, 16f).toFloat(), strokePaint)
-        val cy = height / 2f - hintPaint.textSize
-        canvas.drawText("触控板", width / 2f, cy, hintPaint)
-        canvas.drawText("单指移动 · 轻点=左键 · 双指=滚动/右键", width / 2f, cy + hintPaint.textSize * 1.8f, hintPaint)
-        if (!darkTheme || width > UiTheme.dp(context, 520f)) {
-            canvas.drawText("长按后拖动 = 拖拽", width / 2f, cy + hintPaint.textSize * 3.6f, hintPaint)
+        val cx = width / 2f
+        val cy = height / 2f
+        val arm = UiTheme.dp(context, 14f).toFloat()
+        crossPaint.strokeWidth = UiTheme.dp(context, 1.2f).toFloat()
+        crossPaint.color = if (darkTheme) 0x55FFFFFF else 0x33000000
+        canvas.drawLine(cx - arm, cy, cx + arm, cy, crossPaint)
+        canvas.drawLine(cx, cy - arm, cx, cy + arm, crossPaint)
+        if (trailEnabled) drawTrail(canvas)
+    }
+
+    private fun drawTrail(canvas: Canvas) {
+        if (trail.isEmpty()) return
+        val now = SystemClock.uptimeMillis()
+        trail.removeAll { now - it.at > TRAIL_LIFETIME_MS }
+        if (trail.size < 2) return
+        trailPaint.strokeWidth = UiTheme.dp(context, 2f).toFloat()
+        for (i in 1 until trail.size) {
+            val prev = trail[i - 1]
+            val point = trail[i]
+            val age = (now - point.at).coerceIn(0, TRAIL_LIFETIME_MS)
+            val alpha = ((1f - age / TRAIL_LIFETIME_MS.toFloat()) * 110f).toInt()
+            if (alpha <= 0) continue
+            trailPaint.color = if (darkTheme) {
+                (alpha shl 24) or 0x35CBFF
+            } else {
+                (alpha shl 24) or 0x0D84FF
+            }
+            canvas.drawLine(prev.x, prev.y, point.x, point.y, trailPaint)
         }
+        postInvalidateOnAnimation()
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -131,6 +143,10 @@ class TouchpadView @JvmOverloads constructor(
                 accumulatorX = 0f
                 accumulatorY = 0f
                 scrollAccumulator = 0f
+                if (trailEnabled) {
+                    trail.clear()
+                    addTrailPoint(event.x, event.y)
+                }
                 handler.postDelayed(longPress, 420L)
                 return true
             }
@@ -176,13 +192,16 @@ class TouchpadView @JvmOverloads constructor(
                         accumulatorY -= outY
                         listener?.onMove(outX, outY)
                     }
+                    if (trailEnabled) {
+                        addTrailPoint(event.x, event.y)
+                        postInvalidateOnAnimation()
+                    }
                 }
                 return true
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
                 handler.removeCallbacks(longPress)
-                // Continue tracking with the finger that is still down.
                 val remaining = if (event.actionIndex == 0) 1 else 0
                 if (event.pointerCount - 1 == 1) {
                     lastX = event.getX(remaining)
@@ -204,6 +223,7 @@ class TouchpadView @JvmOverloads constructor(
                     )
                 }
                 parent?.requestDisallowInterceptTouchEvent(false)
+                postInvalidateOnAnimation()
                 return true
             }
 
@@ -220,6 +240,11 @@ class TouchpadView @JvmOverloads constructor(
         return super.onTouchEvent(event)
     }
 
+    private fun addTrailPoint(x: Float, y: Float) {
+        trail.add(TrailPoint(x, y, SystemClock.uptimeMillis()))
+        while (trail.size > 64) trail.removeAt(0)
+    }
+
     private fun averageY(event: MotionEvent): Float {
         if (event.pointerCount == 0) return 0f
         var sum = 0f
@@ -229,6 +254,11 @@ class TouchpadView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         handler.removeCallbacks(longPress)
+        trail.clear()
         super.onDetachedFromWindow()
+    }
+
+    private companion object {
+        const val TRAIL_LIFETIME_MS = 520L
     }
 }

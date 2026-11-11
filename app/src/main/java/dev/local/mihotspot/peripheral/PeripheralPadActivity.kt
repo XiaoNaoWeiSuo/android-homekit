@@ -45,6 +45,7 @@ class PeripheralPadActivity : Activity() {
         const val THEME_DEFAULT = "default"
         const val PREFS = BtHidPeripheral.PREFS
         const val KEY_SENSITIVITY = "touchpad_sensitivity"
+        const val KEY_TRAIL = "touchpad_trail"
 
         fun intent(context: Context, immersive: Boolean): Intent =
             Intent(context, PeripheralPadActivity::class.java)
@@ -124,6 +125,8 @@ class PeripheralPadActivity : Activity() {
         }
         touchpad = TouchpadView(this).apply {
             darkTheme = dark
+            trailEnabled = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(KEY_TRAIL, false)
             sensitivity = getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getInt(KEY_SENSITIVITY, 180) / 100f
             listener = object : TouchpadView.Listener {
@@ -301,9 +304,9 @@ private class BarView(context: Context) : View(context) {
         }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val rect = RectF()
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
+    private var pressed = false
 
     private var lastX = 0f
     private var lastY = 0f
@@ -314,26 +317,23 @@ private class BarView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val handleWidth = if (horizontalBar) height * 0.30f else width * 0.30f
+        // A short Apple-style grab handle, not a full-height pill.
+        val thickness = UiTheme.dp(context, 4f).toFloat()
+        val length = UiTheme.dp(context, 54f).toFloat()
+        val cx = width / 2f
+        val cy = height / 2f
         if (horizontalBar) {
-            val cy = height / 2f
-            rect.set(width * 0.08f, cy - handleWidth / 2f, width * 0.92f, cy + handleWidth / 2f)
+            rect.set(cx - length / 2f, cy - thickness / 2f, cx + length / 2f, cy + thickness / 2f)
         } else {
-            val cx = width / 2f
-            rect.set(cx - handleWidth / 2f, height * 0.08f, cx + handleWidth / 2f, height * 0.92f)
+            rect.set(cx - thickness / 2f, cy - length / 2f, cx + thickness / 2f, cy + length / 2f)
         }
-        paint.color = if (darkTheme) 0xFF16202B.toInt() else 0xFFE9EDF2.toInt()
-        canvas.drawRoundRect(rect, handleWidth / 2f, handleWidth / 2f, paint)
-        dotPaint.color = if (darkTheme) 0xFF4FD6FF.toInt() else 0xFF9AA4B2.toInt()
-        val dotRadius = UiTheme.dp(context, 1.6f).toFloat()
-        val step = UiTheme.dp(context, 8f)
-        if (horizontalBar) {
-            val cx = width / 2f
-            for (i in -1..1) canvas.drawCircle(cx + i * step, height / 2f, dotRadius, dotPaint)
-        } else {
-            val cy = height / 2f
-            for (i in -1..1) canvas.drawCircle(width / 2f, cy + i * step, dotRadius, dotPaint)
+        paint.color = when {
+            pressed -> if (darkTheme) 0xAAE8F4FF.toInt() else 0x55000000
+            darkTheme -> 0x66DCE9F5.toInt()
+            else -> 0x33000000
         }
+        val radius = thickness / 2f
+        canvas.drawRoundRect(rect, radius, radius, paint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -344,6 +344,8 @@ private class BarView(context: Context) : View(context) {
                 totalDx = 0f
                 totalDy = 0f
                 dragged = false
+                pressed = true
+                invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -381,6 +383,8 @@ private class BarView(context: Context) : View(context) {
                     }
                 }
                 performClick()
+                pressed = false
+                invalidate()
                 return true
             }
         }
