@@ -98,6 +98,11 @@ Kotlin: UsbPeripheralService
 
 App → 守护进程：原始 HID 报告字节（含 Report ID）。守护进程 `write()` 到 `/dev/hidg0`，非阻塞，失败丢弃。
 
+`report_length` 必须覆盖**含 Report ID 的线上长度**（键盘 1+8=9 字节）。`f_hid` 用它决定
+中断 IN 请求长度：写成 8 时每个键盘报告被截断成 8 字节，主机等不到第 9 个字节、
+永远不重新发起请求，`/dev/hidg0` 从此只返回 `EAGAIN`（`Try again`），而主机侧
+`hidutil` 仍能正常列出键盘设备——看起来“绑定成功、就是打不出字”。
+
 ### 4.2 视频（47832）
 
 App → 守护进程的二进制帧：
@@ -144,6 +149,11 @@ payload ...
   1. UVC 仍视为实验性；不要在主机相机 App 打开时切换/停止 USB 外设。
   2. 切换前先关闭主机相机 App，最好拔掉数据线再重新枚举。
   3. HID/UAC2 不受此问题影响，可先作为稳定能力交付。
+  4. 2026-11-11 复测补充：主机**没有**在取流（`streaming=0`、无 `STREAMON`）时，
+     仅执行 `controller.stop()`（UDC unbind + 恢复厂商 HAL）也让真机 panic 重启。
+     注意 `ro.boot.bootreason` 只会显示 `reboot`，**不能用它排除 panic**；
+     要判定请查本轮 dmesg 的 `POWERUP_REASON kpanic`（`hardwareinfo` 驱动打印）。
+     因此 **unbind 本身即风险点**，不要为了验证而反复启停；启动（bind）侧未观察到异常。
 - 事件通知必须使用 `POLLPRI`（已修）；否则守护进程收不到 `STREAMON/SETUP`，主机只能读到打开时预排队的空 buffer。
 
 ## 8. 已知边界

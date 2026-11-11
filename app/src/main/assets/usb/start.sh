@@ -19,7 +19,10 @@ rm -f f1 f2 f3 f4
 # ---- HID: keyboard + relative mouse + consumer ----
 mkdir $H 2>/dev/null
 cat /data/local/tmp/marionette_hid.bin > $H/report_desc 2>/dev/null
-echo 8 > $H/report_length 2>/dev/null
+# Wire reports include the report ID (keyboard 1+8 = 9 bytes). f_hid sizes the
+# interrupt-IN request from this value; 8 truncated every keyboard report and
+# left the host waiting for the missing byte, which wedged the endpoint.
+echo 9 > $H/report_length 2>/dev/null
 echo 0 > $H/protocol 2>/dev/null
 echo 0 > $H/subclass 2>/dev/null
 HIDDEV=$(cat $H/dev 2>/dev/null)
