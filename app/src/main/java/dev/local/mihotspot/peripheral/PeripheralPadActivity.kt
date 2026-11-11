@@ -17,6 +17,7 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.Toast
 import dev.local.mihotspot.ui.UiTheme
 import kotlin.math.abs
 
@@ -57,6 +58,8 @@ class PeripheralPadActivity : Activity() {
     private lateinit var keyboard: KeyboardPanel
     private lateinit var touchpad: TouchpadView
     private var dark = true
+    private var backInvoker: android.window.OnBackInvokedCallback? = null
+    private var lastBackHintAt = 0L
 
     private val stateListener = object : BtHidPeripheral.Listener {
         override fun onStateChanged(state: BtHidPeripheral.State, detail: String?) {
@@ -87,14 +90,45 @@ class PeripheralPadActivity : Activity() {
         if (dark) {
             hideSystemBars()
             excludeSystemBackGesture()
+            registerBackSwallow()
         }
         bridge.addListener(stateListener)
         bridge.start()
     }
 
     override fun onDestroy() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            backInvoker?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+        }
         bridge.removeListener(stateListener)
         super.onDestroy()
+    }
+
+    /**
+     * MIUI's gesture stubs do not honour setSystemGestureExclusionRects, so the
+     * edge swipe still reaches the activity as a back event. Swallow it: only
+     * the ✕ key leaves the peripheral surface.
+     */
+    private fun registerBackSwallow() {
+        if (Build.VERSION.SDK_INT < 33) return
+        val callback = android.window.OnBackInvokedCallback { notifyExitOnly() }
+        backInvoker = callback
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            callback
+        )
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        notifyExitOnly()
+    }
+
+    private fun notifyExitOnly() {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastBackHintAt < 2000L) return
+        lastBackHintAt = now
+        Toast.makeText(this, "沉浸模式已屏蔽返回手势，点键盘上的 ✕ 退出", Toast.LENGTH_SHORT).show()
     }
 
     /**
@@ -109,8 +143,11 @@ class PeripheralPadActivity : Activity() {
         if (Build.VERSION.SDK_INT < 29) return
         val content = findViewById<android.view.View>(android.R.id.content) ?: return
         val update = {
-            content.systemGestureExclusionRects =
-                listOf(android.graphics.Rect(0, 0, content.width, content.height))
+            val rects = listOf(android.graphics.Rect(0, 0, content.width, content.height))
+            content.systemGestureExclusionRects = rects
+            // Also apply on the decor root: some OEM gesture handlers only
+            // look at the window's top-level view.
+            window.decorView.systemGestureExclusionRects = rects
         }
         content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> update() }
         content.post(update)
