@@ -351,3 +351,15 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 
 风险：绑定/激活 UVC 侧今天已 3 次触发 `POWERUP_REASON kpanic`；
 重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
+
+### 12.1 源码核对（2026-11-11，android13-5.15）
+
+- `uvc_v4l2_qbuf()` 只在 `uvc->state == UVC_STATE_STREAMING` 时
+  `queue_work(video->pump)`；而该状态是在 `uvc_v4l2_streamon()` 末尾
+  （`uvcg_video_enable()` 与 `setup_continue()` 之后）才置位的。
+  我们的顺序是「收到 STREAMON 事件 → `VIDIOC_STREAMON` → 之后才 QBUF」，
+  **满足这个前提**，所以“泵没被唤醒”不成立，剩余问题不在排队顺序。
+- `uvc_v4l2_release()` → `uvc_v4l2_disable()` → `usb_function_deactivate()`，
+  这解释了为什么守护进程退出会解绑整个 gadget（HID/UAC2 一起消失）。
+- `uvc_v4l2_subscribe_event()` 对 `UVC_EVENT_SETUP` 在已连接时返回 `-EBUSY`，
+  所以同一时刻只能有一个进程订阅；重复 open 会失败而不是静默。
