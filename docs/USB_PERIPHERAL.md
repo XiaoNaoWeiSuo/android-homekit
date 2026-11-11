@@ -189,6 +189,11 @@ payload ...
      注意 `ro.boot.bootreason` 只会显示 `reboot`，**不能用它排除 panic**；
      要判定请查本轮 dmesg 的 `POWERUP_REASON kpanic`（`hardwareinfo` 驱动打印）。
      因此 **unbind 本身即风险点**，不要为了验证而反复启停；启动（bind）侧未观察到异常。
+  5. 2026-11-11 21:05 再补：**绑定/激活一侧也会 panic**。一次
+     `binduvc.sh`（解绑→重链 HID+UVC+UAC2→`echo UDC`）+ 新守护进程启动并订阅 UVC 后，
+     主机开始枚举时真机 `POWERUP_REASON kpanic` 重启（`/proc/uptime` 归零）。
+     所以不能把“启动安全、停止危险”当成定论；只要涉及 UVC 的 configfs 重绑，
+     两侧都可能触发。重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
 - 事件通知必须使用 `POLLPRI`（已修）；否则守护进程收不到 `STREAMON/SETUP`，主机只能读到打开时预排队的空 buffer。
 - 2026-11-11 源码定位：除 POLLPRI 外还有两处致命缺陷（`UVCIOC_SEND_RESPONSE` ioctl 号写错、buffer 排队顺序反了），净效果与“收不到事件”完全一致。详见 §9。
 

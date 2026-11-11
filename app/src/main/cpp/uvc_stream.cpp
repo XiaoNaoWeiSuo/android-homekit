@@ -1034,6 +1034,15 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
     buf.bytesused = (uint32_t)v.frame_bytes;
     buf.field = V4L2_FIELD_NONE;
     buf.flags = 0;
+    // Diagnostic: prove what is actually in the mmap buffer at QBUF time.
+    // A blank frame here (y0=16) means the conversion never landed; y0=235
+    // means this kernel simply is not transmitting the buffer.
+    static unsigned frame_log = 0;
+    if (frame_log++ % 30 == 0) {
+        const uint8_t *p = static_cast<const uint8_t *>(v.buffers[buf.index].start);
+        LOGI("UVC: qbuf idx=%u len=%zu used=%u y0=%u y1=%u y2=%u u=%u v=%u",
+             buf.index, v.buffers[buf.index].len, buf.bytesused, p[0], p[2], p[4], p[1], p[3]);
+    }
     if (xioctl(v.fd, VIDIOC_QBUF, &buf) < 0) {
         if (errno == ENODEV) {
             v.dead = true;
