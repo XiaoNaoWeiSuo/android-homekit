@@ -158,10 +158,14 @@ payload ...
 **2026-11-11 实测（完整组合 HID + UVC + UAC2 同时绑定）**
 
 - HID：面板点一次 `q`，主机只收到一个字符，3 秒无重复。
-- UVC：`ffmpeg -pixel_format yuyv422 -framerate 30 -video_size 640x480` 收到 30 帧、
-  平均亮度 121（非黑帧）、约 23 fps，守护进程日志出现 `host selected alt 1`。
-  **不指定 `-pixel_format yuyv422` 时 ffmpeg 会选 UYVY**，与本 gadget 的 YUYV 不匹配，
-  表现为主机停在 alt 0、抓帧阻塞（容易误判成“还是不出流”）。
+- UVC：控制握手已打通（日志 `host selected alt 1, streaming`，主机能拿到帧），但
+  **画面内容仍是空白**：灌入亮度 235 的 NV21 合成帧时，主机抓到的仍是 0/122 的常量帧，
+  说明送出去的是队列里的空白缓冲，转换后的帧没有被主机取走。**此项尚不可用**，
+  不要用“能抓到帧”判断摄像头已好。
+  - 判据：合成 NV21（Y=235、UV=128）从 47832 灌入，再看主机抓帧的平均亮度；
+    `121/122` 是空白缓冲的特征值，`0` 是置零缓冲，都不是真实画面。
+  - 另一个坑：不指定 `-pixel_format yuyv422` 时 ffmpeg 会选 UYVY，与本 gadget 的
+    YUYV 不匹配，表现为主机停在 alt 0、抓帧阻塞。
 - UAC2：往 47833 灌入 440 Hz，主机录音测得 `mean -22.5 dB`；日志为
   `pcm_open ok card=1 dev=0 PCM_IN ch=1` / `PCM_OUT ch=2`，均 48 kHz。
 - 扬声器方向：主机把默认输出切到该 USB 声卡并播放 440 Hz，手机侧从 47834 收流
