@@ -138,6 +138,7 @@ HID_CONNECTION state=2 device=<host> name=<host name>
 | 双击 bar | 50/50 共存；**只有该状态解锁竖屏** |
 | 方向 | 横屏「键盘左 / 触控板右」，竖屏「键盘上 / 触控板下」，顺序不变 |
 | 退出 | ✕ 不再悬浮，作为键帽并入键盘第一行最右侧，无独立背景 |
+| 返回手势 | 沉浸模式对整窗设置 `setSystemGestureExclusionRects`（系统按每边 200 dp 截断），边缘返回手势不再误触；底部 home 手势不允许排除，退出只能点 ✕ |
 | 键位 | 16 单位 ANSI 网格（tab/caps 2u、shift 2.5/3.5u、enter 3u、space 7.5u），字母大写，`sans-serif-medium`；沉浸模式下静止无填充，仅按下时显示浅色填充 |
 | 特色键 | tab / caps / enter / ⌫ / ⇧ / ⌃ / ⌥ / ⌘ / 方向键 / ✕ / esc 静止时带 1 px 浅色描边，按下补充浅色底与更亮描边 |
 | 图标 | 手绘统一线稿：1.5 dp 描边、17 dp 方框、同一风格；左侧键左下对齐、右侧键右下对齐，与键帽宽度无关（MacBook 式） |

@@ -84,7 +84,10 @@ class PeripheralPadActivity : Activity() {
             window.attributes = window.attributes.apply { screenBrightness = 0.01f }
         }
         setContentView(buildUi())
-        if (dark) hideSystemBars()
+        if (dark) {
+            hideSystemBars()
+            excludeSystemBackGesture()
+        }
         bridge.addListener(stateListener)
         bridge.start()
     }
@@ -92,6 +95,25 @@ class PeripheralPadActivity : Activity() {
     override fun onDestroy() {
         bridge.removeListener(stateListener)
         super.onDestroy()
+    }
+
+    /**
+     * Immersive mode is used as a keyboard/touchpad, so the system back gesture
+     * along the screen edges is pure accident. Exclude the whole window from
+     * gesture navigation; the ✕ key is the only way out.
+     *
+     * The platform clamps exclusions to 200 dp per edge, which is exactly the
+     * back-gesture zone; the bottom home gesture is not excludable and stays.
+     */
+    private fun excludeSystemBackGesture() {
+        if (Build.VERSION.SDK_INT < 29) return
+        val content = findViewById<android.view.View>(android.R.id.content) ?: return
+        val update = {
+            content.systemGestureExclusionRects =
+                listOf(android.graphics.Rect(0, 0, content.width, content.height))
+        }
+        content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> update() }
+        content.post(update)
     }
 
     @Suppress("DEPRECATION")
