@@ -75,8 +75,16 @@ fi
 
 # ---- links (adb stays as a development safety net) ----
 cd $G/configs/b.1 || exit 11
-ln -s ../../functions/ffs.adb f1 2>/dev/null
 ln -s ../../functions/hid.marionette f2 2>/dev/null
+# ffs.adb may already be linked by the vendor configuration (functionN).
+# Linking the same function instance twice makes the whole configuration fail
+# to bind, so add our own link only when none exists.
+have_adb=0
+for l in function*; do
+  [ -L "$l" ] || continue
+  case "$(readlink "$l")" in *ffs.adb) have_adb=1 ;; esac
+done
+[ "$have_adb" = 1 ] || ln -s ../../functions/ffs.adb f1 2>/dev/null
 [ "__ENABLE_CAMERA__" = "1" ] && ln -s ../../functions/uvc.marionette f3 2>/dev/null
 [ "__ENABLE_AUDIO__" = "1" ] && ln -s ../../functions/uac2.marionette f4 2>/dev/null
 
