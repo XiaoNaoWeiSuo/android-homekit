@@ -211,6 +211,9 @@ class UsbPeripheralService : Service() {
     private var vendorAttachedSince = 0L
     private var vendorAttachStreak = 0
 
+    /** When we last handed the port back to the vendor; only then is the HAL busy. */
+    @Volatile private var vendorRestoredAt = 0L
+
     /** One free retry for a bind that lost a race with the vendor HAL. */
     private var wedgedRetryUsed = false
 
@@ -300,6 +303,16 @@ class UsbPeripheralService : Service() {
         } else {
             camera
         }
+        /*
+         * Persist what actually came up, not what was requested. A SCREEN request
+         * without MediaProjection consent degrades to OFF, and storing SCREEN made
+         * every later start silently come up with no camera while the UI still
+         * claimed it was selected.
+         */
+        UsbSession.prefs(this).edit()
+            .putString(UsbSession.KEY_CAMERA_SOURCE, effectiveCamera.name)
+            .putBoolean(UsbSession.KEY_AUDIO, audio)
+            .apply()
         executor.execute {
             provisioning = true
             try {
@@ -697,7 +710,15 @@ class UsbPeripheralService : Service() {
                 val now2 = SystemClock.elapsedRealtime()
                 if (vendorAttachedSince == 0L) vendorAttachedSince = now2
                 vendorAttachStreak++
-                if (vendorAttachStreak < 2 || now2 - vendorAttachedSince < 3000L) {
+                /*
+                 * Only the restore path races the vendor HAL's own rebind; a real
+                 * plug arrives with the HAL idle, so one probe is enough there.
+                 * This keeps the extra settle time where it protects us and
+                 * removes it from the common plug-in path.
+                 */
+                val freshRestore = vendorRestoredAt != 0L && now2 - vendorRestoredAt < 5000L
+                val needsSettle = freshRestore && now2 - vendorAttachedSince < 1800L
+                if (vendorAttachStreak < 2 || needsSettle) {
                     mainHandler.postDelayed(pendingPoll, HOST_SEARCH_MS)
                     return@execute
                 }
@@ -805,7 +826,7 @@ class UsbPeripheralService : Service() {
              */
             if (!attached && (provisioned || !status.gadgetBound) && !provisioning) {
                 val settled = SystemClock.elapsedRealtime() - provisionedAt
-                if (settled < 6000L) {
+                if (settled < 3500L) {
                     Log.i(TAG, "USB_DETACH_IGNORED_SETTLING settled=${settled}ms")
                     return@execute
                 }
@@ -984,6 +1005,7 @@ class UsbPeripheralService : Service() {
         } catch (e: Throwable) {
             Log.i(TAG, "USB_HOST_GONE_STOP_FAILED ${e.javaClass.simpleName}: ${e.message}")
         }
+        vendorRestoredAt = SystemClock.elapsedRealtime()
         updateNotification("插上数据线后自动接管")
         publish(
             "armed",

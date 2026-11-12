@@ -1433,11 +1433,15 @@ class MainActivity : Activity() {
     ) {
         val card = peripheralModesCard ?: return
         val btConnected = hidState == BtHidPeripheral.State.CONNECTED
-        val wanted = if (btConnected || usb.active) View.VISIBLE else View.GONE
+        // The card is the indicator: it appears when a host can actually use the
+        // peripheral and disappears the moment it cannot. "ready" means the UDC
+        // is attached and the daemon is up; armed/waiting states are not usable.
+        val usbUsable = usb.state == "ready"
+        val wanted = if (btConnected || usbUsable) View.VISIBLE else View.GONE
         if (card.visibility != wanted) card.visibility = wanted
-        peripheralModesHint?.text = usb.hint ?: when {
-            usb.active && btConnected -> "USB 与蓝牙主机均可用，进入后使用 USB 键鼠"
-            usb.active -> "USB 键鼠已就绪，选择接下来在手机上使用的键鼠界面"
+        peripheralModesHint?.text = when {
+            usbUsable && btConnected -> "USB 与蓝牙主机均可用"
+            usbUsable -> ""
             else -> "主机已连接，选择接下来在手机上使用的键鼠界面"
         }
     }
