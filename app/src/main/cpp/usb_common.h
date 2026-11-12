@@ -122,3 +122,27 @@ static inline bool udc_host_attached() {
     closedir(dir);
     return attached;
 }
+
+/**
+ * Re-arm the pull-up through the UDC's soft_connect knob.
+ *
+ * After a detach this vendor kernel parks dwc3 in low power mode and never
+ * re-enables the pull-up on the next VBUS, so a plain replug does not attach.
+ * Toggling soft_connect re-runs usb_gadget_connect() without touching configfs,
+ * which is what makes "unplug, plug back in" work at all.
+ */
+static inline bool soft_connect_cycle() {
+    const char *path = "/sys/class/udc/a600000.dwc3/soft_connect";
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    fputs("disconnect", f);
+    fflush(f);
+    fclose(f);
+    usleep(60000);
+    f = fopen(path, "w");
+    if (!f) return false;
+    fputs("connect", f);
+    fflush(f);
+    fclose(f);
+    return true;
+}

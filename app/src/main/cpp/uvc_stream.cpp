@@ -1230,19 +1230,12 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
     while (!stop->load()) {
         if (video.fd < 0) {
             /*
-             * The node stays enumerable while the cable is out, so opening it
-             * again would not fail - it would just churn open/close (and the
-             * close path is the one that panics this kernel). Wait for the
-             * host to actually come back instead.
+             * Always open, even with no host attached: UVC is bind_deactivated,
+             * and opening this node is what calls uvc_function_activate() and
+             * lets the whole composite (HID + UAC2 included) connect. Gating the
+             * open on the UDC state deadlocked exactly that: no attach without
+             * the open, no open without the attach.
              */
-            if (!udc_host_attached()) {
-                if (!logged_waiting) {
-                    logged_waiting = true;
-                    trace_lifecycle("uvc waiting: no host on the UDC");
-                }
-                if (!wait_ms(stop, 150)) break;
-                continue;
-            }
             const bool verbose = (open_attempt++ % 25) == 0;
             if (!open_uvc_node(node, video, ctl, verbose)) {
                 trace_lifecycle("uvc open failed, retry in %d ms", open_backoff_ms);

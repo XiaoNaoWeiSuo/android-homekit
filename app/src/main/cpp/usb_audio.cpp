@@ -402,6 +402,7 @@ void mic_worker(std::shared_ptr<WorkerCtx> ctx) {
     int16_t stereo[kPeriodFrames * kAppChannels];
     size_t filled = 0;
     int client = -1;
+    int error_streak = 0;
 
     while (!ctx->stop->load() && !ctx->failed.load()) {
         if (client < 0) {
@@ -442,13 +443,39 @@ void mic_worker(std::shared_ptr<WorkerCtx> ctx) {
             int w = pcm_transfer(alsa, /*write=*/true, h, const_cast<void *>(data),
                                  kPeriodFrames, channels);
             if (w < 0) {
-                const char *err = alsa.error_fn(h);
-                LOGW("pcm_write: %s (%d)", err ? err : "error", w);
-                if (!pcm_recover(alsa, h, w)) {
+                const int saved = errno;
+                /*
+                 * EIO simply means the host is not recording right now: the
+                 * gadget PCM has no consumer. tinyalsa returns the negative errno
+                 * as the result instead of setting errno, so check both. Tearing
+                 * the worker down for this reset the app's socket every few
+                 * seconds.
+                 */
+                if (w == -EIO || saved == EIO) {
+                    if (alsa.prepare_fn) alsa.prepare_fn(h);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
+                if (++error_streak <= 1 || error_streak % 100 == 0) {
+                    const char *err = alsa.error_fn(h);
+                    LOGW("pcm_write: %s (%d) streak=%d", err ? err : "error", w, error_streak);
+                }
+                if (alsa.prepare_fn) alsa.prepare_fn(h);
+                /*
+                 * EBUSY / an idle gadget PCM happens continuously while the host
+                 * is not recording. Teardown is only justified when the card is
+                 * actually gone; anything else just resets the app's socket.
+                 */
+                if (error_streak % 20 == 0 && find_uac2_card() < 0) {
+                    LOGW("pcm_write: UAC2 card gone; re-probing");
                     ctx->failed.store(true);
                     break;
                 }
-            } else if (static_cast<unsigned>(w) < kPeriodFrames) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            error_streak = 0;
+            if (static_cast<unsigned>(w) < kPeriodFrames) {
                 LOGW("pcm_write short write: %d/%u frames", w, kPeriodFrames);
             }
             continue;
@@ -473,6 +500,7 @@ void spk_worker(std::shared_ptr<WorkerCtx> ctx) {
     int16_t in[kPeriodFrames * kAppChannels];
     int16_t out[kPeriodFrames * kAppChannels];
     int client = -1;
+    int error_streak = 0;
 
     while (!ctx->stop->load() && !ctx->failed.load()) {
         if (client < 0) {
@@ -482,14 +510,28 @@ void spk_worker(std::shared_ptr<WorkerCtx> ctx) {
 
         int n = pcm_transfer(alsa, /*write=*/false, h, in, kPeriodFrames, channels);
         if (n < 0) {
-            const char *err = alsa.error_fn(h);
-            LOGW("pcm_read: %s (%d)", err ? err : "error", n);
-            if (!pcm_recover(alsa, h, n)) {
+            const int saved = errno;
+            // Host not playing: no consumer on the gadget PCM. tinyalsa returns
+            // -EIO rather than setting errno. Idle, do not die.
+            if (n == -EIO || saved == EIO) {
+                if (alsa.prepare_fn) alsa.prepare_fn(h);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            if (++error_streak <= 1 || error_streak % 100 == 0) {
+                const char *err = alsa.error_fn(h);
+                LOGW("pcm_read: %s (%d) streak=%d", err ? err : "error", n, error_streak);
+            }
+            if (alsa.prepare_fn) alsa.prepare_fn(h);
+            if (error_streak % 20 == 0 && find_uac2_card() < 0) {
+                LOGW("pcm_read: UAC2 card gone; re-probing");
                 ctx->failed.store(true);
                 break;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
+        error_streak = 0;
         if (n == 0) {  // a blocking read cannot return empty; never spin on it
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
