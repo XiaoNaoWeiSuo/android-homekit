@@ -135,6 +135,12 @@ class UsbVideoSource(
     /* Diagnostics: how fast the camera actually hands frames over. */
     private var lastArrivalNanos = 0L
     private var arrivalLogs = 0
+    /* Switch diagnostics: elapsed time of the start request that is running,
+     * plus the first-frame counters used to show where a source change slows
+     * down (release, open, configure, first payload). */
+    private var startAtMillis = 0L
+    private var firstFrameLogged = false
+    @Volatile private var lastLuma = 0
 
     /**
      * Applies the frame size the host committed in the UVC handshake. A camera
@@ -231,7 +237,12 @@ class UsbVideoSource(
         checkNotNull(worker) { "UsbVideoSource worker handler is missing" }
 
     private fun startCameraOnWorker(source: Source, gen: Long) {
+        startAtMillis = SystemClock.elapsedRealtime()
+        firstFrameLogged = false
+        lastLuma = 0
+        Log.i(TAG, "USB_CAMERA_START source=$source gen=$gen target=${targetWidth}x${targetHeight}")
         releaseAllOnWorker()
+        Log.i(TAG, "USB_CAMERA_RELEASED after ${sinceStart()}ms")
         if (gen != generation.get()) return
         lastFrameNanos = 0L
 
@@ -306,6 +317,7 @@ class UsbVideoSource(
         try {
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
+                    Log.i(TAG, "USB_CAMERA_OPENED after ${sinceStart()}ms")
                     if (gen != generation.get()) {
                         device.close()
                         return
@@ -377,6 +389,7 @@ class UsbVideoSource(
                             return
                         }
                         captureSession = session
+                        Log.i(TAG, "USB_CAMERA_SESSION_READY after ${sinceStart()}ms")
                         try {
                             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                             request.addTarget(reader.surface)
@@ -420,9 +433,18 @@ class UsbVideoSource(
             }
             lastArrivalNanos = arrival
 
+            if (!firstFrameLogged) {
+                firstFrameLogged = true
+                Log.i(TAG, "USB_CAMERA_FRAME1 after ${sinceStart()}ms luma=${meanLuma(image)}")
+            }
+
             val now = arrival
             if (now - lastFrameNanos < MIN_FRAME_GAP_NANOS) return
             lastFrameNanos = now
+            /* Steady-state brightness, reported once a second with the stats. A
+             * source that keeps sending frames but stays dark (auto exposure
+             * still settling, or a covered lens) is visible here. */
+            lastLuma = meanLuma(image)
 
             val width = image.width
             val height = image.height
@@ -668,11 +690,13 @@ class UsbVideoSource(
         val elapsed = now - statsSince
         if (elapsed < 2_000) return
         val fps = statsFrames * 1_000.0 / elapsed
+        val luma = lastLuma
         Log.i(
             TAG,
             "USB_VIDEO_STATS ${targetWidth}x${targetHeight} fps=${String.format("%.1f", fps)} " +
                 "q=$jpegQuality avg=${statsBytes / statsFrames / 1024}KB " +
-                "enc=${String.format("%.1f", statsCostMs.toDouble() / statsFrames)}ms"
+                "enc=${String.format("%.1f", statsCostMs.toDouble() / statsFrames)}ms" +
+                if (luma > 0) " luma=$luma" else ""
         )
         statsSince = now
         statsFrames = 0
@@ -809,10 +833,41 @@ class UsbVideoSource(
 
     private fun fail(gen: Long, message: String) {
         if (gen != generation.get() || failedGeneration == gen) return
+        Log.w(TAG, "USB_CAMERA_FAILED after ${sinceStart()}ms: $message")
         failedGeneration = gen
         running = false
         releaseAllOnWorker()
         reportError(message)
+    }
+
+    /** Milliseconds since the start request that is currently running. */
+    private fun sinceStart(): Long =
+        if (startAtMillis == 0L) -1L else SystemClock.elapsedRealtime() - startAtMillis
+
+    /**
+     * Mean luma of a captured frame, sampled rather than summed over every
+     * pixel. A source that is producing frames but black (auto exposure still
+     * settling) reads near 0, which separates "no frames" from "dark frames"
+     * when diagnosing a slow switch.
+     */
+    private fun meanLuma(image: Image): Int {
+        return try {
+            val plane = image.planes[0]
+            val buffer = plane.buffer
+            val step = maxOf(1, buffer.remaining() / 4096)
+            var sum = 0L
+            var samples = 0
+            var index = 0
+            val limit = buffer.limit()
+            while (index < limit) {
+                sum += buffer.get(index).toInt() and 0xFF
+                samples++
+                index += step
+            }
+            if (samples == 0) -1 else (sum / samples).toInt()
+        } catch (e: Exception) {
+            -1
+        }
     }
 
     private fun reportError(message: String) {
