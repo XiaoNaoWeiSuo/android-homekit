@@ -41,6 +41,13 @@ class UsbVideoLink(private val token: String) {
     @Volatile private var output: BufferedOutputStream? = null
     @Volatile private var connected = false
 
+    /**
+     * Set from the daemon's `MODE <w> <h>` line: the frame size the host
+     * committed in the UVC PROBE/COMMIT handshake. Frames must match it, since
+     * the host has already told its decoder what to expect.
+     */
+    @Volatile var onMode: ((width: Int, height: Int) -> Unit)? = null
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
         worker = Thread({ loop() }, "usb-video").apply {
@@ -114,12 +121,37 @@ class UsbVideoLink(private val token: String) {
             socket = newSocket
             output = newOut
             connected = true
+            startReader(newSocket)
             Log.i(TAG, "USB_VIDEO_CONNECTED port=$PORT")
             newOut
         } catch (e: Exception) {
             if (connected) Log.i(TAG, "USB_VIDEO_CONNECT_FAILED ${e.message}")
             connected = false
             null
+        }
+    }
+
+    /** Reads the daemon's one-way control lines (`MODE w h`). */
+    private fun startReader(sock: Socket) {
+        Thread({
+            try {
+                val reader = sock.getInputStream().bufferedReader(Charsets.US_ASCII)
+                while (running.get()) {
+                    val line = reader.readLine() ?: break
+                    if (!line.startsWith("MODE ")) continue
+                    val parts = line.trim().split(' ')
+                    if (parts.size < 3) continue
+                    val width = parts[1].toIntOrNull() ?: continue
+                    val height = parts[2].toIntOrNull() ?: continue
+                    if (width <= 0 || height <= 0) continue
+                    Log.i(TAG, "USB_VIDEO_MODE ${width}x${height}")
+                    onMode?.invoke(width, height)
+                }
+            } catch (_: Exception) {
+            }
+        }, "usb-video-rx").apply {
+            isDaemon = true
+            start()
         }
     }
 
