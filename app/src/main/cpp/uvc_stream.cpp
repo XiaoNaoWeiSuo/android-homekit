@@ -157,8 +157,10 @@ static_assert(sizeof(UvcStreamingControl) == 34, "uvc_streaming_control ABI mism
  * Small helpers
  * ------------------------------------------------------------------------- */
 
-static const int kWidth = 640;
-static const int kHeight = 480;
+static const int kWidth = 1280;
+static const int kHeight = 720;
+/* Upper bound for one MJPEG frame; the real size is sent per frame. */
+static const size_t kMjpegMaxBytes = 300000;
 static const size_t kHeaderSize = 22; /* MRV1 header */
 static const uint32_t kMaxPayload = 64u * 1024u * 1024u;
 static const uint32_t kFrameInterval = 333333; /* 100 ns units, 30 fps */
@@ -209,6 +211,7 @@ struct VideoNode {
     unsigned width = 0;
     unsigned height = 0;
     size_t frame_bytes = 0;
+    bool jpeg = false; /* V4L2 format is MJPEG: payload is passed through */
     bool streaming = false;
     bool dead = false;
 };
@@ -306,8 +309,10 @@ static void queue_blank(VideoNode &v, unsigned index) {
     if (v.fd < 0 || index >= v.nbufs || index >= kBufferCount) return;
     if (!v.buffers[index].start || v.buffers[index].len == 0) return;
 
-    const size_t bytes = std::min(v.buffers[index].len, v.frame_bytes);
-    fill_black(v.buffers[index].start, bytes);
+    // For MJPEG the buffer holds a JPEG of arbitrary length; an empty frame is
+    // the only safe placeholder because black YUYV bytes are not a valid JPEG.
+    const size_t bytes = v.jpeg ? 0 : std::min(v.buffers[index].len, v.frame_bytes);
+    if (!v.jpeg) fill_black(v.buffers[index].start, bytes);
 
     struct v4l2_buffer buf;
     memset(&buf, 0, sizeof buf);
@@ -473,25 +478,26 @@ static bool open_uvc_node(const char *node, VideoNode &v, UvcControlState &st, b
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     fmt.fmt.pix.width = kWidth;
     fmt.fmt.pix.height = kHeight;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix.bytesperline = kWidth * 2;
-    fmt.fmt.pix.sizeimage = kWidth * kHeight * 2;
+    fmt.fmt.pix.bytesperline = 0;
+    fmt.fmt.pix.sizeimage = (uint32_t)kMjpegMaxBytes;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
         if (verbose) LOGW("UVC: %s S_FMT: %s", v.path, strerror(errno));
         release_node(v);
         return false;
     }
-    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV || fmt.fmt.pix.width < 2 ||
-        fmt.fmt.pix.height < 1 || (fmt.fmt.pix.width & 1)) {
-        LOGW("UVC: %s rejected YUYV %dx%d (got fmt 0x%08x %ux%u)", v.path, kWidth, kHeight,
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG || fmt.fmt.pix.width < 2 ||
+        fmt.fmt.pix.height < 1) {
+        LOGW("UVC: %s rejected MJPEG %dx%d (got fmt 0x%08x %ux%u)", v.path, kWidth, kHeight,
              fmt.fmt.pix.pixelformat, fmt.fmt.pix.width, fmt.fmt.pix.height);
         release_node(v);
         return false;
     }
     v.width = fmt.fmt.pix.width;
     v.height = fmt.fmt.pix.height;
-    v.frame_bytes = (size_t)v.width * (size_t)v.height * 2;
+    v.frame_bytes = fmt.fmt.pix.sizeimage;
+    v.jpeg = true;
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof req);
@@ -1001,7 +1007,7 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
         stats.drops.not_streaming++;
         return;
     }
-    if (sw < 1 || sh < 1 || format > 1) {
+    if (sw < 1 || sh < 1 || format > 2) {
         stats.drops.bad++;
         return;
     }
@@ -1019,8 +1025,12 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
         return;
     }
 
-    if (buf.index >= v.nbufs || buf.index >= kBufferCount || !v.buffers[buf.index].start ||
-        v.buffers[buf.index].len < v.frame_bytes) {
+    if (buf.index >= v.nbufs || buf.index >= kBufferCount || !v.buffers[buf.index].start) {
+        stats.drops.bad++;
+        queue_blank(v, buf.index);
+        return;
+    }
+    if (!v.jpeg && v.buffers[buf.index].len < v.frame_bytes) {
         stats.drops.bad++;
         queue_blank(v, buf.index);
         return;
@@ -1034,15 +1044,26 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
         return;
     }
 
-    if (!convert_frame(map, payload, length, sw, sh, format,
-                       static_cast<uint8_t *>(v.buffers[buf.index].start), (int)v.width,
-                       (int)v.height)) {
-        stats.drops.bad++;
-        queue_blank(v, buf.index);
-        return;
+    if (v.jpeg) {
+        // The app already produced a JPEG; send it as-is with its real length.
+        size_t n = length < v.buffers[buf.index].len ? length : v.buffers[buf.index].len;
+        if (n < 4) {
+            stats.drops.bad++;
+            queue_blank(v, buf.index);
+            return;
+        }
+        memcpy(v.buffers[buf.index].start, payload, n);
+        buf.bytesused = (uint32_t)n;
+    } else {
+        if (!convert_frame(map, payload, length, sw, sh, format,
+                           static_cast<uint8_t *>(v.buffers[buf.index].start), (int)v.width,
+                           (int)v.height)) {
+            stats.drops.bad++;
+            queue_blank(v, buf.index);
+            return;
+        }
+        buf.bytesused = (uint32_t)v.frame_bytes;
     }
-
-    buf.bytesused = (uint32_t)v.frame_bytes;
     buf.field = V4L2_FIELD_NONE;
     buf.flags = 0;
     // Diagnostic: prove what is actually in the mmap buffer at QBUF time.
