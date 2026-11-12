@@ -1104,6 +1104,19 @@ static void handle_frame(VideoNode &v, FrameMap &map, const uint8_t *payload, si
             queue_blank(v, buf.index);
             return;
         }
+        /*
+         * Validate the JPEG framing before it reaches the host. A truncated or
+         * half-written frame (SOI/EOI missing) is decoded as stripe garbage and
+         * is exactly what a camera-source switch used to leave on screen, so
+         * drop it and let the next good frame take the slot.
+         */
+        const bool has_soi = payload[0] == 0xFF && payload[1] == 0xD8;
+        const bool has_eoi = payload[n - 2] == 0xFF && payload[n - 1] == 0xD9;
+        if (!has_soi || !has_eoi) {
+            stats.drops.bad++;
+            queue_blank(v, buf.index);
+            return;
+        }
         memcpy(v.buffers[buf.index].start, payload, n);
         buf.bytesused = (uint32_t)n;
     } else {

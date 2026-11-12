@@ -67,7 +67,7 @@ if [ "__ENABLE_CAMERA__" = "1" ]; then
   # function's deactivate path goes through percpu_ref + RCU, and tearing it
   # down repeatedly has produced three different panics. Rebuild only when the
   # descriptor set below actually changed; a plain off/on cycle reuses it.
-  UVC_VER=3
+  UVC_VER=4
   if [ -L $F/streaming/header/h/m ] && \
      [ "$(cat /data/local/tmp/uvc_desc.ver 2>/dev/null)" = "$UVC_VER" ] && \
      [ -s /data/local/tmp/uvc_modes.txt ]; then
@@ -129,11 +129,13 @@ if [ "__ENABLE_CAMERA__" = "1" ]; then
     # reliably readable right after mkdir, so record the position we just used.
     echo "$af_num $af_w $af_h $af_buf" >> /data/local/tmp/uvc_modes.txt
   }
+  # Portrait rungs only. A landscape canvas made the app rotate by
+  # sensor-90 and resample, which is what showed the scene lying on its side
+  # and produced stripe artefacts after a camera switch. With only portrait
+  # modes the host must pick one, the app rotates by sensorOrientation (the
+  # canonical mapping) and encodes straight into the negotiated canvas.
   add_frame p1080 1080 1920 400000
   add_frame p720 720 1280 250000
-  add_frame l1080 1920 1080 400000
-  add_frame l720 1280 720 250000
-  add_frame l1440 2560 1440 700000
   mkdir -p $F/streaming/header/h
   ( cd $F/streaming/header/h && ln -s ../../mjpeg/m m )
   if [ ! -L $F/streaming/header/h/m ]; then
