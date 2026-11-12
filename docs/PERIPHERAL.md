@@ -125,7 +125,10 @@ HID_CONNECTION state=2 device=<host> name=<host name>
 * 设备与手感设置移到统一设置页，三级结构：
   设置 → **蓝牙键鼠**（设备名 / 允许被发现 / 重连 / 重置蓝牙 / 灵敏度 / 鼠标 DPI /
   USB 回报率 / 低延迟保活 / 拖尾轨迹 / 按键音效 / 按键触感）→ **按键触感**（启用、强度、试一下）。
-* 按键触感：每次按键 8 ms 单次震动，振幅按强度百分比（默认 30%），走 `VIBRATE`。
+* 按键触感:马达不支持组合原语(`mSupportedPrimitives=[]`),但支持系统预置瞬态
+  `CLICK / TICK / HEAVY_CLICK`。因此按键时优先播放预置效果(厂商为该马达调过,落地感清脆),
+  强度滑块映射为:≤20 TICK(轻)、≤70 CLICK(清脆,默认 30)、>70 HEAVY_CLICK(更实);
+  预置不可用时回退 4 ms 硬起振 + 3 ms 衰减的波形。
 * 连接成功时发送高优先级 heads-up 通知（通道 `peripheral_connected`，点击直达沉浸模式）。
 
 键鼠界面规则（`PeripheralPadActivity`）：

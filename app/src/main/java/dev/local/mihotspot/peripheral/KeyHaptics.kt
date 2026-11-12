@@ -2,16 +2,25 @@ package dev.local.mihotspot.peripheral
 
 import android.content.Context
 import android.os.Build
+import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 
 /**
- * Very light per-key vibration for the on-screen keyboard.
+ * Light per-key feedback for the on-screen keyboard.
  *
- * Uses a short one-shot with a configurable amplitude instead of the system
- * KEYBOARD_TAP constant, because the system feedback is either absent (when the
- * user disabled touch sounds/haptics) or far too strong on HyperOS.
+ * This phone's linear motor does not expose composition primitives, but it does
+ * advertise the pre-baked transients CLICK / TICK / HEAVY_CLICK. Those are tuned
+ * for this actuator and feel like a crisp collision, while a short
+ * `createOneShot` amplitude ramp feels soft because the motor needs time to
+ * spool up. So the preferred path is a pre-baked effect; a hard-attack waveform
+ * is only the fallback.
+ *
+ * The strength setting maps to three transients:
+ *   <= 20  TICK         (light)
+ *   <= 70  CLICK        (crisp, default)
+ *   >  70  HEAVY_CLICK  (firmer bottom-out)
  */
 object KeyHaptics {
     const val KEY_ENABLED = "key_haptics_enabled"
@@ -36,13 +45,47 @@ object KeyHaptics {
         if (!isEnabled(context)) return
         val vibrator = vibrator(context) ?: return
         if (!vibrator.hasVibrator()) return
-        val amplitude = (255 * strength(context) / 100).coerceIn(1, 255)
+        val strength = strength(context)
+        if (playPredefined(vibrator, strength)) return
+        playFallback(vibrator, strength)
+    }
+
+    private fun playPredefined(vibrator: Vibrator, strength: Int): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        return try {
+            val effect = when {
+                strength <= 20 -> VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK)
+                strength <= 70 -> VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)
+                else -> VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK)
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                vibrator.vibrate(
+                    effect,
+                    VibrationAttributes.createForUsage(VibrationAttributes.USAGE_TOUCH)
+                )
+            } else {
+                vibrator.vibrate(effect)
+            }
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Pre-baked transients unavailable: a 4 ms attack still beats an 8 ms ramp. */
+    private fun playFallback(vibrator: Vibrator, strength: Int) {
         try {
-            if (Build.VERSION.SDK_INT >= 26) {
-                vibrator.vibrate(VibrationEffect.createOneShot(8L, amplitude))
+            if (Build.VERSION.SDK_INT >= 26 && vibrator.hasAmplitudeControl()) {
+                val amplitude = (255 * strength / 100).coerceIn(1, 255)
+                val effect = VibrationEffect.createWaveform(
+                    longArrayOf(0, 4, 3),
+                    intArrayOf(0, amplitude, 0),
+                    -1
+                )
+                vibrator.vibrate(effect)
             } else {
                 @Suppress("DEPRECATION")
-                vibrator.vibrate(8L)
+                vibrator.vibrate(6L)
             }
         } catch (e: Exception) {
             // A missing VIBRATE permission or a vendor-restricted motor is not
