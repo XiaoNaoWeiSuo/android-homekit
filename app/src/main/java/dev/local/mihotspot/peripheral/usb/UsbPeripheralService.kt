@@ -503,6 +503,26 @@ class UsbPeripheralService : Service() {
             UsbHub.link(this).start()
             running = true
             hostAttached = status.bound
+            /*
+             * Adopting means this service now owns the composition - but only if
+             * the gadget is still bound. After a physical unplug with UVC active
+             * the kernel unbinds the whole composite on its own, and claiming
+             * ownership of a gadget that is already gone is what left the UI
+             * reporting a session that no longer existed.
+             */
+            lastCamera = runCatching {
+                UsbCameraSource.valueOf(
+                    UsbSession.prefs(this).getString(
+                        UsbSession.KEY_CAMERA_SOURCE, UsbCameraSource.OFF.name
+                    ) ?: UsbCameraSource.OFF.name
+                )
+            }.getOrDefault(UsbCameraSource.OFF)
+            lastAudio = UsbSession.prefs(this).getBoolean(UsbSession.KEY_AUDIO, false)
+            provisioned = status.gadgetBound
+            if (provisioned) {
+                provisionedAt = SystemClock.elapsedRealtime()
+                teardownOnDestroy = true
+            }
             startHostWatch()
             // The video/audio pipelines cannot be restored without re-running the
             // provisioning script, so say so instead of leaving a silent black
@@ -783,7 +803,7 @@ class UsbPeripheralService : Service() {
              * "host plugged in" detector, and the next attach triggers a fresh
              * takeover - the order that has always worked.
              */
-            if (!attached && provisioned && !provisioning) {
+            if (!attached && (provisioned || !status.gadgetBound) && !provisioning) {
                 val settled = SystemClock.elapsedRealtime() - provisionedAt
                 if (settled < 6000L) {
                     Log.i(TAG, "USB_DETACH_IGNORED_SETTLING settled=${settled}ms")
@@ -981,9 +1001,13 @@ class UsbPeripheralService : Service() {
         hostAttached: Boolean? = null,
         hint: String? = null
     ) {
-        // Only session-lifecycle states define "is USB usable"; ancillary
-        // broadcasts (camera_error) must not hide the peripheral entry.
-        if (state == "ready" || state == "waiting" || state == "error") {
+        // Session-lifecycle states define "is USB usable"; ancillary broadcasts
+        // (camera_error) must not hide the peripheral entry. `armed` and
+        // `armed_stop` are lifecycle states too - dropping them here left the UI
+        // reading a stale "ready" after a real unplug.
+        if (state == "ready" || state == "waiting" || state == "error" ||
+            state == "armed" || state == "armed_stop"
+        ) {
             UsbPeripheralStatus.onServiceState(this, state, detail, hostAttached, hint)
         }
         sendBroadcast(

@@ -120,7 +120,9 @@ class UsbGadgetController(private val context: Context) {
         /** stop.sh refused to run because a host currently holds the gadget. */
         val preflightStop: Boolean = false,
         /** The controller never attached while VBUS was live: port is stuck. */
-        val portWedged: Boolean = false
+        val portWedged: Boolean = false,
+        /** True while our gadget still owns the UDC binding (g1/UDC non-empty). */
+        val gadgetBound: Boolean = false
     ) {
         val bound: Boolean
             get() = state == "configured" || state == "addressed" || state == "powered"
@@ -155,6 +157,7 @@ class UsbGadgetController(private val context: Context) {
         val command = """
             echo STATE=${'$'}(cat $UDC 2>/dev/null)
             echo VBUS=${'$'}(cat /sys/class/power_supply/usb/online 2>/dev/null)
+            echo GBOUND=${'$'}(cat /config/usb_gadget/g1/UDC 2>/dev/null)
             echo HID=${'$'}(cat /config/usb_gadget/g1/functions/hid.marionette/dev 2>/dev/null)
             echo VIDEO=${'$'}(for v in /sys/class/video4linux/video*; do [ "${'$'}(cat ${'$'}v/name 2>/dev/null)" = "dwc3-gadget" ] && echo /dev/${'$'}(basename ${'$'}v); done | head -1)
             echo CARD=${'$'}(grep -q UAC2Gadget /proc/asound/cards 2>/dev/null && echo UAC2Gadget)
@@ -179,7 +182,8 @@ class UsbGadgetController(private val context: Context) {
             vbusPresent = value("VBUS") == "1",
             preflightAttached = out.contains("PREFLIGHT=host-attached"),
             preflightStop = out.contains("PREFLIGHT=host-attached-stop"),
-            portWedged = out.contains("PORT=wedged")
+            portWedged = out.contains("PORT=wedged"),
+            gadgetBound = value("GBOUND") != null
         )
     }
 
