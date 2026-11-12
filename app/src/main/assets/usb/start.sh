@@ -38,34 +38,74 @@ HIDDEV=$(cat $H/dev 2>/dev/null)
 HIDMINOR=${HIDDEV#*:}
 HIDNODE=/dev/hidg$HIDMINOR
 
-# ---- UVC: 1280x720 MJPEG@30 ----
+# ---- UVC: MJPEG frame ladder @30 ----
 # USB 2.0 (this port enumerates as high-speed through the adapter) tops out at
-# ~24.6 MB/s for one isoc endpoint. Uncompressed 720p needs 55 MB/s and native
-# 1080x2400 needs 155 MB/s, so the only way to carry 720p is a compressed UVC
-# format; MJPEG is supported by macOS and Windows without extra drivers.
+# ~24.6 MB/s for one isoc endpoint, so the payload must stay compressed; MJPEG is
+# decoded by macOS and Windows with no extra driver. Several frame sizes are
+# advertised in one format so the host can pick a rung and the user can find
+# where the link or the encoder gives up.
 if [ "__ENABLE_CAMERA__" = "1" ]; then
   # f_uvc freezes its streaming descriptors on first bind: after that, configfs
   # answers EBUSY to any new format link even once the UDC is cleared, so a
   # gadget provisioned by an older script can never gain MJPEG in place. Drop
   # the whole function and build it again from scratch every time.
-  # (rm -rf fails on configfs: it unlinks attributes first and gets EPERM. Walk
-  # the tree deepest-first and rmdir instead.)
+  # The order matters: frame attributes are only writable while the format is
+  # not yet linked into streaming/header/h. If the links from a previous run
+  # survive, rmdir leaves them behind, mkdir re-creates the frames with kernel
+  # defaults (640x360) and every wWidth write below is rejected with EBUSY.
+  # So: unlink first, then remove directories deepest-first.
+  # (rm -rf fails on configfs anyway: it unlinks attributes first and gets EPERM.)
+  find $F -type l -delete 2>/dev/null
   for d in $(find $F -mindepth 1 -depth -type d 2>/dev/null); do rmdir "$d" 2>/dev/null; done
   rmdir $F 2>/dev/null
+  if [ -d $F/streaming ]; then
+    echo "UVC_REBUILD_FAILED stale tree under $F" > /data/local/tmp/uvc_link.log
+  fi
   mkdir $F 2>/dev/null
   mkdir -p $F/control/header/h
   [ -L $F/control/class/fs/h ] || ( cd $F/control/class/fs && ln -s ../../header/h h )
   [ -L $F/control/class/ss/h ] || ( cd $F/control/class/ss && ln -s ../../header/h h )
-  mkdir -p $F/streaming/mjpeg/m/720p
-  D=$F/streaming/mjpeg/m/720p
-  echo 1280 > $D/wWidth 2>/dev/null
-  echo 720 > $D/wHeight 2>/dev/null
-  # Upper bound for one JPEG; the daemon reports the real size per frame.
-  echo 300000 > $D/dwMaxVideoFrameBufferSize 2>/dev/null
-  echo 147456000 > $D/dwMinBitRate 2>/dev/null
-  echo 147456000 > $D/dwMaxBitRate 2>/dev/null
-  echo 333333 > $D/dwDefaultFrameInterval 2>/dev/null
-  echo 333333 > $D/dwFrameInterval 2>/dev/null
+  # Frame ladder. The kernel numbers frames in creation order (bFrameIndex
+  # 1,2,3...), so the first entry here is also the host's default. Portrait
+  # rungs come first: the phone is normally held upright, and a landscape canvas
+  # of a portrait scene is what made the camera picture look sideways.
+  # The table is read by the daemon so it can tell the app which rung the host
+  # committed (MODE <w> <h> on the video socket).
+  M=$F/streaming/mjpeg/m
+  mkdir -p $M
+  : > /data/local/tmp/uvc_modes.txt
+  af_num=0
+  add_frame() {
+    af_name=$1; af_w=$2; af_h=$3; af_buf=$4
+    af_num=$((af_num + 1))
+    af_dir=$M/$af_name
+    mkdir -p $af_dir
+    echo $af_w > $af_dir/wWidth 2>/dev/null
+    echo $af_h > $af_dir/wHeight 2>/dev/null
+    # Upper bound for one JPEG at this size; the daemon sends the real length.
+    echo $af_buf > $af_dir/dwMaxVideoFrameBufferSize 2>/dev/null
+    # Declared bandwidth must stay inside what one high-speed isoc endpoint can
+    # carry (3072 bytes per microframe, ~196 Mbit/s). Derive it from the frame
+    # bound at the 30 fps we ask for; an invented w*h*160 figure made 2560x1440
+    # claim 590 Mbit/s and macOS refused to open the device at all.
+    echo $((af_buf * 240)) > $af_dir/dwMaxBitRate 2>/dev/null
+    echo $((af_buf * 120)) > $af_dir/dwMinBitRate 2>/dev/null
+    echo 333333 > $af_dir/dwDefaultFrameInterval 2>/dev/null
+    echo 333333 > $af_dir/dwFrameInterval 2>/dev/null
+    af_idx=$(cat $af_dir/bFrameIndex 2>/dev/null)
+    af_ok=$(cat $af_dir/wWidth 2>/dev/null)
+    if [ "$af_ok" != "$af_w" ]; then
+      echo "UVC_FRAME_WRITE_FAILED $af_name wanted=$af_w got=$af_ok" >> /data/local/tmp/uvc_link.log
+    fi
+    # The kernel numbers frames in creation order, and bFrameIndex is not
+    # reliably readable right after mkdir, so record the position we just used.
+    echo "$af_num $af_w $af_h $af_buf" >> /data/local/tmp/uvc_modes.txt
+  }
+  add_frame p1080 1080 1920 400000
+  add_frame p720 720 1280 250000
+  add_frame l1080 1920 1080 400000
+  add_frame l720 1280 720 250000
+  add_frame l1440 2560 1440 700000
   mkdir -p $F/streaming/header/h
   ( cd $F/streaming/header/h && ln -s ../../mjpeg/m m )
   if [ ! -L $F/streaming/header/h/m ]; then

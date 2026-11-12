@@ -43,6 +43,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <linux/usb/ch9.h>
@@ -159,14 +160,40 @@ static_assert(sizeof(UvcStreamingControl) == 34, "uvc_streaming_control ABI mism
 
 static const int kWidth = 1280;
 static const int kHeight = 720;
-/* Upper bound for one MJPEG frame; the real size is sent per frame. */
-static const size_t kMjpegMaxBytes = 300000;
+/* Upper bound for one MJPEG frame; the real size is sent per frame. Must match
+ * the largest dwMaxVideoFrameBufferSize in the gadget's frame ladder. */
+static const size_t kMjpegMaxBytes = 800000;
 static const size_t kHeaderSize = 22; /* MRV1 header */
 static const uint32_t kMaxPayload = 64u * 1024u * 1024u;
 static const uint32_t kFrameInterval = 333333; /* 100 ns units, 30 fps */
 static const uint32_t kMaxPayloadTransferSize = 3072; /* high-speed isoc */
 static const unsigned kBufferCount = 4;
 static const uint8_t kMagic[4] = {'M', 'R', 'V', '1'};
+
+/* One rung of the gadget's MJPEG frame ladder (see app/src/main/assets/usb/
+ * start.sh, which writes this table after creating the frames). */
+struct FrameMode {
+    unsigned index = 0;
+    unsigned w = 0;
+    unsigned h = 0;
+    unsigned bytes = 0;
+};
+
+static void load_modes(std::vector<FrameMode> &modes) {
+    modes.clear();
+    FILE *f = fopen("/data/local/tmp/uvc_modes.txt", "r");
+    if (!f) return;
+    unsigned index, w, h, bytes;
+    while (fscanf(f, "%u %u %u %u", &index, &w, &h, &bytes) == 4)
+        modes.push_back(FrameMode{index, w, h, bytes});
+    fclose(f);
+}
+
+static const FrameMode *find_mode(const std::vector<FrameMode> &modes, unsigned index) {
+    for (const FrameMode &m : modes)
+        if (m.index == index) return &m;
+    return nullptr;
+}
 
 static int xioctl(int fd, unsigned long request, void *arg) {
     int ret;
@@ -226,6 +253,12 @@ struct UvcControlState {
     uint8_t pending_entity = 0;
     uint8_t pending_cs = 0;
     unsigned setups = 0; /* diagnostics: first few class requests, then quiet */
+
+    /* Frame the host last committed. Bumped on every commit so the socket loop
+     * can tell the app to capture/encode at that size. */
+    unsigned mode_w = 0;
+    unsigned mode_h = 0;
+    unsigned mode_seq = 0;
 };
 
 struct Drops {
@@ -353,7 +386,7 @@ static void release_node(VideoNode &v) {
                 v.buffers[i].len = 0;
             }
         }
-        close(v.fd);
+        close_traced(v.fd, "uvc node");
         v.fd = -1;
     }
     v.nbufs = 0;
@@ -392,7 +425,7 @@ static bool resolve_node(const char *node, char *out, size_t cap) {
         if (fd < 0) continue;
         char name[128];
         const ssize_t got = read(fd, name, sizeof name - 1);
-        close(fd);
+        close_traced(fd, "sysfs video name");
         if (got <= 0) continue;
         name[got] = '\0';
         if (strstr(name, "dwc3-gadget") == nullptr) continue;
@@ -799,15 +832,33 @@ static void process_setup(UvcControlState &st, const VideoNode &v, const struct 
      */
 }
 
-static void process_event_data(UvcControlState &st, const VideoNode &v, const uvc_request_data &data) {
+static void process_event_data(UvcControlState &st, const VideoNode &v,
+                               const std::vector<FrameMode> &modes,
+                               const uvc_request_data &data) {
     if (st.pending == PENDING_PROBE || st.pending == PENDING_COMMIT) {
         if (data.length >= (int32_t)sizeof(UvcStreamingControl)) {
             UvcStreamingControl ctrl;
             memcpy(&ctrl, data.data, sizeof ctrl);
-            /* This descriptor exposes exactly one YUYV frame. */
+            /* Only one format (MJPEG) is linked, so bFormatIndex is always 1,
+             * but the host picks a frame from the ladder. Keep its choice: the
+             * app has to encode at exactly that size, and the daemon reports
+             * the real per-frame length anyway. */
             ctrl.bFormatIndex = 1;
-            ctrl.bFrameIndex = 1;
-            ctrl.dwMaxVideoFrameSize = (uint32_t)v.frame_bytes;
+            const FrameMode *mode = find_mode(modes, ctrl.bFrameIndex);
+            if (mode) {
+                ctrl.dwMaxVideoFrameSize = mode->bytes;
+                if (st.pending == PENDING_COMMIT &&
+                    (st.mode_w != mode->w || st.mode_h != mode->h)) {
+                    st.mode_w = mode->w;
+                    st.mode_h = mode->h;
+                    st.mode_seq++;
+                    LOGI("UVC: host committed %ux%u (frame %u)", mode->w, mode->h,
+                         mode->index);
+                }
+            } else {
+                ctrl.bFrameIndex = 1;
+                ctrl.dwMaxVideoFrameSize = (uint32_t)v.frame_bytes;
+            }
             if (ctrl.dwFrameInterval == 0 || ctrl.dwFrameInterval > 10000000u)
                 ctrl.dwFrameInterval = kFrameInterval;
             if (ctrl.dwMaxPayloadTransferSize == 0)
@@ -829,7 +880,7 @@ static void process_event_data(UvcControlState &st, const VideoNode &v, const uv
 }
 
 /* Returns false when the node is gone and must be closed/re-polled. */
-static bool drain_events(VideoNode &v, UvcControlState &st) {
+static bool drain_events(VideoNode &v, UvcControlState &st, const std::vector<FrameMode> &modes) {
     for (;;) {
         struct v4l2_event ev;
         memset(&ev, 0, sizeof ev);
@@ -862,6 +913,7 @@ static bool drain_events(VideoNode &v, UvcControlState &st) {
              * is bound again.
              */
             LOGI("UVC: host disconnected, recycling node");
+            trace_lifecycle("uvc host disconnected, recycling node");
             v.dead = true;
             return false;
         }
@@ -918,7 +970,7 @@ static bool drain_events(VideoNode &v, UvcControlState &st) {
         if (ev.type == UVC_EVENT_DATA) {
             uvc_event uev;
             memcpy(&uev, ev.u.data, sizeof uev);
-            process_event_data(st, v, uev.u.data);
+            process_event_data(st, v, modes, uev.u.data);
             continue;
         }
 
@@ -1162,21 +1214,47 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
     UvcControlState ctl;
     FrameMap map;
     Stats stats;
+    std::vector<FrameMode> modes;
+    load_modes(modes);
+    LOGI("UVC: %zu frame mode(s) known", modes.size());
     std::vector<uint8_t> rx;
     rx.reserve(1 << 16);
 
     int client_fd = -1;
+    unsigned sent_mode_seq = 0;
     int open_attempt = 0;
+    int open_backoff_ms = 200;
+    bool logged_waiting = false;
     auto last_stats = std::chrono::steady_clock::now();
 
     while (!stop->load()) {
         if (video.fd < 0) {
-            const bool verbose = (open_attempt++ % 25) == 0;
-            if (!open_uvc_node(node, video, ctl, verbose)) {
-                if (!wait_ms(stop, 200)) break;
+            /*
+             * The node stays enumerable while the cable is out, so opening it
+             * again would not fail - it would just churn open/close (and the
+             * close path is the one that panics this kernel). Wait for the
+             * host to actually come back instead.
+             */
+            if (!udc_host_attached()) {
+                if (!logged_waiting) {
+                    logged_waiting = true;
+                    trace_lifecycle("uvc waiting: no host on the UDC");
+                }
+                if (!wait_ms(stop, 150)) break;
                 continue;
             }
+            const bool verbose = (open_attempt++ % 25) == 0;
+            if (!open_uvc_node(node, video, ctl, verbose)) {
+                trace_lifecycle("uvc open failed, retry in %d ms", open_backoff_ms);
+                const int slept = open_backoff_ms;
+                open_backoff_ms = std::min(open_backoff_ms * 2, 2000);
+                if (!wait_ms(stop, slept)) break;
+                continue;
+            }
+            logged_waiting = false;
             open_attempt = 0;
+            open_backoff_ms = 200;
+            trace_lifecycle("uvc node opened: %s", video.path);
             rx.clear();
             last_stats = std::chrono::steady_clock::now();
         }
@@ -1214,7 +1292,7 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
          * never dequeued a single UVC_EVENT_SETUP, the host's PROBE/COMMIT
          * transfers timed out, and the camera never reached alt 1.
          */
-        if (!drain_events(video, ctl)) {
+        if (!drain_events(video, ctl, modes)) {
             LOGW("UVC: node lost, re-polling");
             release_node(video);
             rx.clear();
@@ -1241,6 +1319,24 @@ int uvc_run(const char *node, int port, const char *token, std::atomic<bool> *st
                 fcntl(client_fd, F_SETFD, FD_CLOEXEC);
                 rx.clear();
                 LOGI("UVC: client connected");
+            }
+        }
+
+        /* Tell the app which frame the host committed so it captures and
+         * encodes at exactly that size. Sent on connect and on every change. */
+        if (client_fd >= 0 && ctl.mode_seq != sent_mode_seq) {
+            char line[64];
+            const int len = snprintf(line, sizeof line, "MODE %u %u\n", ctl.mode_w, ctl.mode_h);
+            if (len > 0) {
+                const ssize_t wrote = send(client_fd, line, (size_t)len, MSG_NOSIGNAL);
+                if (wrote == len) {
+                    sent_mode_seq = ctl.mode_seq;
+                } else if (wrote < 0 && errno != EAGAIN && errno != EINTR) {
+                    LOGW("UVC: mode notify: %s", strerror(errno));
+                    close(client_fd);
+                    client_fd = -1;
+                    rx.clear();
+                }
             }
         }
 

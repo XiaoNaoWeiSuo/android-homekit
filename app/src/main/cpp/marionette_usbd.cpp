@@ -16,6 +16,24 @@ static std::atomic<bool> g_stop{false};
 
 static void on_signal(int) { g_stop.store(true); }
 
+/**
+ * The daemon is spawned from a root shell and inherits whatever that shell
+ * inherited. The panic trace of 2026-11-12 showed __fput() -> module_put()
+ * dying inside this process, and the gadget functions are all built in, so an
+ * inherited module-owned fd is a plausible source. Record what we start with.
+ */
+static void log_inherited_fds() {
+    for (int fd = 0; fd < 64; ++fd) {
+        char link[64];
+        char path[256];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        const ssize_t n = readlink(link, path, sizeof path - 1);
+        if (n <= 0) continue;
+        path[n] = '\0';
+        LOGI("fd inherited %d -> %s", fd, path);
+    }
+}
+
 // Weak fallbacks let the HID path build and run before the video/audio modules
 // land. The real implementations override these at link time.
 __attribute__((weak)) int uvc_run(const char *, int, const char *, std::atomic<bool> *) {
@@ -51,6 +69,7 @@ int main(int argc, char **argv) {
     signal(SIGHUP, on_signal);
 
     LOGI("daemon start hid=%s video=%s", hid_node, video_node);
+    log_inherited_fds();
     std::thread hid(usb_hid_run, hid_node, hid_port, token, &g_stop);
     std::thread video(uvc_run, video_node, video_port, token, &g_stop);
     std::thread audio(audio_run, mic_port, spk_port, token, &g_stop);

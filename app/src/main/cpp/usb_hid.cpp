@@ -164,6 +164,8 @@ int usb_hid_run(const char *node, int port, const char *token, std::atomic<bool>
 
     int hid_fd = -1;
     int client_fd = -1;
+    int hid_backoff_ms = 300;
+    bool hid_waiting_logged = false;
     uint8_t report[64];
 
     while (!stop->load()) {
@@ -175,12 +177,37 @@ int usb_hid_run(const char *node, int port, const char *token, std::atomic<bool>
             LOGI("HID client connected");
         }
         if (hid_fd < 0) {
-            hid_fd = open(node, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-            if (hid_fd < 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            /*
+             * Same rule as the UVC node: while the cable is out the node still
+             * exists but the host is gone, so opening it just to fail a write
+             * and close it again turns a flap into an open/close storm. Idle
+             * until the UDC reports a host.
+             */
+            if (!udc_host_attached()) {
+                if (!hid_waiting_logged) {
+                    hid_waiting_logged = true;
+                    trace_lifecycle("hidg waiting: no host on the UDC");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
+            hid_fd = open(node, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+            if (hid_fd < 0) {
+                /*
+                 * The gadget is re-created on every provisioning cycle, and
+                 * re-opening right after a teardown used to spin. Back off so
+                 * a flap cannot turn into an open/close storm.
+                 */
+                trace_lifecycle("hidg open failed (%s), retry in %d ms", strerror(errno),
+                                hid_backoff_ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(hid_backoff_ms));
+                hid_backoff_ms = std::min(hid_backoff_ms * 2, 2000);
+                continue;
+            }
+            hid_backoff_ms = 300;
+            hid_waiting_logged = false;
             LOGI("HID node open: %s", node);
+            trace_lifecycle("hidg opened: %s", node);
         }
 
         // 1-byte length + report. Reports are at most 8 bytes today, but keep
@@ -203,7 +230,7 @@ int usb_hid_run(const char *node, int port, const char *token, std::atomic<bool>
         if (!write_report(hid_fd, report, len, budget)) {
             LOGW("hidg write failed: %s", strerror(errno));
             if (errno == ENODEV || errno == ESHUTDOWN || errno == EINVAL) {
-                close(hid_fd);
+                close_traced(hid_fd, "hidg write failed");
                 hid_fd = -1;
             }
         }
@@ -211,7 +238,7 @@ int usb_hid_run(const char *node, int port, const char *token, std::atomic<bool>
 
     send_release_all(hid_fd);
     if (client_fd >= 0) close(client_fd);
-    if (hid_fd >= 0) close(hid_fd);
+    if (hid_fd >= 0) close_traced(hid_fd, "hidg shutdown");
     close(listen_fd);
     return 0;
 }
