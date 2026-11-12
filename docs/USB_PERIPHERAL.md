@@ -1,6 +1,6 @@
 # USB 外设（摄像头 / 麦克风 / 扬声器 / 键鼠）
 
-更新：2026-11-11
+更新：2026-11-12（视频已改为 1280x720 MJPEG；该改动**尚未上机验证**，详见 §12）
 
 目标：手机通过 **USB 标准类协议** 变成主机的外设，主机零安装、零驱动：
 
@@ -43,16 +43,21 @@ mkdir -p $F/control/header/h
 ln -s ../../header/h $F/control/class/fs/h
 ln -s ../../header/h $F/control/class/ss/h
 
-# --- UVC frame: 640x480 YUYV ---
-mkdir -p $F/streaming/uncompressed/u/640x480
-... wWidth/wHeight/dwFrameInterval/dwMaxVideoFrameBufferSize/dwMin|MaxBitRate ...
+# --- UVC frame: 1280x720 MJPEG@30 ---
+mkdir -p $F/streaming/mjpeg/m/720p
+D=$F/streaming/mjpeg/m/720p
+echo 1280 > $D/wWidth; echo 720 > $D/wHeight
+echo 300000 > $D/dwMaxVideoFrameBufferSize   # 单帧 JPEG 上限，实际长度按帧报告
+echo 147456000 > $D/dwMinBitRate; echo 147456000 > $D/dwMaxBitRate
+echo 333333 > $D/dwDefaultFrameInterval; echo 333333 > $D/dwFrameInterval
 mkdir -p $F/streaming/header/h
-ln -s ../../uncompressed/u $F/streaming/header/h/u
+ln -s ../../mjpeg/m $F/streaming/header/h/m
 ln -s ../../header/h $F/streaming/class/fs/h
 ln -s ../../header/h $F/streaming/class/hs/h
 ln -s ../../header/h $F/streaming/class/ss/h
-echo 3072 > $F/streaming_maxpacket   # 640x480@30 需要 3072
+echo 3072 > $F/streaming_maxpacket
 echo 1 > $F/streaming_interval
+echo 0 > $F/streaming_maxburst
 
 # --- 链接函数 ---
 cd $G/configs/b.1
@@ -112,14 +117,25 @@ App → 守护进程的二进制帧：
 magic   "MRV1"        4 bytes
 width   uint16 LE
 height  uint16 LE
-format  uint8          0 = NV21, 1 = RGBA8888
+format  uint8          0 = NV21, 1 = RGBA8888, 2 = 完整 JPEG
 flags   uint8          保留 0
 length  uint32 LE      payload 字节数
 pts     uint64 LE      纳秒
 payload ...
 ```
 
-守护进程把 NV21/RGBA 转成 UVC 当前协商的 YUYV（必要时 MJPEG 后续再加），按主机帧间隔写入 V4L2 output。主机未取流时丢弃帧，不阻塞。
+UVC 目前只暴露**一种**格式：`V4L2_PIX_FMT_MJPEG`、1280x720、单帧上限 300000 字节
+（`dwMaxVideoFrameBufferSize`，实际长度由每帧的 `bytesused` 给出）。
+
+- `format = 2`（JPEG）：守护进程**原样直通**到 V4L2 output，不做任何转码，`bytesused` = 真实 JPEG 长度。
+  这是 App 当前实际发送的格式（`UsbVideoSource` 在采集侧压到 1280x720 JPEG，quality 85）。
+- `format = 0/1`（NV21/RGBA）：旧路径，需要守护进程自己编码，当前 UVC 协商为 MJPEG，
+  这些裸帧**不会**被直接接受，仅作为历史兼容保留。
+- 占位/空帧：MJPEG 模式下 `queue_blank()` 提交 `bytesused = 0` 的空 buffer（不是填黑），
+  用来在主机取流前维持 buffer 循环；非 MJPEG 路径才会填黑。
+
+主机未取流时丢弃帧，不阻塞。为什么必须上 MJPEG：USB 2.0 单等时端点约 24.6 MB/s，
+裸 720p 需要 55 MB/s、原生 1080x2400 需要 155 MB/s，只有压缩格式能承载 720p。
 
 ### 4.3 音频（47833 麦克风，47834 扬声器）
 
@@ -158,14 +174,18 @@ payload ...
 **2026-11-11 实测（完整组合 HID + UVC + UAC2 同时绑定）**
 
 - HID：面板点一次 `q`，主机只收到一个字符，3 秒无重复。
-- UVC：**已验证可用**（2026-11-12）。灌入亮度 235 的 NV21 合成帧后，
+- UVC：**YUYV 640×480 路径已验证可用**（2026-11-12）。灌入亮度 235 的 NV21 合成帧后，
   `/data/local/tmp/uvc_qbuf.log` 记录 `len=614400 used=614400 y0=235 y1=235 y2=235 u=128 v=128`；
   主机 `ffprobe` 收到 **94 帧、640×480、约 39 fps**，首帧平均亮度 255。
+  - ⚠️ 该基线的格式（YUYV / 640×480 / 614400 字节帧）随后被 `519a4ee`、`56f8717`、`d5fb2d9`
+    改成了 **1280×720 MJPEG**，**新格式尚未上机复验**。判据不变：`uvc_qbuf.log` 的
+    `used` 应等于真实 JPEG 字节数，主机 `ffprobe` 应报 `mjpeg 1280x720`。
   - 之前判为“空白帧”是**测试方法问题**，不是 gadget 缺陷：重启后 AVFoundation 里
     UVC 相机的索引会变（曾由 `1` 变成 `0`），索引错了就开到内置相机上；
     另外用 `dd` 逐帧的喂帧脚本并未真正连上 47832。判据以 `uvc_qbuf.log` 的 `y0` 为准。
-  - 另一个坑：不指定 `-pixel_format yuyv422` 时 ffmpeg 会选 UYVY，与本 gadget 的
-    YUYV 不匹配，表现为主机停在 alt 0、抓帧阻塞。
+  - 另一个坑（YUYV 时代）：不指定 `-pixel_format yuyv422` 时 ffmpeg 会选 UYVY，与本 gadget 的
+    YUYV 不匹配，表现为主机停在 alt 0、抓帧阻塞。改成 MJPEG 后**不需要**再指定像素格式，
+    让 ffmpeg 按 UVC 描述符协商即可（见 §11）。
 - UAC2：往 47833 灌入 440 Hz，主机录音测得 `mean -22.5 dB`；日志为
   `pcm_open ok card=1 dev=0 PCM_IN ch=1` / `PCM_OUT ch=2`，均 48 kHz。
 - 扬声器方向：主机把默认输出切到该 USB 声卡并播放 440 Hz，手机侧从 47834 收流
@@ -177,7 +197,8 @@ payload ...
 
 ## 7. UVC 真机风险（2026-11-11，重要）
 
-- 主机可以枚举出标准 `UVC Camera`（macOS `system_profiler` 可见），AVFoundation/ffmpeg 也能抓到 640x480 帧。
+- 主机可以枚举出标准 `UVC Camera`（macOS `system_profiler` 可见），AVFoundation/ffmpeg 也能抓到帧
+  （历史基线是 YUYV 640×480；当前代码是 MJPEG 1280×720，见 §12）。
 - 但在 UVC 取流/热重绑过程中，真机出现过 `POWERUP_REASON: kpanic`，手机会重启；这是内核级问题，应用层无法保证规避。
 - 目前判断：vendor `f_uvc` 在主机仍持有 streaming 接口时执行 UDC unbind/rebind 会触发异常。
 - 安全规则：
@@ -209,7 +230,8 @@ payload ...
 
 ## 8. 已知边界
 
-- 手机 USB 口是 USB 2.0：640x480 YUYV@30 约 18 MB/s，可靠；1280x720 需要 MJPEG。
+- 手机 USB 口是 USB 2.0：640x480 YUYV@30 约 18 MB/s；1280x720 按裸数据不可行，
+  因此视频走 **MJPEG 1280x720**（单帧上限 300 KB）。
 - UVC 摄像头在主机端是一个标准摄像头；前三路（前置/后置/屏幕）在手机上切换，主机会看到画面源切换。
 - 隐藏系统导航条、音频路由（听筒）属于 Android 侧，另见主文档。
 - Windows 对 UVC/UAC2 的标准驱动支持良好；HID 已验证。
@@ -297,10 +319,10 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 1. 确认没有别的进程持有节点：`ls -l /proc/[0-9]*/fd 2>/dev/null | grep -E 'video[0-9]+'`，
    只剩 `marionette_usbd` 一个持有者。
 2. 启动后看 `logcat -s marionette_usbd`（或 `/data/local/tmp/marionette_usbd.log`）：
-   - `UVC: /dev/videoN ready 640x480 YUYV, 4 buffers` — S_FMT/REQBUFS/mmaps/订阅全部成功；
+   - `UVC: /dev/videoN ready 1280x720 MJPEG, 4 buffers` — S_FMT/REQBUFS/mmaps/订阅全部成功；
    - 没有 `subscribe 0x… failed`（尤其 `SETUP` 的 `-EBUSY` 说明有残留句柄）。
-3. 在主机侧打开相机（或 `ffmpeg -f avfoundation -framerate 30 -video_size 640x480 -i 1 -t 3 /tmp/uvc.mov`），
-   应依次看到：
+3. 在主机侧打开相机（或 `ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i <索引> -t 3 /tmp/uvc.mov`；
+   MJPEG 不需要再指定 `-pixel_format`），应依次看到：
    ```
    UVC: setup 21/01 v=0100 i=0001 l=34 -> 34    # SET_CUR(VS_PROBE)
    UVC: setup a1/81 ...            -> 34        # GET_CUR(VS_PROBE)
@@ -315,7 +337,7 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 失败分支：
 
 - 只有 `setup …` 没有 `streaming`：看 `->` 的值。`-62`(`-EL2HLT`) 说明分类/应答错了；
-  `34` 但仍无 `alt 1`，说明主机拒绝了 probe 参数（对比 `dwMaxVideoFrameSize`=614400、
+  `34` 但仍无 `alt 1`，说明主机拒绍了 probe 参数（对比 `dwMaxVideoFrameSize`=300000、
   `dwMaxPayloadTransferSize`=3072，与 `streaming_maxpacket=3072` 一致）。
 - `streaming=1` 但 `out=0`：`DQBUF` 返回 `EAGAIN` 且 `nobuf` 增长 → QBUF/pump 顺序被打回
   （不要改回“open 时预排队”）。
@@ -332,20 +354,30 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 - ADB 保持：开启→关闭 USB 外设后 `adb devices` 仍有设备（`127ee43`、`a8098dc`）。
 - 画面源切换：FRONT→BACK→FRONT 全程守护进程 pid 不变、UDC 保持 `configured`（`36cb191`）。
 
-**摄像头（2026-11-12 已验证）**：合成 NV21（Y=235）经 47832 灌入后，
+**摄像头（YUYV 640×480 已验证，MJPEG 720p 待验证）**：合成 NV21（Y=235）经 47832 灌入后，
 `/data/local/tmp/uvc_qbuf.log` 记录 `y0=235`，主机 `ffprobe` 收到 94 帧 640×480、
 首帧平均亮度 255。此前“空白帧”的结论来自错误的测试条件（AVFoundation 索引变化 +
 喂帧脚本未连上），与 gadget 无关。
+
+⚠️ 此后 `519a4ee` / `56f8717` / `d5fb2d9` 把整条视频链改成了 **1280x720 MJPEG**（App 采集侧
+压 JPEG、守护进程直通、`start.sh` 只暴露 `mjpeg/m/720p`、单帧上限 300000）：
+
+- 代码已完成且已提交，但**未上机验证**；上面 640×480 的数字不代表当前代码。
+- 回滚判据：若 MJPEG 在本机跑不通，恢复为 640×480 YUYV 需同时改三处
+  （`UsbVideoSource` 的格式/尺寸、`uvc_stream.cpp` 的 `S_FMT`、`start.sh` 的 streaming 描述符），
+  单改一处只会导致主机停在 alt 0。
 
 复现步骤：
 
 1. `start_test.sh`（相机开、音频关）绑定并启动守护进程，确认 `UVC: /dev/videoN ready`；
 2. 手机侧持续灌帧：
    `(printf 'HELLO TESTTOKEN\n'; while true; do cat frames.bin; done) | nc 127.0.0.1 47832`；
+   MJPEG 验证时 `frames.bin` 需是「MRV1 帧头（format=2）+ 完整 JPEG」的完整帧；
 3. 主机侧先列设备（**每次重启后索引可能变**）：
    `ffmpeg -f avfoundation -list_devices true -i ""`，确认 UVC 相机的当前索引；
-4. `ffmpeg -pixel_format yuyv422 -framerate 30 -video_size 640x480 -i <索引> -t 3 /tmp/t.mkv`；
-5. 判据：`uvc_qbuf.log` 的 `y0`（235 = 我们的内容）与主机抓帧的平均亮度。
+4. `ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i <索引> -t 3 /tmp/t.mkv`；
+5. 判据：`uvc_qbuf.log` 的 `used`（应等于该 JPEG 字节数）与主机 `ffprobe` 报的
+   `mjpeg 1280x720`。
 
 仍待补的验证：用 App 自己的相机源（前置/后置/屏幕）走同一条 47832 通道，
 而不是合成帧；管线代码已存在于 `UsbVideoSource`，需一次 App 驱动的会话。
