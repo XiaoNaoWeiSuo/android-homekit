@@ -566,7 +566,8 @@ class UsbPeripheralService : Service() {
         screenResult: Int,
         screenData: Intent?
     ) {
-        val link = UsbVideoLink(token).also { it.start() }
+        val link = videoLink ?: UsbVideoLink(token).also { it.start() }
+        videoLink = link
         val video = UsbVideoSource(this) { data, width, height, format, pts ->
             link.send(data, width, height, format, pts)
         }
@@ -618,8 +619,11 @@ class UsbPeripheralService : Service() {
         }
         videoSource?.stop()
         videoSource = null
-        videoLink?.stop()
-        videoLink = null
+        /*
+         * Keep the daemon link: tearing the client down and reconnecting leaves a
+         * gap in the stream right when a host is re-syncing after the source
+         * change, and some hosts never leave their black frame afterwards.
+         */
         activeCamera = source
         if (source != UsbCameraSource.OFF) {
             updateForegroundTypes(source, activeAudio)
