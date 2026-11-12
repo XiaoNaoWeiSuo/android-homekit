@@ -1,6 +1,6 @@
 # 蓝牙键鼠外设（手机作为 HID Device）
 
-更新日期：2026-11-11
+更新日期：2026-11-12
 
 本文记录 Marionette 的第一项「把手机变成外设」能力：**手机以标准 Bluetooth HID
 键盘 / 触控板的身份接入主机**。主机端（macOS / Windows / Linux / iPadOS）不需要
@@ -50,7 +50,10 @@ app/src/main/java/dev/local/mihotspot/peripheral/
 ├── PeripheralService.kt  # 前台服务（connectedDevice）+ PeripheralHub 单例
 ├── TouchpadView.kt       # 手势→相对鼠标/滚轮/点击
 ├── KeyboardPanel.kt      # 屏上键帽，多指组合键 / 统一图标
-└── PeripheralActivity.kt # 外设页面（状态、配对、触控板、键盘、文本直通）
+├── KeyHaptics.kt         # 按键触感（系统预置瞬态优先）
+├── KeySounds.kt          # 按键音效
+├── PeripheralPadActivity.kt # 键鼠界面：沉浸 / 默认，蓝牙与 USB 共用
+└── usb/                  # 有线四合一（HID/UVC/UAC2），见 docs/USB_PERIPHERAL.md
 ```
 
 与其他模块的关系：**不进入 HomeKit/HAP 栈**。HID 只依赖 Android 公开蓝牙 API，
@@ -82,7 +85,8 @@ app/src/main/java/dev/local/mihotspot/peripheral/
 
 ## 6. 配对流程（macOS 示例）
 
-1. App 首页 →「蓝牙键鼠外设」→ 打开「外设模式」（首次会申请蓝牙权限）。
+1. App 首页顶部卡片打开 **HID** 开关（与 HomeKit 开关并列；旧「蓝牙键鼠外设」入口已删除，
+   配对/设备名/手感等都在设置 → 蓝牙键鼠）。首次会申请蓝牙权限。
 2. 点「允许被发现 120 秒」，系统弹出可发现确认。
 3. Mac：系统设置 → 蓝牙 → 在「附近的设备」里选择设备名（默认 `Magic Keyboard`，
    可在页面里改）。
@@ -166,9 +170,10 @@ HID_CONNECTION state=2 device=<host> name=<host name>
 | 竖屏上下分屏 | **未完成实测**：HyperOS 忽略 adb 强制旋转，代码按 `height > width` 分支 | — |
 | bar 拖动 / 上下滑切换 | 机制与双击同一路径，**未逐项实测** | — |
 
-## 10. 后续（不在本期范围）
+## 10. 相邻能力与后续
 
-* 有线（USB）摄像头 / 麦克风：另开文档，先确认设备内核的 gadget 函数（`f_uac*`、
-  `f_uvc`、`f_hid`）与 `f_fs` 能力。
+* 有线（USB）键鼠 / 摄像头 / 麦克风 / 扬声器：**已实现**，走标准 USB gadget
+  （`f_hid` + `f_uvc` + `f_uac2`），主机零安装；协议、生命周期状态机和实测数据见
+  `docs/USB_PERIPHERAL.md`。蓝牙仍只承载键鼠。
 * BLE HOGP 低功耗版：可复用现有 GATT 服务器代码，适合长期挂着不耗电。
 * 沉潜模式可选：用 root 压低刷新率 / 把亮度做成设置项。

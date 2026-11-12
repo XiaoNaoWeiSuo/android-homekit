@@ -1,8 +1,32 @@
 # Marionette HomeKit 交接与排障手册
 
-更新日期：2026-11-04
+更新日期：2026-11-12
 
-## 2026-11-04 17:31 调度一致性、发现恢复与中等文件验收（最新）
+## 2026-11-12 USB 外设四合一 + 键鼠界面（最新）
+
+手机作为标准 USB 外设（HID 键鼠 + UVC 摄像头 + UAC2 麦克风/扬声器）已可整机接管，主机零安装；
+蓝牙只承载键鼠。协议、生命周期状态机、实测数据全在 `docs/USB_PERIPHERAL.md`，键鼠界面与蓝牙 HID
+在 `docs/PERIPHERAL.md`，外设栈边界与不变量在 `docs/ARCHITECTURE.md` §7。本节只记结论与红线。
+
+已验证（真机）：完整组合 HID+UVC+UAC2 同时绑定，主机侧 `hidutil` / AVFoundation /
+`system_profiler` 均能列出；麦克风（手机→主机）录音 `mean -22.5 dB`；扬声器方向手机收到
+2.79 s PCM（手机出声未单独验收）；开关 USB 外设后 adb 保持；真拔插后入口卡片自动出现/消失；
+摄像头竖屏档位 1080×1920 @30 fps，原地切源（不再重绑 UDC）单次首帧 ≤0.5 s，10 次来回 +
+6 次 0.4 s 连点均无失败。
+
+红线（都来自实测 panic / 卡死）：有主机时解绑 gadget 会 kpanic，stop 必须等拔线；无主机时绑定的
+gadget 永不 attach，只能借厂商 gadget 探测主机；`usb/online`(VBUS) 与 `typec data_role` 不可靠，
+只有 UDC state 可信；UVC 是 `bind_deactivated`，daemon 必须先开 `/dev/videoN`；切源期间不要断
+`UsbVideoLink`，且必须复用同一个 `UsbVideoSource`（否则 `camera in use`）；真的撞上也只重试一次
+（400 ms）。
+
+未验证：SCREEN 源的 MediaProjection 授权路径、沉浸键鼠界面的竖屏上下分屏、扬声器长时间稳定性。
+
+排障：`logcat -s UsbVideoSource:I MiHotspotUsb:I UsbPeripheralService:I`。`USB_VIDEO_STATS` 的 `luma`
+与主机 `YAVG` 对照可区分「没帧」和「画面本来就黑」；切源探针在 `build-tools/usb/switch_probe.sh`、
+`switch_stress.sh`。
+
+## 2026-11-04 17:31 调度一致性、发现恢复与中等文件验收
 
 60 秒 transfer pin 实验未证明改善，且用户随后报告接收弹窗消失，已回退到原 6 秒；不能把它记为吞吐修复。16:15 的手机日志只有 Discover、没有 Ask、审批目录为空；Mac 发起 ASK 后连接未完成，最终 receiverDeclined，不等于用户真的拒绝。
 

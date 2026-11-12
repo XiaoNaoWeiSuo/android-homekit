@@ -1,6 +1,6 @@
 # Marionette HomeKit-over-BLE 架构定稿
 
-更新日期：2026-09-16
+更新日期：2026-11-12（HomeKit 部分定稿于 2026-09-16；§7 为外设栈补充）
 
 这份文档记录已经在 Xiaomi 13 真机验证通过的实现原则。它不是 HAP 教程；遇到问题时，先按这里的边界和不变量判断，再看 `HANDOFF.md` 的日志排障流程。
 
@@ -140,3 +140,23 @@ Home 的图标由 HAP 服务类型决定，不能通过 `Name` 或 `ConfiguredNa
 协议行为以 Apple 开源 [HomeKitADK 的 BLE 广播与事件实现](https://github.com/apple/HomeKitADK/blob/master/HAP/HAPBLEAccessoryServer%2BAdvertising.c) 为主要参考；ADK 是协议参考，不能直接当作 Android GATT 实现使用。
 
 当前实现针对已 Root 的 Xiaomi 13 / Android 13 验证，不是 MFi 认证产品，也不适用于安全关键控制。Root shell、Android 版本差异、厂商电源管理和 Home 的元数据缓存都属于部署边界。
+
+## 7. 外设栈（2026-11-12 补充）
+
+除 HomeKit 之外，App 还把手机做成主机外设。两条路径共用 HID 语义，但传输与生命周期完全独立，
+都不进入 HomeKit/HAP 栈（唯一共享的是 UI 主题与前台服务约定）：
+
+| 路径 | 传输 | 能力 | 文档 |
+| --- | --- | --- | --- |
+| 蓝牙 | Classic HID（`BluetoothHidDevice`，无 root） | 键盘 / 触控板 | `docs/PERIPHERAL.md` |
+| USB | configfs gadget：`f_hid` + `f_uvc` + `f_uac2`（需 root） | 键盘 / 触控板 / 摄像头（前/后/屏幕）/ 麦克风 / 扬声器 | `docs/USB_PERIPHERAL.md` |
+
+不变量：
+
+* 蓝牙只承载键鼠，摄像头与音频只走 USB；主机端零安装（标准 HID / UVC / UAC2）。
+* USB 生命周期的唯一事实来源是 `/sys/class/udc/*/state`；厂商 gadget 只当主机探测器，
+  **有主机时绝不解绑**（本内核在该路径上多次 kpanic）。
+* 首页顶部卡片是 HomeKit 与 HID 两个产品开关；USB 是独立卡片，`usb_state == ready` 才显示，
+  拔线即消失，不需要文案解释。
+* 键鼠界面只有一个实现 `PeripheralPadActivity`（沉浸 / 默认），蓝牙与 USB 共用同一套面板和
+  事件，区别只在传输层（`BtHidPeripheral` vs `UsbHidLink`）。

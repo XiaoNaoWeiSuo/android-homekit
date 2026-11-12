@@ -43,12 +43,12 @@ mkdir -p $F/control/header/h
 ln -s ../../header/h $F/control/class/fs/h
 ln -s ../../header/h $F/control/class/ss/h
 
-# --- UVC frame: 1280x720 MJPEG@30 ---
-mkdir -p $F/streaming/mjpeg/m/720p
-D=$F/streaming/mjpeg/m/720p
-echo 1280 > $D/wWidth; echo 720 > $D/wHeight
-echo 300000 > $D/dwMaxVideoFrameBufferSize   # 单帧 JPEG 上限，实际长度按帧报告
-echo 147456000 > $D/dwMinBitRate; echo 147456000 > $D/dwMaxBitRate
+# --- UVC frame ladder: 竖屏 MJPEG@30（顺序即 bFrameIndex，第一档是主机默认） ---
+mkdir -p $F/streaming/mjpeg/m/p1080
+D=$F/streaming/mjpeg/m/p1080
+echo 1080 > $D/wWidth; echo 1920 > $D/wHeight
+echo 400000 > $D/dwMaxVideoFrameBufferSize   # 单帧 JPEG 上限，实际长度按帧报告
+echo 48000000 > $D/dwMinBitRate; echo 96000000 > $D/dwMaxBitRate
 echo 333333 > $D/dwDefaultFrameInterval; echo 333333 > $D/dwFrameInterval
 mkdir -p $F/streaming/header/h
 ln -s ../../mjpeg/m $F/streaming/header/h/m
@@ -124,11 +124,21 @@ pts     uint64 LE      纳秒
 payload ...
 ```
 
-UVC 目前只暴露**一种**格式：`V4L2_PIX_FMT_MJPEG`、1280x720、单帧上限 300000 字节
-（`dwMaxVideoFrameBufferSize`，实际长度由每帧的 `bytesused` 给出）。
+UVC 只暴露**一种**格式 `V4L2_PIX_FMT_MJPEG`，同一 format 下挂两个**竖屏**档位
+（`start.sh` 的 frame ladder；主机在 VS_PROBE 里选档，序号即创建顺序）：
+
+| bFrameIndex | 尺寸 | 单帧上限 `dwMaxVideoFrameBufferSize` |
+| --- | --- | --- |
+| 1 | 1080×1920 | 400000 |
+| 2 | 720×1280 | 250000 |
+
+帧率固定 30 fps（`dwDefaultFrameInterval=333333`），实际长度仍由每帧 `bytesused` 给出。
+daemon 在 VS_COMMIT 时把主机选中的档位以 `MODE <w> <h>` 发回视频 socket，App 按这个画布编码
+（见 §13）。竖屏档位是必须的：横屏画布会被 App 按 sensor 旋转再重采样，画面躺倒且切源后出条纹。
 
 - `format = 2`（JPEG）：守护进程**原样直通**到 V4L2 output，不做任何转码，`bytesused` = 真实 JPEG 长度。
-  这是 App 当前实际发送的格式（`UsbVideoSource` 在采集侧压到 1280x720 JPEG，quality 85）。
+  这是 App 当前实际发送的格式：`UsbVideoSource` 压到主机协商的档位（默认竖屏 1080×1920），
+  JPEG 质量按实测编码耗时在 55–88 之间自适应。
 - `format = 0/1`（NV21/RGBA）：旧路径，需要守护进程自己编码，当前 UVC 协商为 MJPEG，
   这些裸帧**不会**被直接接受，仅作为历史兼容保留。
 - 占位/空帧：MJPEG 模式下 `queue_blank()` 提交 `bytesused = 0` 的空 buffer（不是填黑），
@@ -178,9 +188,9 @@ UVC 目前只暴露**一种**格式：`V4L2_PIX_FMT_MJPEG`、1280x720、单帧�
   `/data/local/tmp/uvc_qbuf.log` 记录 `len=614400 used=614400 y0=235 y1=235 y2=235 u=128 v=128`；
   主机 `ffprobe` 收到 **94 帧、640×480、约 39 fps**，首帧平均亮度 255。
   - 该基线的格式（YUYV / 640×480 / 614400 字节帧）随后被 `519a4ee`、`56f8717`、`d5fb2d9`
-    改成了 **MJPEG + 阶梯**。2026-11-12 已用 App 真实相机复验：主机 `ffmpeg` 抓到
-    **2560×1440**（主机自选阶梯最高档），守护进程 `out=86`（3 秒约 90 帧），
-    `uvc_qbuf.log` 的 `used` 为 203–275 KB 的真实 JPEG 长度。
+    改成了 **MJPEG + 阶梯**，`eaf7e33` 起阶梯只保留竖屏档位。2026-11-12 用 App 真实相机复验：
+    主机 `ffmpeg` 协商到 **1080×1920**，守护进程稳定 30 fps，每帧 145–160 KB，
+    `uvc_qbuf.log` 的 `used` 是真实 JPEG 长度。
   - 之前判为“空白帧”是**测试方法问题**，不是 gadget 缺陷：重启后 AVFoundation 里
     UVC 相机的索引会变（曾由 `1` 变成 `0`），索引错了就开到内置相机上；
     另外用 `dd` 逐帧的喂帧脚本并未真正连上 47832。判据以 `uvc_qbuf.log` 的 `y0` 为准。
@@ -262,8 +272,9 @@ Kernel panic - not syncing: Oops: Fatal exception
 
 ## 8. 已知边界
 
-- 手机 USB 口是 USB 2.0：640x480 YUYV@30 约 18 MB/s；1280x720 按裸数据不可行，
-  因此视频走 **MJPEG 1280x720**（单帧上限 300 KB）。
+- 手机 USB 口是 USB 2.0：裸 1080×1920@30（YUV）约 93 MB/s，远超单等时端点的 ~24.6 MB/s，
+  因此视频走 **MJPEG 竖屏 1080×1920（单帧上限 400 KB）/ 720×1280（250 KB）**，
+  主机在 VS_PROBE 里选定一档。
 - UVC 摄像头在主机端是一个标准摄像头；前三路（前置/后置/屏幕）在手机上切换，主机会看到画面源切换。
 - 隐藏系统导航条、音频路由（听筒）属于 Android 侧，另见主文档。
 - Windows 对 UVC/UAC2 的标准驱动支持良好；HID 已验证。
@@ -351,10 +362,11 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 1. 确认没有别的进程持有节点：`ls -l /proc/[0-9]*/fd 2>/dev/null | grep -E 'video[0-9]+'`，
    只剩 `marionette_usbd` 一个持有者。
 2. 启动后看 `logcat -s marionette_usbd`（或 `/data/local/tmp/marionette_usbd.log`）：
-   - `UVC: /dev/videoN ready 1280x720 MJPEG, 4 buffers` — S_FMT/REQBUFS/mmaps/订阅全部成功；
+   - `UVC: /dev/videoN ready 1080x1920 YUYV, 4 buffers` — S_FMT/REQBUFS/mmaps/订阅全部成功
+     （`YUYV` 是 buffer 容量口径，实际格式是 MJPEG；尺寸是本次默认档位）；
    - 没有 `subscribe 0x… failed`（尤其 `SETUP` 的 `-EBUSY` 说明有残留句柄）。
-3. 在主机侧打开相机（或 `ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i <索引> -t 3 /tmp/uvc.mov`；
-   MJPEG 不需要再指定 `-pixel_format`），应依次看到：
+3. 在主机侧打开相机（或 `ffmpeg -f avfoundation -framerate 30 -i <索引> -t 3 /tmp/uvc.mov`；
+   不要指定 `-video_size`/`-pixel_format`，让主机从竖屏档位里自己协商），应依次看到：
    ```
    UVC: setup 21/01 v=0100 i=0001 l=34 -> 34    # SET_CUR(VS_PROBE)
    UVC: setup a1/81 ...            -> 34        # GET_CUR(VS_PROBE)
@@ -369,8 +381,8 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 失败分支：
 
 - 只有 `setup …` 没有 `streaming`：看 `->` 的值。`-62`(`-EL2HLT`) 说明分类/应答错了；
-  `34` 但仍无 `alt 1`，说明主机拒绍了 probe 参数（对比 `dwMaxVideoFrameSize`=300000、
-  `dwMaxPayloadTransferSize`=3072，与 `streaming_maxpacket=3072` 一致）。
+  `34` 但仍无 `alt 1`，说明主机拒绝了 probe 参数（对比 `dwMaxVideoFrameSize`=400000（p1080 档）
+  / 250000（p720 档）、`dwMaxPayloadTransferSize`=3072，与 `streaming_maxpacket=3072` 一致）。
 - `streaming=1` 但 `out=0`：`DQBUF` 返回 `EAGAIN` 且 `nobuf` 增长 → QBUF/pump 顺序被打回
   （不要改回“open 时预排队”）。
 - 任何 `SEND_RESPONSE: Inappropriate ioctl` → 跑的还是旧二进制。
@@ -384,16 +396,18 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 - 扬声器（主机→手机）：主机默认输出临时切到本设备播 2 s，手机侧从 47834
   收到 2.79 s PCM，`mean -25.5 dB`（播完已还原默认输出）。
 - ADB 保持：开启→关闭 USB 外设后 `adb devices` 仍有设备（`127ee43`、`a8098dc`）。
-- 画面源切换：FRONT→BACK→FRONT 全程守护进程 pid 不变、UDC 保持 `configured`（`36cb191`）。
+- 画面源切换：FRONT→BACK→FRONT 全程守护进程 pid 不变、UDC 保持 `configured`（`36cb191`），
+  现在单次切源首帧 ≤ 0.5 s（`b54109e`/`397b5a3`，见 §13）。
 
 **摄像头（2026-11-12 已用 App 真实相机验证）**
 
 - 早期合成帧基线（YUYV 640×480）：灌入 Y=235 后 `uvc_qbuf.log` 记 `y0=235`，主机收到 94 帧。
   此前“空白帧”的结论是测试方法错误（AVFoundation 索引变化 + 喂帧脚本未连上）。
-- 当前链路：App 采集 → JPEG → 47832 直通 → UVC MJPEG 阶梯。实测主机 `ffmpeg` 抓 3 秒，
-  `ffprobe` 报 **2560×1440**（主机自选阶梯最高档），守护进程 `out=86`，`used` 203–275 KB。
-- FRONT→BACK 切换实测：画面完全不同（首帧 PSNR 仅 **6.24 dB**），确认是另一路相机。
-- 仍待验证：SCREEN 源（需 MediaProjection 授权，只能 UI 确认）。
+- 当前链路：App 采集 → 按协商档位编码 JPEG → 47832 直通 → UVC MJPEG。主机 `ffmpeg` 协商到
+  **1080×1920**（竖屏），守护进程稳定 30 fps、每帧 145–160 KB、`enc` 8–12 ms。
+- FRONT→BACK 切换：首帧 PSNR 6.24 dB，确认是另一路相机；切换耗时与判据见 §13。
+- 仍待验证：SCREEN 源（需 MediaProjection 授权，只能在 UI 里授予；无授权时降级为 OFF，
+  日志 `USB_CAMERA_SCREEN_NO_CONSENT`）。
 
 复现步骤（App 驱动，2026-11-12 实测有效的顺序）：
 
@@ -432,8 +446,8 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
    slab 野指针），所以 stop 必须等拔线。
 3. UVC 是 `bind_deactivated`：守护进程必须先打开 `/dev/videoN` 才会 activate/attach，
    不能因为「UDC 未附着」而不开节点（那会死锁）。
-4. 接管后 6 s 稳定窗口 + 恢复后「连续 2 次探测、稳定 3 s」才重新接管，避免与厂商
-   HAL 的重配竞态；绑定失败只给一次 3 s 重试。
+4. 接管后 3.5 s 稳定窗口 + 恢复后「连续 2 次探测、厂商 gadget 稳定 1.8 s」才重新接管，
+   避免与厂商 HAL 的重配竞态；绑定失败只给一次 3 s 重试。
 5. 拔线时先 `releaseAll()` 再改状态，避免主机侧留一个自动重复的按键。
 
 已验证：全功能接管、脱离→交还→自动重新接管、关闭延后与厂商还原（adb 保持）、
@@ -473,23 +487,51 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 `UsbPeripheralService.stop()` + `startUsb()`，即 `stop.sh` 解绑 UDC、`start.sh` 重新绑定。
 含 UVC 的解绑/重绑正是本内核 panic 的高发路径（见 §7），因此切换会偶发 kpanic。
 
-修复（`36cb191`）：
+修复（`36cb191` 起，`2f58b88`/`b54109e`/`397b5a3` 收尾）：
 
-- 服务新增 `ACTION_SWITCH_CAMERA`：停止旧的 `UsbVideoSource` / `UsbVideoLink`，
-  用同一个 token 启动新源，**不触碰 configfs、守护进程和 gadget**；
-- 界面在「旧源与新源都是相机（FRONT/BACK/SCREEN）」时走原地换源；
+- 服务新增 `ACTION_SWITCH_CAMERA`：**不触碰 configfs、守护进程和 gadget**，
+  只在 App 侧换采集源；界面在「旧源与新源都是相机」时走原地换源，
   只有开启 / 关闭摄像头才重新 provisioning（那会改变 function 链接）；
-- 切换在服务的单线程 executor 上执行，与绑定过程天然串行，不会并发写 configfs。
+- 切换在服务的单线程 executor 上执行，与绑定过程天然串行，不会并发写 configfs；
+- `2f58b88`：切源期间**不断开** `UsbVideoLink`。断链会在主机重新同步的那一刻留一个空窗，
+  有些主机从此停在黑帧；
+- `b54109e`：整个会话复用**同一个** `UsbVideoSource`。每次新建实例会和上一个相机的异步释放撞车
+  （`camera in use`），表现为主机停在最后一帧、只有重启 App 才恢复；
+- `397b5a3`：真的撞上 `ERROR_CAMERA_IN_USE` / `ERROR_MAX_CAMERAS_IN_USE` 时，
+  释放后 400 ms 重试一次（日志 `USB_CAMERA_OPEN_RETRY`），而不是一直失败。
 
-实测（2026-11-12）：
+### 13.1 实测时间线（2026-11-12）
+
+`UsbVideoSource` 每次起流都会打自己的时间线（毫秒从该次请求算起）；主机侧用
+`build-tools/usb/switch_probe.sh` / `switch_stress.sh` 同步记录亮度（`signalstats` 的
+`YAVG`），两边对照：
 
 ```
-启动(前置): 18935 marionette_usbd / configured
-切到后置:   18935 marionette_usbd / configured
-切回前置:   18935 marionette_usbd / configured
-日志: USB_CAMERA_SWITCHED source=BACK / source=FRONT
+USB_CAMERA_START source=BACK gen=4 target=1080x1920
+USB_CAMERA_RELEASED after 69ms        # 关掉旧的 session / reader / device
+USB_CAMERA_OPENED after 85ms          # openCamera 回调
+USB_CAMERA_SESSION_READY after 153ms  # createCaptureSession 配置完成
+USB_CAMERA_FRAME1 after 459ms luma=0  # 首帧；luma 0 = AE 还在起跳
+USB_VIDEO_STATS 1080x1920 fps=30.0 q=89 avg=234KB enc=11.8ms luma=133
 ```
 
-切换前后守护进程 pid 不变、UDC 始终 `configured`、无重启。
+- 前后摄来回切 10 次：10/10 首帧 ≤ 0.5 s，0 次 `USB_CAMERA_FAILED`，结束后立刻回到 30 fps；
+- 0.4 s 间隔连点 6 次：最后一次请求生效，没有 `camera in use` 失败；
+- 主机侧亮度跟随切换的延迟 ≤ 0.5 s，不再停在旧帧。
 
-未覆盖：SCREEN 源需要 MediaProjection 授权对话框，只能通过 UI 手动验证一次。
+### 13.2 “切过去是黑的” 先看 luma
+
+同一时刻设备端和主机的亮度应当一致（后摄被桌面遮住时的实测）：
+
+```
+设备端 stats luma=20   主机 YAVG=20    # 一致 → 画面本来就是黑的
+设备端 stats luma=164  主机 YAVG=164   # 一致 → 前置正常
+```
+
+判断顺序：两边一致 → 链路正常，暗的是场景（后摄 AE 从 luma 0 起跳，开头 1–2 s 更暗）；
+主机亮度不随设备端变 → daemon/UVC 或主机解码器；设备端不再打 `FRAME1`/`STATS` →
+采集侧没起来，看 `USB_CAMERA_FAILED` / `USB_CAMERA_OPEN_RETRY` 与
+`logcat -s UsbVideoSource:I UsbPeripheralService:I`。
+
+未覆盖：SCREEN 源需要 MediaProjection 授权对话框，只能通过 UI 手动验证一次；
+未授权时降级为 OFF 并记 `USB_CAMERA_SCREEN_NO_CONSENT`。
