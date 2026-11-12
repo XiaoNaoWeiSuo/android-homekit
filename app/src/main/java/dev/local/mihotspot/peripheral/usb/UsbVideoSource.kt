@@ -3,8 +3,14 @@ package dev.local.mihotspot.peripheral.usb
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -22,6 +28,8 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.min
@@ -53,11 +61,21 @@ class UsbVideoSource(
         /** MRV1 `format` byte: tightly packed RGBA8888, four bytes per pixel. */
         const val FORMAT_RGBA8888 = 1
 
+        /** MRV1 `format` byte: a complete JPEG, forwarded to UVC unchanged. */
+        const val FORMAT_JPEG = 2
+
         private const val TAG = "UsbVideoSource"
-        private const val CAMERA_WIDTH = 640
-        private const val CAMERA_HEIGHT = 480
-        private const val SCREEN_WIDTH = 640
-        private const val SCREEN_HEIGHT = 480
+        // The UVC function is MJPEG 1280x720 (uncompressed 720p exceeds the
+        // ~24.6 MB/s this high-speed port can carry), so sources are captured
+        // at that size and always emitted as JPEG.
+        private const val UVC_WIDTH = 1280
+        private const val UVC_HEIGHT = 720
+        private const val CAMERA_WIDTH = 1280
+        private const val CAMERA_HEIGHT = 720
+        // The panel is 20:9; mirror it at the same aspect and letterbox to 16:9.
+        private const val SCREEN_WIDTH = 1280
+        private const val SCREEN_HEIGHT = 576
+        private const val JPEG_QUALITY = 85
         private const val FRAME_INTERVAL_NANOS = 1_000_000_000L / 30L
         private const val DEFAULT_SCREEN_DPI = 320
     }
@@ -322,7 +340,8 @@ class UsbVideoSource(
 
             if (gen != generation.get()) return
             val pts = image.timestamp.takeIf { it > 0L } ?: now
-            emitFrame(nv21, width, height, FORMAT_NV21, pts)
+            val jpeg = nv21ToJpeg(nv21, width, height)
+            emitFrame(jpeg, UVC_WIDTH, UVC_HEIGHT, FORMAT_JPEG, pts)
         } finally {
             image.close()
         }
@@ -437,10 +456,42 @@ class UsbVideoSource(
             val rgba = copyRgba(plane, width, height)
 
             if (gen != generation.get()) return
-            emitFrame(rgba, width, height, FORMAT_RGBA8888, now)
+            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
+            emitFrame(letterboxJpeg(bmp), UVC_WIDTH, UVC_HEIGHT, FORMAT_JPEG, now)
         } finally {
             image.close()
         }
+    }
+
+    /** Camera frames arrive as NV21; UVC wants a JPEG at exactly 1280x720. */
+    private fun nv21ToJpeg(nv21: ByteArray, width: Int, height: Int): ByteArray {
+        val yuv = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuv.compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, out)
+        val jpeg = out.toByteArray()
+        if (width == UVC_WIDTH && height == UVC_HEIGHT) return jpeg
+        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
+        return letterboxJpeg(bmp)
+    }
+
+    /** Fits `src` into 1280x720 preserving aspect, padding with black. */
+    private fun letterboxJpeg(src: Bitmap): ByteArray {
+        val out = Bitmap.createBitmap(UVC_WIDTH, UVC_HEIGHT, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+        val scale = minOf(
+            UVC_WIDTH.toFloat() / src.width,
+            UVC_HEIGHT.toFloat() / src.height
+        )
+        val w = (src.width * scale).toInt().coerceAtLeast(2)
+        val h = (src.height * scale).toInt().coerceAtLeast(2)
+        val left = (UVC_WIDTH - w) / 2
+        val top = (UVC_HEIGHT - h) / 2
+        canvas.drawBitmap(src, null, Rect(left, top, left + w, top + h), null)
+        val baos = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, baos)
+        return baos.toByteArray()
     }
 
     private fun emitFrame(
