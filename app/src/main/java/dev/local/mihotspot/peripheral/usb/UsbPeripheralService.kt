@@ -32,6 +32,8 @@ class UsbPeripheralService : Service() {
         const val ACTION_STOP = "dev.local.mihotspot.usb.STOP"
         /** Re-own a session whose gadget/daemon survived a process restart. */
         const val ACTION_ATTACH = "dev.local.mihotspot.usb.ATTACH"
+        /** Swap the capture source without touching configfs or the daemon. */
+        const val ACTION_SWITCH_CAMERA = "dev.local.mihotspot.usb.SWITCH_CAMERA"
         const val ACTION_STATE = "dev.local.mihotspot.usb.STATE"
         const val EXTRA_CAMERA_SOURCE = "camera_source"
         const val EXTRA_AUDIO = "audio"
@@ -42,6 +44,12 @@ class UsbPeripheralService : Service() {
 
         @Volatile var running: Boolean = false
             private set
+
+        /** What the live session is actually streaming; decides in-place swaps. */
+        @Volatile private var activeCamera = UsbCameraSource.OFF
+        @Volatile private var activeAudio = false
+
+        fun streamingCamera(): UsbCameraSource = activeCamera
 
         fun start(
             context: Context,
@@ -89,6 +97,32 @@ class UsbPeripheralService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, UsbPeripheralService::class.java))
         }
+
+        /**
+         * Change the capture source of a running session. The UVC function stays
+         * linked and the daemon keeps running; only the app-side pipeline swaps.
+         * Re-provisioning for this used to unbind/rebind the gadget, and this
+         * vendor kernel panics on that path often enough that switching between
+         * front/back/screen could reboot the phone.
+         */
+        fun switchCamera(
+            context: Context,
+            camera: UsbCameraSource,
+            screenResultCode: Int = 0,
+            screenData: Intent? = null
+        ) {
+            val intent = Intent(context, UsbPeripheralService::class.java).apply {
+                action = ACTION_SWITCH_CAMERA
+                putExtra(EXTRA_CAMERA_SOURCE, camera.name)
+                putExtra(EXTRA_SCREEN_RESULT, screenResultCode)
+                if (screenData != null) putExtra(EXTRA_SCREEN_DATA, screenData)
+            }
+            try {
+                context.startService(intent)
+            } catch (e: Exception) {
+                Log.i(TAG, "USB_SWITCH_FAILED ${e.message}")
+            }
+        }
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -117,6 +151,22 @@ class UsbPeripheralService : Service() {
         }
         if (intent?.action == ACTION_ATTACH) {
             attachSession()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_SWITCH_CAMERA) {
+            val camera = runCatching {
+                UsbCameraSource.valueOf(
+                    intent.getStringExtra(EXTRA_CAMERA_SOURCE) ?: UsbCameraSource.OFF.name
+                )
+            }.getOrDefault(UsbCameraSource.OFF)
+            val screenResult = intent.getIntExtra(EXTRA_SCREEN_RESULT, 0)
+            @Suppress("DEPRECATION")
+            val screenData: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(EXTRA_SCREEN_DATA, Intent::class.java)
+            } else {
+                intent.getParcelableExtra(EXTRA_SCREEN_DATA)
+            }
+            executor.execute { switchCameraInPlace(camera, screenResult, screenData) }
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_START) {
@@ -172,6 +222,8 @@ class UsbPeripheralService : Service() {
                 videoLink = null
 
                 updateForegroundTypes(effectiveCamera, audio)
+                activeCamera = effectiveCamera
+                activeAudio = audio
                 if (effectiveCamera != UsbCameraSource.OFF) {
                     startVideo(effectiveCamera, token, screenResult, screenData)
                 }
@@ -288,6 +340,44 @@ class UsbPeripheralService : Service() {
         videoSource = video
     }
 
+    /**
+     * Swap the capture source of a live session. Nothing here touches configfs,
+     * the daemon or the gadget: the UVC function stays linked and only the
+     * app-side pipeline changes. Re-provisioning on a source change used to
+     * unbind/rebind the gadget, and this vendor kernel panics on that path often
+     * enough that switching front/back/screen could reboot the phone.
+     */
+    private fun switchCameraInPlace(
+        camera: UsbCameraSource,
+        screenResult: Int,
+        screenData: Intent?
+    ) {
+        if (!running || destroyed) {
+            Log.i(TAG, "USB_SWITCH_SKIPPED running=$running destroyed=$destroyed")
+            return
+        }
+        val source = if (camera == UsbCameraSource.SCREEN && screenData == null) {
+            UsbCameraSource.OFF
+        } else {
+            camera
+        }
+        videoSource?.stop()
+        videoSource = null
+        videoLink?.stop()
+        videoLink = null
+        activeCamera = source
+        if (source != UsbCameraSource.OFF) {
+            updateForegroundTypes(source, activeAudio)
+            startVideo(source, UsbSession.token(this), screenResult, screenData)
+        }
+        updateNotification(
+            if (source == UsbCameraSource.OFF) "USB 键鼠已就绪 · 点按进入设置"
+            else "USB 外设运行中 · 摄像头已开启"
+        )
+        publish("ready", "camera=$source", hostAttached = null)
+        Log.i(TAG, "USB_CAMERA_SWITCHED source=$source")
+    }
+
     private fun updateForegroundTypes(camera: UsbCameraSource, audio: Boolean) {
         if (Build.VERSION.SDK_INT < 29) return
         var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
@@ -334,6 +424,8 @@ class UsbPeripheralService : Service() {
         if (teardownOnDestroy) executor.execute { controller.stop() }
         executor.shutdown()
         running = false
+        activeCamera = UsbCameraSource.OFF
+        activeAudio = false
         UsbSession.setEnabled(this, false)
         UsbPeripheralStatus.onServiceStopped(this)
         super.onDestroy()

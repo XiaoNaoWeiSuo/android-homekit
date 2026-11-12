@@ -458,15 +458,30 @@ class UsbPeripheralActivity : Activity() {
     }
 
     private fun applyCamera(source: UsbCameraSource) {
+        val previous = cameraSource
         cameraSource = source
         UsbSession.prefs(this).edit()
             .putString(UsbSession.KEY_CAMERA_SOURCE, source.name).apply()
         updateCameraButtons()
         if (master.isChecked) {
-            showStatus("● 正在应用", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
-            statusDetail.text = "正在应用摄像头设置…"
-            UsbPeripheralService.stop(this)
-            Handler(Looper.getMainLooper()).postDelayed({ startUsb() }, 1000)
+            // FRONT/BACK/SCREEN -> FRONT/BACK/SCREEN only swaps the app-side
+            // pipeline: the UVC function stays linked and the daemon keeps
+            // running. Re-provisioning here used to unbind/rebind the gadget,
+            // and this vendor kernel turns that into a panic often enough that
+            // switching sources could reboot the phone.
+            val inPlace = UsbPeripheralService.running &&
+                previous != UsbCameraSource.OFF &&
+                source != UsbCameraSource.OFF
+            if (inPlace) {
+                showStatus("● 正在切换", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+                statusDetail.text = "正在切换画面源…"
+                UsbPeripheralService.switchCamera(this, source, screenResultCode, screenData)
+            } else {
+                showStatus("● 正在应用", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
+                statusDetail.text = "正在应用摄像头设置…"
+                UsbPeripheralService.stop(this)
+                Handler(Looper.getMainLooper()).postDelayed({ startUsb() }, 1000)
+            }
         } else {
             statusDetail.text = when (source) {
                 UsbCameraSource.OFF -> "摄像头已关闭"
