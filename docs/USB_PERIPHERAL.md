@@ -363,3 +363,17 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
   这解释了为什么守护进程退出会解绑整个 gadget（HID/UAC2 一起消失）。
 - `uvc_v4l2_subscribe_event()` 对 `UVC_EVENT_SETUP` 在已连接时返回 `-EBUSY`，
   所以同一时刻只能有一个进程订阅；重复 open 会失败而不是静默。
+
+### 12.2 已知缺陷：关闭 USB 外设模式后 adb 消失（2026-11-11 修复）
+
+症状：在 App 里关掉「USB 外设模式」后，主机再也看不到手机（无 adb、无 mtp，`ioreg` 为空），
+手机本身正常（Wi-Fi 可达）。
+
+原因：`stop.sh` 在移除我们自己 `f1..f4` 之后，又新建了 `f1 -> ffs.adb`、`f2 -> ffs.mtp`，
+而厂商配置里本来就有 `function0 -> ffs.mtp`、`function1 -> ffs.adb`。**同一个 function
+实例被链了两次**，configfs 绑定失败，`echo UDC` 未生效，于是整块 USB 一起消失。
+
+修复：只删 `f1..f4`，厂商的 `functionN` 保持不动；仅当对应 ffs 链接缺失时才补建；
+先 `start vendor.usbgadget-hal-1-1` 并留出 functionfs 重新挂载的时间，再绑定 UDC。
+
+恢复手段：configfs 状态是运行时的，**重启手机**即可回到厂商默认组合（adb+mtp）。
