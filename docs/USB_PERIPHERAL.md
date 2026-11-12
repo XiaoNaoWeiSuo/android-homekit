@@ -197,6 +197,37 @@ UVC 目前只暴露**一种**格式：`V4L2_PIX_FMT_MJPEG`、1280x720、单帧�
 
 ## 7. UVC 真机风险（2026-11-11，重要）
 
+### 7.0 2026-11-12 更正：这次重启不是 f_uvc 的 WARN
+
+拔线后插到 Windows 触发的重启，`/data/vendor/diag/last_kmsg` 里的真实 trace 是：
+
+```
+Unable to handle kernel NULL pointer dereference at virtual address 00000000000009a0
+Internal error: Oops: 96000005 [#1] PREEMPT SMP
+CPU: 5 PID: 11111 Comm: marionette_usbd
+pc : module_put+0x38/0x1d8
+lr : __fput+0x1b8/0x440
+Call trace:
+ module_put+0x38/0x1d8
+ __fput+0x1b8/0x440
+ ____fput+0x14/0x24
+ task_work_run+0x140/0x204
+Kernel panic - not syncing: Oops: Fatal exception
+```
+
+要点：
+
+- panic 在**守护进程 close() 一个 fd 的收尾路径**里（`__fput` → `module_put` 空指针），
+  ！不是 `usb_composite_setup_continue()` 的 WARN，下面 §7 里那套 WARN 推导解释**不能**用来解释这次重启。
+- 这台机 `panic_on_warn` 当前是 **0**，所以「WARN 被 panic_on_warn 提升为 panic」不成立。
+- `usb_f_hid / usb_f_uvc / usb_f_uac2` 都不在 `/proc/modules` 里（内建），因此
+  `module_put` 的那个 module 不是它们；具体是哪个 fd 需靠守护进程新增的
+  `close fd=… path=…` 日志在下次复现时点名。
+- 2026-11-12 已加的诊断：`usb_common.h` 的 `close_traced()` 在关闭节点前用
+  `readlink /proc/self/fd/N` 打出真实路径；`marionette_usbd` 启动时会把
+  继承的 fd 表形态（`fd inherited N -> path`）打进 logcat。
+- 判 panic 仍然只能查 `POWERUP_REASON kpanic` 或 `last_kmsg`；`ro.boot.bootreason` 只显示 `reboot`。
+
 - 主机可以枚举出标准 `UVC Camera`（macOS `system_profiler` 可见），AVFoundation/ffmpeg 也能抓到帧
   （历史基线是 YUYV 640×480；当前代码是 MJPEG 1280×720，见 §12）。
 - 但在 UVC 取流/热重绑过程中，真机出现过 `POWERUP_REASON: kpanic`，手机会重启；这是内核级问题，应用层无法保证规避。
@@ -385,6 +416,21 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 风险：含 UVC 的解绑/重绑已多次触发 `POWERUP_REASON kpanic`（11-11 两次、11-12 一次）；
 重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
 画面源切换已不再走重绑（见 §13）。
+
+### 12.0 拔线后的状态刷新（2026-11-12 修复）
+
+以前拔线后 UI 永远停在「已就绪」：拔线并不会 unbind gadget，UDC 只是从
+`configured` 变成 `not attached`，而服务只在 start/adopt/switchCamera 三处
+`publish()`，没有任何拔插监听。现在补上了三层：
+
+1. `UsbManager.ACTION_USB_STATE`（`connected` extra）接收器 —— 插拔即时刷新；
+   注意这两个常量在公开 SDK 里被隐藏，代码里用字面量。
+2. 运行期 4 s 轮询 `controller.status()` 做兼底（某些宿主不发该广播）。
+3. 会话消失（daemon/gadget 没了）时把状态置为 `error` 并停止服务，
+   且 `teardownOnDestroy = false`（不去 unbind 半个死的 gadget）。
+
+拔线时先 `releaseAll()` 再改状态，避免主机侧留一个一直自动重复的按键。
+这条修复尚未上机验证。
 
 ### 12.1 源码核对（2026-11-11，android13-5.15）
 
