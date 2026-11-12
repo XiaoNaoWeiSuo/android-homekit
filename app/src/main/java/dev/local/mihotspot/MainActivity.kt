@@ -1435,7 +1435,7 @@ class MainActivity : Activity() {
         val btConnected = hidState == BtHidPeripheral.State.CONNECTED
         val wanted = if (btConnected || usb.active) View.VISIBLE else View.GONE
         if (card.visibility != wanted) card.visibility = wanted
-        peripheralModesHint?.text = when {
+        peripheralModesHint?.text = usb.hint ?: when {
             usb.active && btConnected -> "USB 与蓝牙主机均可用，进入后使用 USB 键鼠"
             usb.active -> "USB 键鼠已就绪，选择接下来在手机上使用的键鼠界面"
             else -> "主机已连接，选择接下来在手机上使用的键鼠界面"

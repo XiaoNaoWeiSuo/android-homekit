@@ -91,7 +91,26 @@ class UsbPeripheralActivity : Activity() {
             snapshot.state == "error" -> {
                 setSwitchSilently(master, false)
                 showStatus("● 绑定失败", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
-                statusDetail.text = "请重新插拔数据线后重试"
+                statusDetail.text = snapshot.hint ?: "请重新插拔数据线后重试"
+            }
+            snapshot.state == "armed" -> {
+                setSwitchSilently(master, true)
+                showStatus(
+                    "● 插线后自动开启",
+                    UiTheme.COLOR_ACCENT,
+                    UiTheme.COLOR_ACCENT_LIGHT
+                )
+                statusDetail.text = snapshot.hint
+                    ?: "主机接上后自动接管，无需再点开关"
+            }
+            snapshot.state == "armed_stop" -> {
+                setSwitchSilently(master, false)
+                showStatus(
+                    "● 拔线后自动关闭",
+                    UiTheme.COLOR_WARNING,
+                    UiTheme.COLOR_WARNING_LIGHT
+                )
+                statusDetail.text = snapshot.hint ?: "数据线已插着 · 拔掉后自动关闭"
             }
             snapshot.active -> {
                 setSwitchSilently(master, true)
@@ -132,6 +151,26 @@ class UsbPeripheralActivity : Activity() {
                     )
                     statusDetail.text = "主机可直接使用 USB 键盘与触控板"
                 }
+                "armed" -> {
+                    setSwitchSilently(master, true)
+                    showStatus(
+                        "● 插线后自动开启",
+                        UiTheme.COLOR_ACCENT,
+                        UiTheme.COLOR_ACCENT_LIGHT
+                    )
+                    statusDetail.text = intent.getStringExtra(UsbPeripheralService.EXTRA_HINT)
+                        ?: "主机接上后自动接管，无需再点开关"
+                }
+                "armed_stop" -> {
+                    setSwitchSilently(master, false)
+                    showStatus(
+                        "● 拔线后自动关闭",
+                        UiTheme.COLOR_WARNING,
+                        UiTheme.COLOR_WARNING_LIGHT
+                    )
+                    statusDetail.text = intent.getStringExtra(UsbPeripheralService.EXTRA_HINT)
+                        ?: "数据线已插着 · 拔掉后自动关闭"
+                }
                 "waiting" -> {
                     setSwitchSilently(master, true)
                     showStatus(
@@ -139,7 +178,8 @@ class UsbPeripheralActivity : Activity() {
                         UiTheme.COLOR_WARNING,
                         UiTheme.COLOR_WARNING_LIGHT
                     )
-                    statusDetail.text = "请将 USB 数据线连接到主机，连接后会自动生效"
+                    statusDetail.text = intent.getStringExtra(UsbPeripheralService.EXTRA_HINT)
+                        ?: "请将 USB 数据线连接到主机，连接后会自动生效"
                 }
                 "error" -> {
                     setSwitchSilently(master, false)
@@ -148,7 +188,8 @@ class UsbPeripheralActivity : Activity() {
                         UiTheme.COLOR_DANGER,
                         UiTheme.COLOR_DANGER_LIGHT
                     )
-                    statusDetail.text = "请重新插拔数据线后重试"
+                    statusDetail.text = intent.getStringExtra(UsbPeripheralService.EXTRA_HINT)
+                        ?: "请重新插拔数据线后重试"
                 }
             }
         }

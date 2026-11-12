@@ -42,11 +42,14 @@ object UsbPeripheralStatus {
         val pending: Boolean,
         val enabled: Boolean,
         val state: String,
-        val detail: String?
+        val detail: String?,
+        /** Short user-facing reason, when the state needs explaining. */
+        val hint: String? = null
     )
 
     @Volatile private var liveState: String? = null
     @Volatile private var liveDetail: String? = null
+    @Volatile private var liveHint: String? = null
     @Volatile private var liveHostAttached = false
     @Volatile private var liveReady = false
     @Volatile private var startRequestedAt = 0L
@@ -74,12 +77,20 @@ object UsbPeripheralStatus {
      * Published by [UsbPeripheralService] whenever it learns a new session state.
      * [hostAttached] is left untouched when null (e.g. a camera-only error).
      */
-    fun onServiceState(context: Context, state: String, detail: String?, hostAttached: Boolean?) {
+    fun onServiceState(
+        context: Context,
+        state: String,
+        detail: String?,
+        hostAttached: Boolean?,
+        hint: String? = null
+    ) {
         liveState = state
         liveDetail = detail
+        liveHint = hint
         if (hostAttached != null) liveHostAttached = hostAttached
-        liveReady = state == "ready" || state == "waiting"
-        UsbSession.setState(context, state, liveHostAttached, detail)
+        liveReady = state == "ready" || state == "waiting" ||
+            state == "armed" || state == "armed_stop"
+        UsbSession.setState(context, state, liveHostAttached, detail, hint)
         if (liveReady) UsbSession.setEnabled(context, true)
         cache(serviceSnapshot(context))
     }
@@ -88,6 +99,7 @@ object UsbPeripheralStatus {
     fun onServiceStopped(context: Context) {
         liveState = "off"
         liveDetail = null
+        liveHint = null
         liveReady = false
         liveHostAttached = false
         UsbSession.setState(context, "off", false, null)
@@ -107,7 +119,8 @@ object UsbPeripheralStatus {
         pending = !liveReady && liveState != "error",
         enabled = UsbSession.isEnabled(context),
         state = liveState ?: "off",
-        detail = liveDetail
+        detail = liveDetail,
+        hint = liveHint
     )
 
     /** Cheap, main-thread safe: memory and SharedPreferences only, never root. */
@@ -121,16 +134,25 @@ object UsbPeripheralStatus {
         }
         // No in-process service: fall back to the last published record so a
         // still-live session keeps its entry and transport until [verify] runs.
+        // Host attachment is deliberately NOT taken from that record: it is a
+        // snapshot from before the process died (often before the cable was
+        // pulled), and presenting it as current is what made the UI claim a
+        // connected host with the cable out. It stays false until a real probe
+        // confirms it.
         val enabled = UsbSession.isEnabled(context)
         val state = UsbSession.state(context)
-        val active = enabled && (state == "ready" || state == "waiting")
+        val active = enabled && (
+            state == "ready" || state == "waiting" ||
+                state == "armed" || state == "armed_stop"
+            )
         return Snapshot(
             active = active,
-            hostAttached = UsbSession.hostAttached(context),
+            hostAttached = false,
             pending = enabled && !active,
             enabled = enabled,
             state = if (active) state else "off",
-            detail = UsbSession.stateDetail(context)
+            detail = UsbSession.stateDetail(context),
+            hint = UsbSession.stateHint(context)
         )
     }
 

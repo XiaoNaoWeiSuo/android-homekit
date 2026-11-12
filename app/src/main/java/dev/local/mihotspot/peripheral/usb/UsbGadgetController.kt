@@ -26,6 +26,8 @@ object UsbSession {
     const val KEY_STATE_DETAIL = "usb_state_detail"
     const val KEY_STATE_HOST = "usb_state_host_attached"
     const val KEY_STATE_AT = "usb_state_at"
+    /** Short user-facing reason shown on the home card (e.g. "拔线后自动开启"). */
+    const val KEY_STATE_HINT = "usb_state_hint"
 
     fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -58,11 +60,21 @@ object UsbSession {
     fun stateUpdatedAt(context: Context): Long =
         prefs(context).getLong(KEY_STATE_AT, 0L)
 
-    fun setState(context: Context, state: String, hostAttached: Boolean, detail: String?) {
+    fun stateHint(context: Context): String? =
+        prefs(context).getString(KEY_STATE_HINT, null)
+
+    fun setState(
+        context: Context,
+        state: String,
+        hostAttached: Boolean,
+        detail: String?,
+        hint: String? = null
+    ) {
         prefs(context).edit()
             .putString(KEY_STATE, state)
             .putBoolean(KEY_STATE_HOST, hostAttached)
             .putString(KEY_STATE_DETAIL, detail)
+            .putString(KEY_STATE_HINT, hint)
             .putLong(KEY_STATE_AT, System.currentTimeMillis())
             .apply()
     }
@@ -96,7 +108,19 @@ class UsbGadgetController(private val context: Context) {
         val videoNode: String? = null,
         val card: String? = null,
         val daemonPid: Int? = null,
-        val raw: String = ""
+        val raw: String = "",
+        /**
+         * VBUS is present even when only a charger (or a charge-only cable) is
+         * attached. A charging cable and no cable look identical to the UDC,
+         * which is why "waiting" used to be the only thing the UI could say.
+         */
+        val vbusPresent: Boolean = false,
+        /** start.sh refused to run because a host currently holds the gadget. */
+        val preflightAttached: Boolean = false,
+        /** stop.sh refused to run because a host currently holds the gadget. */
+        val preflightStop: Boolean = false,
+        /** The controller never attached while VBUS was live: port is stuck. */
+        val portWedged: Boolean = false
     ) {
         val bound: Boolean
             get() = state == "configured" || state == "addressed" || state == "powered"
@@ -130,6 +154,7 @@ class UsbGadgetController(private val context: Context) {
     fun status(): Status {
         val command = """
             echo STATE=${'$'}(cat $UDC 2>/dev/null)
+            echo VBUS=${'$'}(cat /sys/class/power_supply/usb/online 2>/dev/null)
             echo HID=${'$'}(cat /config/usb_gadget/g1/functions/hid.marionette/dev 2>/dev/null)
             echo VIDEO=${'$'}(for v in /sys/class/video4linux/video*; do [ "${'$'}(cat ${'$'}v/name 2>/dev/null)" = "dwc3-gadget" ] && echo /dev/${'$'}(basename ${'$'}v); done | head -1)
             echo CARD=${'$'}(grep -q UAC2Gadget /proc/asound/cards 2>/dev/null && echo UAC2Gadget)
@@ -150,7 +175,11 @@ class UsbGadgetController(private val context: Context) {
             videoNode = value("VIDEO"),
             card = value("CARD"),
             daemonPid = value("DAEMON")?.toIntOrNull() ?: value("PID")?.toIntOrNull(),
-            raw = out
+            raw = out,
+            vbusPresent = value("VBUS") == "1",
+            preflightAttached = out.contains("PREFLIGHT=host-attached"),
+            preflightStop = out.contains("PREFLIGHT=host-attached-stop"),
+            portWedged = out.contains("PORT=wedged")
         )
     }
 

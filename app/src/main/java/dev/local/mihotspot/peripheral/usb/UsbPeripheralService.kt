@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import dev.local.mihotspot.R
 import java.util.concurrent.Executors
@@ -33,6 +34,8 @@ class UsbPeripheralService : Service() {
         private const val NOTIFICATION_ID = 4210
         /** Fallback cadence for hosts whose cable events never reach us. */
         private const val HOST_POLL_MS = 4000L
+        /** While nothing is attached, look harder: this is what the user is waiting for. */
+        private const val HOST_SEARCH_MS = 1500L
         /** Cable events arrive in pairs when the connector is loose. */
         private const val HOST_DEBOUNCE_MS = 300L
         /*
@@ -55,6 +58,8 @@ class UsbPeripheralService : Service() {
         const val EXTRA_SCREEN_DATA = "screen_data"
         const val EXTRA_STATE = "state"
         const val EXTRA_DETAIL = "detail"
+        /** Short, user-facing explanation of why the host is missing. */
+        const val EXTRA_HINT = "hint"
 
         @Volatile var running: Boolean = false
             private set
@@ -159,6 +164,66 @@ class UsbPeripheralService : Service() {
     /** Consecutive failed probes; one root-shell hiccup must not kill the session. */
     private var lostStreak = 0
 
+    /** Throttles the probe heartbeat so logcat stays readable. */
+    private var lastProbeLogAt = 0L
+
+    /** Rapid switch flips are the fastest way to a kernel panic; space them out. */
+    private var lastProvisionAt = 0L
+
+    /** Last user-facing explanation, so a VBUS-only change still reaches the UI. */
+    private var lastHint: String? = null
+
+    /**
+     * A start request that was refused because the host already holds the
+     * gadget. Provisioning in that state unbinds the vendor gadget under a live
+     * host and has both panicked this kernel and left the port unable to attach
+     * until a reboot, so wait for the cable to come out instead.
+     */
+    private data class PendingStart(
+        val camera: UsbCameraSource,
+        val audio: Boolean,
+        val screenResult: Int,
+        val screenData: Intent?
+    )
+
+    @Volatile private var pendingStart: PendingStart? = null
+
+    /** True while a provisioning/teardown root script is in flight. */
+    @Volatile private var provisioning = false
+
+    /** True once this service actually owns the configfs composition. */
+    @Volatile private var provisioned = false
+
+    /** Consecutive probes that saw no host while we were provisioned. */
+    private var detachStreak = 0
+
+    /** Last start parameters, replayed after handing the port back to the vendor. */
+    @Volatile private var lastCamera = UsbCameraSource.OFF
+    @Volatile private var lastAudio = false
+    private var lastScreenResult = 0
+    private var lastScreenData: Intent? = null
+
+    /** Guards against a restore/takeover loop turning into a rebind storm. */
+    private var restoreAttempts = 0
+    private var restoreFirstAt = 0L
+
+    /** How long the vendor gadget has been continuously attached after a restore. */
+    private var vendorAttachedSince = 0L
+    private var vendorAttachStreak = 0
+
+    /** One free retry for a bind that lost a race with the vendor HAL. */
+    private var wedgedRetryUsed = false
+
+    /**
+     * When the takeover finished. The composite (especially with UVC's
+     * bind_deactivated) needs a few seconds to reach "configured", and treating
+     * that window as "host gone" used to tear a healthy start back down.
+     */
+    private var provisionedAt = 0L
+
+    /** Stop requested while a host was attached; runs once the cable is out. */
+    @Volatile private var pendingStop = false
+
     /** Set in onDestroy so an in-flight provisioning task cannot re-publish "running". */
     @Volatile private var destroyed = false
 
@@ -175,7 +240,7 @@ class UsbPeripheralService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopSelf()
+            requestStop()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_ATTACH) {
@@ -199,6 +264,13 @@ class UsbPeripheralService : Service() {
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_START) {
+            // A start supersedes a stop that was waiting for the cable to come out.
+            pendingStop = false
+            mainHandler.removeCallbacks(pendingStopPoll)
+            if (provisioning) {
+                Log.i(TAG, "USB_START_IGNORED provisioning in flight")
+                return START_NOT_STICKY
+            }
             val camera = runCatching {
                 UsbCameraSource.valueOf(
                     intent.getStringExtra(EXTRA_CAMERA_SOURCE) ?: UsbCameraSource.OFF.name
@@ -229,16 +301,127 @@ class UsbPeripheralService : Service() {
             camera
         }
         executor.execute {
-            val token = UsbSession.token(this)
-            val status = controller.start(
-                token,
-                UsbGadgetController.Options(
-                    camera = effectiveCamera != UsbCameraSource.OFF,
-                    audio = audio
+            provisioning = true
+            try {
+                /*
+                 * Binding while no host is attached never attaches on this
+                 * vendor kernel (the PHY wakes on VBUS but the gadget never
+                 * connects). Wait until the host is actually on the port, then
+                 * take the gadget over immediately - that is the order that has
+                 * always enumerated.
+                 */
+                val pre = try {
+                    controller.status()
+                } catch (e: Throwable) {
+                    null
+                }
+                if (pre == null || !pre.bound) {
+                    pendingStart = PendingStart(effectiveCamera, audio, screenResult, screenData)
+                    running = false
+                    teardownOnDestroy = false
+                    updateNotification("插上数据线后自动开启")
+                    publish(
+                        "armed",
+                        pre?.raw ?: "no host",
+                        hostAttached = false,
+                        hint = "等主机接上后自动接管，无需再点开关"
+                    )
+                    Log.i(TAG, "USB_START_PENDING_HOST state=${pre?.state}")
+                    mainHandler.removeCallbacks(pendingPoll)
+                    mainHandler.postDelayed(pendingPoll, HOST_SEARCH_MS)
+                    return@execute
+                }
+                /*
+                 * Rapid flips are the fastest route to a panic, so space real
+                 * provisioning runs out. Never drop the queued request here:
+                 * pendingPoll clears it before calling us, and dropping left the
+                 * UI stuck on "waiting" with no host ever coming up.
+                 */
+                val since = SystemClock.elapsedRealtime() - lastProvisionAt
+                if (lastProvisionAt != 0L && since < 4000L) {
+                    pendingStart = PendingStart(effectiveCamera, audio, screenResult, screenData)
+                    mainHandler.removeCallbacks(pendingPoll)
+                    mainHandler.postDelayed(pendingPoll, 4000L - since)
+                    Log.i(TAG, "USB_START_RATE_LIMITED since=${since}ms re-armed")
+                    return@execute
+                }
+                lastProvisionAt = SystemClock.elapsedRealtime()
+                val token = UsbSession.token(this)
+                val status = controller.start(
+                    token,
+                    UsbGadgetController.Options(
+                        camera = effectiveCamera != UsbCameraSource.OFF,
+                        audio = audio
+                    )
                 )
-            )
+            if (status.preflightAttached) {
+                /*
+                 * The host is already holding the gadget. Re-provisioning here
+                 * unbinds it under a live host: that has panicked this kernel and
+                 * wedged the Type-C port until a reboot. Keep the request and
+                 * provision as soon as the cable is out.
+                 */
+                pendingStart = PendingStart(effectiveCamera, audio, screenResult, screenData)
+                running = false
+                teardownOnDestroy = false
+                updateNotification("数据线已插着 · 拔线后自动开启")
+                publish(
+                    "armed",
+                    status.raw,
+                    hostAttached = true,
+                    hint = "数据线已插着 · 拔掉后自动开启，插回即可使用"
+                )
+                Log.i(TAG, "USB_START_PENDING_UNPLUG ${status.raw}")
+                mainHandler.removeCallbacks(pendingPoll)
+                mainHandler.postDelayed(pendingPoll, HOST_SEARCH_MS)
+                return@execute
+            }
+            if (status.portWedged) {
+                /*
+                 * A bind that loses the race with the vendor HAL also shows up as
+                 * an empty UDC right after BIND=0. Give it one delayed retry
+                 * before declaring the port dead and stopping the session.
+                 */
+                if (!wedgedRetryUsed) {
+                    wedgedRetryUsed = true
+                    Log.i(TAG, "USB_PORT_WEDGED_RETRY ${status.raw}")
+                    mainHandler.postDelayed({
+                        startSession(effectiveCamera, audio, screenResult, screenData)
+                    }, 3000L)
+                    return@execute
+                }
+                wedgedRetryUsed = false
+                /*
+                 * VBUS is live but the controller never attached, and the script's
+                 * bounded rebind did not help. Hand the port back to the vendor
+                 * stack so wired adb/USB is not left dead until a reboot.
+                 */
+                controller.stop()
+                running = false
+                teardownOnDestroy = false
+                UsbSession.setEnabled(this, false)
+                UsbHub.link(this).stop()
+                updateNotification("端口异常 · 已退回厂商 USB")
+                publish(
+                    "error",
+                    status.raw,
+                    hostAttached = false,
+                    hint = "端口未附着 · 已退回厂商 USB，请拔线后重试或重启手机"
+                )
+                Log.i(TAG, "USB_PORT_WEDGED ${status.raw}")
+                stopSelf()
+                return@execute
+            }
             if (status.ready || status.bound) {
                 if (destroyed) return@execute
+                teardownOnDestroy = true
+                provisioned = true
+                provisionedAt = SystemClock.elapsedRealtime()
+                lastCamera = effectiveCamera
+                lastAudio = audio
+                lastScreenResult = screenResult
+                lastScreenData = screenData
+                detachStreak = 0
                 UsbSession.setEnabled(this, true)
                 UsbHub.link(this).start()
                 running = true
@@ -287,6 +470,9 @@ class UsbPeripheralService : Service() {
                 publish("error", status.raw, hostAttached = false)
                 Log.i(TAG, "USB_SESSION_FAILED ${status.raw}")
                 stopSelf()
+            }
+            } finally {
+                provisioning = false
             }
         }
     }
@@ -410,7 +596,11 @@ class UsbPeripheralService : Service() {
             if (source == UsbCameraSource.OFF) "USB 键鼠已就绪 · 点按进入设置"
             else "USB 外设运行中 · 摄像头已开启"
         )
-        publish("ready", "camera=$source", hostAttached = null)
+        publish(
+            if (hostAttached == true) "ready" else "waiting",
+            "camera=$source",
+            hostAttached = null
+        )
         Log.i(TAG, "USB_CAMERA_SWITCHED source=$source")
     }
 
@@ -456,8 +646,59 @@ class UsbPeripheralService : Service() {
         override fun run() {
             if (!running || destroyed) return
             probeHostAttachment()
-            mainHandler.postDelayed(this, HOST_POLL_MS)
+            scheduleNextProbe()
         }
+    }
+
+    /** Waits for the cable to come out before provisioning a refused start. */
+    private val pendingPoll: Runnable = object : Runnable {
+        override fun run() {
+            if (destroyed || pendingStart == null) return
+            executor.execute {
+                if (destroyed || pendingStart == null) return@execute
+                val status: UsbGadgetController.Status? = try {
+                    controller.status()
+                } catch (e: Throwable) {
+                    Log.i(TAG, "USB_PENDING_PROBE_FAILED ${e.javaClass.simpleName}")
+                    null
+                }
+                if (status == null || !status.bound) {
+                    vendorAttachStreak = 0
+                    vendorAttachedSince = 0L
+                    mainHandler.postDelayed(pendingPoll, HOST_SEARCH_MS)
+                    return@execute
+                }
+                /*
+                 * The vendor HAL is still rewriting configfs right after a
+                 * restore; taking over inside that window loses the bind race and
+                 * looks like a wedged port. Require a stably attached vendor
+                 * gadget before provisioning.
+                 */
+                val now2 = SystemClock.elapsedRealtime()
+                if (vendorAttachedSince == 0L) vendorAttachedSince = now2
+                vendorAttachStreak++
+                if (vendorAttachStreak < 2 || now2 - vendorAttachedSince < 3000L) {
+                    mainHandler.postDelayed(pendingPoll, HOST_SEARCH_MS)
+                    return@execute
+                }
+                val pending = pendingStart ?: return@execute
+                pendingStart = null
+                Log.i(TAG, "USB_START_RESUME_AFTER_UNPLUG")
+                startSession(pending.camera, pending.audio, pending.screenResult, pending.screenData)
+            }
+        }
+    }
+
+    /**
+     * ACTION_USB_STATE never reaches us on this ROM (no USB_CABLE_STATE line has
+     * ever appeared in logcat), so the root probe is the only source of truth.
+     * Poll fast while the host is missing and back off once it is confirmed.
+     */
+    private fun scheduleNextProbe() {
+        if (!running || destroyed) return
+        mainHandler.removeCallbacks(hostPoll)
+        val delay = if (hostAttached == true) HOST_POLL_MS else HOST_SEARCH_MS
+        mainHandler.postDelayed(hostPoll, delay)
     }
 
     private fun registerCableReceiver() {
@@ -475,8 +716,7 @@ class UsbPeripheralService : Service() {
     }
 
     private fun startHostWatch() {
-        mainHandler.removeCallbacks(hostPoll)
-        mainHandler.postDelayed(hostPoll, HOST_POLL_MS)
+        scheduleNextProbe()
     }
 
     /**
@@ -535,8 +775,47 @@ class UsbPeripheralService : Service() {
             }
             val attached = status.bound
             lostStreak = 0
-            if (attached == hostAttached) return@execute
+            /*
+             * Our gadget cannot attach when it was bound while the cable was
+             * out, and soft_connect does not rescue it (verified on device: the
+             * vendor gadget attaches instantly, ours never does). So on detach,
+             * hand the port back to the vendor gadget: it is the only reliable
+             * "host plugged in" detector, and the next attach triggers a fresh
+             * takeover - the order that has always worked.
+             */
+            if (!attached && provisioned && !provisioning) {
+                val settled = SystemClock.elapsedRealtime() - provisionedAt
+                if (settled < 6000L) {
+                    Log.i(TAG, "USB_DETACH_IGNORED_SETTLING settled=${settled}ms")
+                    return@execute
+                }
+                if (++detachStreak < 2) return@execute
+                restoreVendorAndArm()
+                return@execute
+            }
+            detachStreak = 0
+            if (SystemClock.uptimeMillis() - lastProbeLogAt > 15_000) {
+                lastProbeLogAt = SystemClock.uptimeMillis()
+                Log.i(
+                    TAG,
+                    "USB_HOST_PROBE state=${status.state} bound=$attached " +
+                        "ready=${status.ready} vbus=${status.vbusPresent} cable=$cableConnected"
+                )
+            }
+            /*
+             * A charging cable and no cable look identical to the UDC, so VBUS
+             * is what separates "nothing plugged in" from "power only, no data
+             * link" - the case behind "I plugged it in and nothing happened".
+             */
+            val hint = when {
+                attached -> null
+                status.vbusPresent ->
+                    "检测到数据线供电，但没有 USB 数据连接 · 换一根数据线或换一个 USB 口"
+                else -> "未检测到数据线 · 插入数据线后自动生效"
+            }
+            if (attached == hostAttached && hint == lastHint) return@execute
             hostAttached = attached
+            lastHint = hint
             updateNotification(
                 if (attached) {
                     "USB 键鼠已就绪 · 点按进入设置"
@@ -549,23 +828,180 @@ class UsbPeripheralService : Service() {
         }
     }
 
-    private fun publish(state: String, detail: String, hostAttached: Boolean? = null) {
+    /** Waits for the cable to come out before tearing the gadget down. */
+    private val pendingStopPoll: Runnable = object : Runnable {
+        override fun run() {
+            if (destroyed || !pendingStop) return
+            executor.execute {
+                if (destroyed || !pendingStop) return@execute
+                val status: UsbGadgetController.Status? = try {
+                    controller.status()
+                } catch (e: Throwable) {
+                    Log.i(TAG, "USB_PENDING_STOP_PROBE_FAILED ${e.javaClass.simpleName}")
+                    null
+                }
+                if (status == null || status.bound) {
+                    mainHandler.postDelayed(pendingStopPoll, HOST_SEARCH_MS)
+                    return@execute
+                }
+                Log.i(TAG, "USB_STOP_RESUME_AFTER_UNPLUG")
+                pendingStop = false
+                doStopNow()
+            }
+        }
+    }
+
+    /** Public stop entry: serialises against a provisioning run. */
+    private fun requestStop() {
+        pendingStart = null
+        mainHandler.removeCallbacks(pendingPoll)
+        if (provisioning) {
+            Log.i(TAG, "USB_STOP_DEFERRED provisioning")
+            mainHandler.postDelayed({ requestStop() }, 800)
+            return
+        }
+        executor.execute { doStopNow() }
+    }
+
+    /**
+     * Runs stop.sh. While a host holds the gadget the script refuses, because
+     * unbinding there frees the UVC function before its deactivate percpu_ref
+     * has left RCU - the resulting Oops is what rebooted the phone.
+     */
+    private fun doStopNow() {
+        if (provisioning) {
+            mainHandler.postDelayed({ requestStop() }, 800)
+            return
+        }
+        /*
+         * Nothing of ours is bound (e.g. the start was still armed): running
+         * stop.sh here would unbind the vendor gadget for no reason.
+         */
+        if (!provisioned) {
+            teardownOnDestroy = false
+            stopSelf()
+            return
+        }
+        provisioning = true
+        try {
+            val status: UsbGadgetController.Status? = try {
+                controller.stop()
+            } catch (e: Throwable) {
+                Log.i(TAG, "USB_STOP_FAILED ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+            if (status != null && status.preflightStop) {
+                pendingStop = true
+                updateNotification("数据线已插着 · 拔掉后自动关闭")
+                publish(
+                    "armed_stop",
+                    status.raw,
+                    hostAttached = true,
+                    hint = "数据线已插着 · 拔掉后自动关闭"
+                )
+                Log.i(TAG, "USB_STOP_PENDING_UNPLUG")
+                mainHandler.postDelayed(pendingStopPoll, HOST_SEARCH_MS)
+                return
+            }
+            // stop.sh already restored the vendor composition, so onDestroy must
+            // not run it again (that would unbind the fresh vendor gadget).
+            teardownOnDestroy = false
+            provisioned = false
+            stopSelf()
+        } finally {
+            provisioning = false
+        }
+    }
+
+    /**
+     * Hand the port back to the vendor gadget after the host went away.
+     *
+     * Safe direction: nothing is attached, so this cannot unbind a live host.
+     * The vendor gadget is then the only reliable "cable plugged in" detector
+     * (ours never attaches when it was bound while the cable was out), and the
+     * pending poll takes over again the moment it attaches.
+     */
+    private fun restoreVendorAndArm() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - restoreFirstAt > 60_000L) {
+            restoreFirstAt = now
+            restoreAttempts = 0
+        }
+        if (++restoreAttempts > 3) {
+            // Three restores in a minute means the takeover never attaches.
+            // Stop instead of endless rebinding - that path is what panicked.
+            Log.i(TAG, "USB_TAKEOVER_LOOP giving up")
+            running = false
+            provisioned = false
+            pendingStart = null
+            teardownOnDestroy = false
+            updateNotification("端口无法附着 · 已停用外设")
+            publish(
+                "error",
+                "takeover loop",
+                hostAttached = false,
+                hint = "端口无法附着 · 已停用外设，请重启手机后重试"
+            )
+            stopSelf()
+            return
+        }
+        Log.i(TAG, "USB_HOST_GONE restoring vendor gadget (attempt=$restoreAttempts)")
+        running = false
+        hostAttached = false
+        provisioned = false
+        detachStreak = 0
+        teardownOnDestroy = false
+        UsbHub.link(this).stop()
+        videoSource?.stop()
+        videoSource = null
+        videoLink?.stop()
+        videoLink = null
+        audioBridge?.stop()
+        audioBridge = null
+        pendingStart = PendingStart(lastCamera, lastAudio, lastScreenResult, lastScreenData)
+        try {
+            controller.stop()
+        } catch (e: Throwable) {
+            Log.i(TAG, "USB_HOST_GONE_STOP_FAILED ${e.javaClass.simpleName}: ${e.message}")
+        }
+        updateNotification("插上数据线后自动接管")
+        publish(
+            "armed",
+            "vendor restored",
+            hostAttached = false,
+            hint = "主机接上后自动接管，无需再点开关"
+        )
+        mainHandler.removeCallbacks(pendingPoll)
+        mainHandler.postDelayed(pendingPoll, HOST_SEARCH_MS)
+    }
+
+    private fun publish(
+        state: String,
+        detail: String,
+        hostAttached: Boolean? = null,
+        hint: String? = null
+    ) {
         // Only session-lifecycle states define "is USB usable"; ancillary
         // broadcasts (camera_error) must not hide the peripheral entry.
         if (state == "ready" || state == "waiting" || state == "error") {
-            UsbPeripheralStatus.onServiceState(this, state, detail, hostAttached)
+            UsbPeripheralStatus.onServiceState(this, state, detail, hostAttached, hint)
         }
         sendBroadcast(
             Intent(ACTION_STATE)
                 .setPackage(packageName)
                 .putExtra(EXTRA_STATE, state)
                 .putExtra(EXTRA_DETAIL, detail)
+                .putExtra(EXTRA_HINT, hint)
         )
     }
 
     override fun onDestroy() {
         destroyed = true
+        pendingStart = null
+        pendingStop = false
         mainHandler.removeCallbacks(hostPoll)
+        mainHandler.removeCallbacks(pendingPoll)
+        mainHandler.removeCallbacks(pendingStopPoll)
         try {
             unregisterReceiver(cableReceiver)
         } catch (_: IllegalArgumentException) {

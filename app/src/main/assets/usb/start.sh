@@ -6,8 +6,26 @@ H=$G/functions/hid.marionette
 F=$G/functions/uvc.marionette
 A=$G/functions/uac2.marionette
 
+# ---- provisioning policy ----
+# Binding while the cable is OUT does not attach on this vendor kernel: the PHY
+# wakes on VBUS ("DWC3 exited from low power mode") but the gadget never
+# connects, so the host sees nothing. The only path that has ever enumerated is
+# taking the gadget over while the host is attached, so do that. Stops stay
+# deferred until the cable is out (see stop.sh), which is where the kernel
+# panics actually came from.
+CUR=$(cat /sys/class/udc/a600000.dwc3/state 2>/dev/null)
+echo "PREV_STATE=$CUR"
+
 killall -TERM marionette_usbd 2>/dev/null
-sleep 0.2
+# Wait for the daemon to really exit: its fd release is what deactivates the
+# UVC function, and that must finish before configfs is touched.
+i=0
+while [ -n "$(pidof marionette_usbd)" ] && [ $i -lt 20 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+killall -KILL marionette_usbd 2>/dev/null
+sleep 0.3
 stop vendor.usbgadget-hal-1-1 2>/dev/null
 echo "" > $G/UDC 2>/dev/null
 # configfs rejects new links while a function is still bound (EBUSY). Wait for
@@ -45,6 +63,16 @@ HIDNODE=/dev/hidg$HIDMINOR
 # advertised in one format so the host can pick a rung and the user can find
 # where the link or the encoder gives up.
 if [ "__ENABLE_CAMERA__" = "1" ]; then
+  # Re-provisioning f_uvc is the most dangerous operation on this kernel: the
+  # function's deactivate path goes through percpu_ref + RCU, and tearing it
+  # down repeatedly has produced three different panics. Rebuild only when the
+  # descriptor set below actually changed; a plain off/on cycle reuses it.
+  UVC_VER=3
+  if [ -L $F/streaming/header/h/m ] && \
+     [ "$(cat /data/local/tmp/uvc_desc.ver 2>/dev/null)" = "$UVC_VER" ] && \
+     [ -s /data/local/tmp/uvc_modes.txt ]; then
+    echo "UVC=reused"
+  else
   # f_uvc freezes its streaming descriptors on first bind: after that, configfs
   # answers EBUSY to any new format link even once the UDC is cleared, so a
   # gadget provisioned by an older script can never gain MJPEG in place. Drop
@@ -119,6 +147,8 @@ if [ "__ENABLE_CAMERA__" = "1" ]; then
   echo 3072 > $F/streaming_maxpacket 2>/dev/null
   echo 1 > $F/streaming_interval 2>/dev/null
   echo 0 > $F/streaming_maxburst 2>/dev/null
+  echo "$UVC_VER" > /data/local/tmp/uvc_desc.ver
+  fi
 fi
 
 # ---- UAC2: 48 kHz stereo playback, mono capture ----
@@ -169,8 +199,16 @@ sleep 0.3
 
 echo a600000.dwc3 > $G/UDC
 echo "BIND=$?"
-sleep 1.5
-echo "STATE=$(cat /sys/class/udc/a600000.dwc3/state 2>/dev/null)"
+sleep 1.2
+STATE=$(cat /sys/class/udc/a600000.dwc3/state 2>/dev/null)
+VBUS=$(cat /sys/class/power_supply/usb/online 2>/dev/null)
+if [ "$STATE" = "not attached" ] && [ -s /sys/class/udc/a600000.dwc3/state ] && [ -z "$(cat $G/UDC 2>/dev/null)" ]; then
+  # Only a bind failure counts as wedged. "VBUS present but not attached" is
+  # the normal state for a charge-only cable and must not trigger a fallback.
+  echo "PORT=wedged"
+fi
+echo "STATE=$STATE"
+echo "VBUS=$VBUS"
 echo "HID_NODE=$HIDNODE"
 for v in /sys/class/video4linux/video*; do
   [ "$(cat $v/name 2>/dev/null)" = "dwc3-gadget" ] && echo "VIDEO_NODE=/dev/$(basename $v)"
