@@ -272,7 +272,7 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 | --- | --- | --- |
 | 暂停画面，主机仍认为相机在 | 守护进程停止投帧；保持 fd、`STREAMON`、configfs 不动（队列耗空后主机画面冻结） | 无内核风险，主机画面停住 |
 | 让主机看到“相机被拔掉” | 只能 unbind 函数 / 关 fd（软断开整个 gadget） | 需先让主机退出取流，否则回到 §7 |
-| 运行中切换手机侧画面源（前/后/屏） | 不用碰 USB：源在 App 侧，守护进程继续按 MRV1 收帧即可 | 不能走 `controller.start()` 重新 bind |
+| 运行中切换手机侧画面源（前/后/屏） | **已实现**（`ACTION_SWITCH_CAMERA`）：只换 `UsbVideoSource`/`UsbVideoLink`，不碰 configfs/守护进程 | 不能走 `controller.start()` 重新 bind（会 kpanic） |
 
 两条硬性约束：
 
@@ -321,7 +321,7 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
   （不要改回“open 时预排队”）。
 - 任何 `SEND_RESPONSE: Inappropriate ioctl` → 跑的还是旧二进制。
 
-## 12. 当前状态与恢复步骤（2026-11-11 21:10）
+## 12. 当前状态与恢复步骤（2026-11-12）
 
 已在真机验证（完整组合 HID + UVC + UAC2 同时绑定）：
 
@@ -329,6 +329,8 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 - 麦克风（手机→主机）：47833 灌 440 Hz，macOS 录音 `mean -22.5 dB`。
 - 扬声器（主机→手机）：主机默认输出临时切到本设备播 2 s，手机侧从 47834
   收到 2.79 s PCM，`mean -25.5 dB`（播完已还原默认输出）。
+- ADB 保持：开启→关闭 USB 外设后 `adb devices` 仍有设备（`127ee43`、`a8098dc`）。
+- 画面源切换：FRONT→BACK→FRONT 全程守护进程 pid 不变、UDC 保持 `configured`（`36cb191`）。
 
 **摄像头（2026-11-12 已验证）**：合成 NV21（Y=235）经 47832 灌入后，
 `/data/local/tmp/uvc_qbuf.log` 记录 `y0=235`，主机 `ffprobe` 收到 94 帧 640×480、
@@ -347,14 +349,10 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 
 仍待补的验证：用 App 自己的相机源（前置/后置/屏幕）走同一条 47832 通道，
 而不是合成帧；管线代码已存在于 `UsbVideoSource`，需一次 App 驱动的会话。
-   - `y0=235` → 缓冲区里是我们的帧，问题在内核没有把它发出去（isoc/泵）；
-   - `y0=16` → 转换/排队路径写错了。
-5. 读 `/data/local/tmp/uvc_setup.log` 末尾：若出现 `00/0b ... -> -34`
-   （`SET_INTERFACE` 被 stall），基本坐实「标准请求被应答 → `setup_continue` WARN → kpanic」
-   这条嫌疑。
 
-风险：绑定/激活 UVC 侧今天已 3 次触发 `POWERUP_REASON kpanic`；
+风险：含 UVC 的解绑/重绑已多次触发 `POWERUP_REASON kpanic`（11-11 两次、11-12 一次）；
 重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
+画面源切换已不再走重绑（见 §13）。
 
 ### 12.1 源码核对（2026-11-11，android13-5.15）
 
@@ -381,3 +379,32 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 先 `start vendor.usbgadget-hal-1-1` 并留出 functionfs 重新挂载的时间，再绑定 UDC。
 
 恢复手段：configfs 状态是运行时的，**重启手机**即可回到厂商默认组合（adb+mtp）。
+
+## 13. 画面源切换：原地换源（2026-11-12 修复）
+
+症状：USB 外设已开启时切换前置 / 后置 / 屏幕，有概率导致手机重启。
+
+原因：`UsbPeripheralActivity.applyCamera()` 原本调用
+`UsbPeripheralService.stop()` + `startUsb()`，即 `stop.sh` 解绑 UDC、`start.sh` 重新绑定。
+含 UVC 的解绑/重绑正是本内核 panic 的高发路径（见 §7），因此切换会偶发 kpanic。
+
+修复（`36cb191`）：
+
+- 服务新增 `ACTION_SWITCH_CAMERA`：停止旧的 `UsbVideoSource` / `UsbVideoLink`，
+  用同一个 token 启动新源，**不触碰 configfs、守护进程和 gadget**；
+- 界面在「旧源与新源都是相机（FRONT/BACK/SCREEN）」时走原地换源；
+  只有开启 / 关闭摄像头才重新 provisioning（那会改变 function 链接）；
+- 切换在服务的单线程 executor 上执行，与绑定过程天然串行，不会并发写 configfs。
+
+实测（2026-11-12）：
+
+```
+启动(前置): 18935 marionette_usbd / configured
+切到后置:   18935 marionette_usbd / configured
+切回前置:   18935 marionette_usbd / configured
+日志: USB_CAMERA_SWITCHED source=BACK / source=FRONT
+```
+
+切换前后守护进程 pid 不变、UDC 始终 `configured`、无重启。
+
+未覆盖：SCREEN 源需要 MediaProjection 授权对话框，只能通过 UI 手动验证一次。
