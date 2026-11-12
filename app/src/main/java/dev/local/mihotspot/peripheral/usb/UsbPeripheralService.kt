@@ -5,11 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import dev.local.mihotspot.R
 import java.util.concurrent.Executors
@@ -27,6 +31,16 @@ class UsbPeripheralService : Service() {
         private const val TAG = "MiHotspotUsb"
         private const val CHANNEL = "usb_peripheral"
         private const val NOTIFICATION_ID = 4210
+        /** Fallback cadence for hosts whose cable events never reach us. */
+        private const val HOST_POLL_MS = 4000L
+        /** Cable events arrive in pairs when the connector is loose. */
+        private const val HOST_DEBOUNCE_MS = 300L
+        /*
+         * UsbManager.ACTION_USB_STATE / USB_CONNECTED are hidden from the public
+         * SDK (they compile to the literals below), so spell them out.
+         */
+        private const val ACTION_USB_STATE = "android.hardware.usb.action.USB_STATE"
+        private const val USB_CONNECTED = "connected"
 
         const val ACTION_START = "dev.local.mihotspot.usb.START"
         const val ACTION_STOP = "dev.local.mihotspot.usb.STOP"
@@ -131,6 +145,20 @@ class UsbPeripheralService : Service() {
     private var videoLink: UsbVideoLink? = null
     private var videoSource: UsbVideoSource? = null
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Last published host-attachment value; null means "not known yet". */
+    @Volatile private var hostAttached: Boolean? = null
+
+    /** Cable state seen in UsbManager.ACTION_USB_STATE (null = never seen). */
+    @Volatile private var cableConnected: Boolean? = null
+
+    /** Drops superseded debounced cable events. */
+    private val attachGeneration = java.util.concurrent.atomic.AtomicInteger()
+
+    /** Consecutive failed probes; one root-shell hiccup must not kill the session. */
+    private var lostStreak = 0
+
     /** Set in onDestroy so an in-flight provisioning task cannot re-publish "running". */
     @Volatile private var destroyed = false
 
@@ -141,6 +169,7 @@ class UsbPeripheralService : Service() {
         super.onCreate()
         controller = UsbGadgetController(this)
         ensureChannel()
+        registerCableReceiver()
         startForegroundCompat(buildNotification("正在准备 USB 外设…"))
     }
 
@@ -213,6 +242,8 @@ class UsbPeripheralService : Service() {
                 UsbSession.setEnabled(this, true)
                 UsbHub.link(this).start()
                 running = true
+                hostAttached = status.bound
+                startHostWatch()
 
                 audioBridge?.stop()
                 audioBridge = null
@@ -285,6 +316,8 @@ class UsbPeripheralService : Service() {
             UsbSession.setEnabled(this, true)
             UsbHub.link(this).start()
             running = true
+            hostAttached = status.bound
+            startHostWatch()
             // The video/audio pipelines cannot be restored without re-running the
             // provisioning script, so say so instead of leaving a silent black
             // camera on the host.
@@ -318,6 +351,9 @@ class UsbPeripheralService : Service() {
         val video = UsbVideoSource(this) { data, width, height, format, pts ->
             link.send(data, width, height, format, pts)
         }
+        // The daemon reports the frame the host committed; capture and encode
+        // have to match it or the picture is the wrong size on the host.
+        link.onMode = { width, height -> video.setTargetSize(width, height) }
         video.onError = { message ->
             Log.i(TAG, "USB_CAMERA_ERROR $message")
             publish("camera_error", message)
@@ -398,6 +434,121 @@ class UsbPeripheralService : Service() {
         }
     }
 
+    /**
+     * Pulling the cable does not unbind the gadget: the UDC merely drops from
+     * `configured` to `not attached`, so nothing in configfs changes and no
+     * existing code re-published state. The UI therefore stayed on "ready"
+     * forever after an unplug.
+     */
+    private val cableReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_USB_STATE) return
+            val connected = intent.getBooleanExtra(USB_CONNECTED, false)
+            if (cableConnected == connected) return
+            cableConnected = connected
+            Log.i(TAG, "USB_CABLE_STATE connected=$connected")
+            if (!running || destroyed) return
+            scheduleHostState(connected)
+        }
+    }
+
+    private val hostPoll = object : Runnable {
+        override fun run() {
+            if (!running || destroyed) return
+            probeHostAttachment()
+            mainHandler.postDelayed(this, HOST_POLL_MS)
+        }
+    }
+
+    private fun registerCableReceiver() {
+        val filter = IntentFilter(ACTION_USB_STATE)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(cableReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(cableReceiver, filter)
+            }
+        } catch (e: Exception) {
+            Log.i(TAG, "USB_CABLE_RECEIVER_FAILED ${e.message}")
+        }
+    }
+
+    private fun startHostWatch() {
+        mainHandler.removeCallbacks(hostPoll)
+        mainHandler.postDelayed(hostPoll, HOST_POLL_MS)
+    }
+
+    /**
+     * A loose connector produces connect/disconnect pairs within milliseconds.
+     * Act only once the newest event has been quiet for a moment, and drop the
+     * stale ones so two overlapping probes cannot fight over the session state.
+     */
+    private fun scheduleHostState(connected: Boolean) {
+        val generation = attachGeneration.incrementAndGet()
+        mainHandler.postDelayed({
+            if (generation != attachGeneration.get() || !running || destroyed) {
+                return@postDelayed
+            }
+            if (connected) probeHostAttachment() else markHostDetached()
+        }, HOST_DEBOUNCE_MS)
+    }
+
+    private fun markHostDetached() {
+        if (hostAttached == false) return
+        hostAttached = false
+        // Release before the link goes idle: otherwise the host keeps whatever
+        // key was held when the cable came out and auto-repeats it.
+        UsbHub.link(this).releaseAll()
+        updateNotification("等待主机连接 · 插入数据线后自动生效")
+        publish("waiting", "主机已断开", hostAttached = false)
+    }
+
+    /** Re-reads the gadget state (root shell, so it runs off the main thread). */
+    private fun probeHostAttachment() {
+        if (!running || destroyed) return
+        executor.execute {
+            if (!running || destroyed) return@execute
+            val status = try {
+                controller.status()
+            } catch (e: Throwable) {
+                Log.i(TAG, "USB_HOST_PROBE_FAILED ${e.javaClass.simpleName}: ${e.message}")
+                return@execute
+            }
+            if (!status.ready) {
+                if (++lostStreak < 2) {
+                    Log.i(TAG, "USB_HOST_PROBE_UNREADY ${status.raw}")
+                    return@execute
+                }
+                Log.i(TAG, "USB_SESSION_LOST ${status.raw}")
+                running = false
+                hostAttached = false
+                mainHandler.removeCallbacks(hostPoll)
+                UsbHub.link(this).stop()
+                UsbSession.setEnabled(this, false)
+                // Nothing of ours is left to unbind, and re-running the script
+                // on a half-dead gadget is exactly what panics this kernel.
+                teardownOnDestroy = false
+                publish("error", "USB 会话已结束：${status.raw}", hostAttached = false)
+                stopSelf()
+                return@execute
+            }
+            val attached = status.bound
+            lostStreak = 0
+            if (attached == hostAttached) return@execute
+            hostAttached = attached
+            updateNotification(
+                if (attached) {
+                    "USB 键鼠已就绪 · 点按进入设置"
+                } else {
+                    "等待主机连接 · 插入数据线后自动生效"
+                }
+            )
+            publish(if (attached) "ready" else "waiting", status.raw, hostAttached = attached)
+            Log.i(TAG, "USB_HOST_ATTACH changed=$attached state=${status.state}")
+        }
+    }
+
     private fun publish(state: String, detail: String, hostAttached: Boolean? = null) {
         // Only session-lifecycle states define "is USB usable"; ancillary
         // broadcasts (camera_error) must not hide the peripheral entry.
@@ -414,6 +565,11 @@ class UsbPeripheralService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        mainHandler.removeCallbacks(hostPoll)
+        try {
+            unregisterReceiver(cableReceiver)
+        } catch (_: IllegalArgumentException) {
+        }
         videoSource?.stop()
         videoSource = null
         videoLink?.stop()
