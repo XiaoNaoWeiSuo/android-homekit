@@ -158,12 +158,12 @@ payload ...
 **2026-11-11 实测（完整组合 HID + UVC + UAC2 同时绑定）**
 
 - HID：面板点一次 `q`，主机只收到一个字符，3 秒无重复。
-- UVC：控制握手已打通（日志 `host selected alt 1, streaming`，主机能拿到帧），但
-  **画面内容仍是空白**：灌入亮度 235 的 NV21 合成帧时，主机抓到的仍是 0/122 的常量帧，
-  说明送出去的是队列里的空白缓冲，转换后的帧没有被主机取走。**此项尚不可用**，
-  不要用“能抓到帧”判断摄像头已好。
-  - 判据：合成 NV21（Y=235、UV=128）从 47832 灌入，再看主机抓帧的平均亮度；
-    `121/122` 是空白缓冲的特征值，`0` 是置零缓冲，都不是真实画面。
+- UVC：**已验证可用**（2026-11-12）。灌入亮度 235 的 NV21 合成帧后，
+  `/data/local/tmp/uvc_qbuf.log` 记录 `len=614400 used=614400 y0=235 y1=235 y2=235 u=128 v=128`；
+  主机 `ffprobe` 收到 **94 帧、640×480、约 39 fps**，首帧平均亮度 255。
+  - 之前判为“空白帧”是**测试方法问题**，不是 gadget 缺陷：重启后 AVFoundation 里
+    UVC 相机的索引会变（曾由 `1` 变成 `0`），索引错了就开到内置相机上；
+    另外用 `dd` 逐帧的喂帧脚本并未真正连上 47832。判据以 `uvc_qbuf.log` 的 `y0` 为准。
   - 另一个坑：不指定 `-pixel_format yuyv422` 时 ffmpeg 会选 UYVY，与本 gadget 的
     YUYV 不匹配，表现为主机停在 alt 0、抓帧阻塞。
 - UAC2：往 47833 灌入 440 Hz，主机录音测得 `mean -22.5 dB`；日志为
@@ -330,19 +330,23 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 - 扬声器（主机→手机）：主机默认输出临时切到本设备播 2 s，手机侧从 47834
   收到 2.79 s PCM，`mean -25.5 dB`（播完已还原默认输出）。
 
-**未通过**：摄像头画面。控制握手已通（`host selected alt 1, streaming`，
-`out` 递增），但主机拿到的是空白帧：
+**摄像头（2026-11-12 已验证）**：合成 NV21（Y=235）经 47832 灌入后，
+`/data/local/tmp/uvc_qbuf.log` 记录 `y0=235`，主机 `ffprobe` 收到 94 帧 640×480、
+首帧平均亮度 255。此前“空白帧”的结论来自错误的测试条件（AVFoundation 索引变化 +
+喂帧脚本未连上），与 gadget 无关。
 
-- 灌入亮度 235 的 NV21 合成帧，主机抓到的仍是 `0`（`fill_black` 的 Y=16）
-  或 `122`（未初始化）——都不是我们的内容。
-- 反差线索：**不喂帧**时主机能连收 93 帧空白；**一喂帧**流反而卡住（只取到 1 帧）。
+复现步骤：
 
-继续排查只需要一次「绑定 → 抓日志」，日志已落盘、不会随 panic 丢失：
+1. `start_test.sh`（相机开、音频关）绑定并启动守护进程，确认 `UVC: /dev/videoN ready`；
+2. 手机侧持续灌帧：
+   `(printf 'HELLO TESTTOKEN\n'; while true; do cat frames.bin; done) | nc 127.0.0.1 47832`；
+3. 主机侧先列设备（**每次重启后索引可能变**）：
+   `ffmpeg -f avfoundation -list_devices true -i ""`，确认 UVC 相机的当前索引；
+4. `ffmpeg -pixel_format yuyv422 -framerate 30 -video_size 640x480 -i <索引> -t 3 /tmp/t.mkv`；
+5. 判据：`uvc_qbuf.log` 的 `y0`（235 = 我们的内容）与主机抓帧的平均亮度。
 
-1. `binduvc.sh`（HID+UVC+UAC2）→ 启动守护进程 → 确认 `UVC: /dev/videoN ready`。
-2. 手机侧持续灌合成帧：`sh /data/local/tmp/feedvid2.sh`（Y=235、UV=128）。
-3. 主机侧：`ffmpeg -f avfoundation -pixel_format yuyv422 -framerate 30 -video_size 640x480 -i 1 -t 3 /tmp/t.mkv`。
-4. 读 `/data/local/tmp/uvc_qbuf.log`：
+仍待补的验证：用 App 自己的相机源（前置/后置/屏幕）走同一条 47832 通道，
+而不是合成帧；管线代码已存在于 `UsbVideoSource`，需一次 App 驱动的会话。
    - `y0=235` → 缓冲区里是我们的帧，问题在内核没有把它发出去（isoc/泵）；
    - `y0=16` → 转换/排队路径写错了。
 5. 读 `/data/local/tmp/uvc_setup.log` 末尾：若出现 `00/0b ... -> -34`
