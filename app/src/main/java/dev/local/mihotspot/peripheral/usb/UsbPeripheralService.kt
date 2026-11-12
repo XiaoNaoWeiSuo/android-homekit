@@ -568,9 +568,15 @@ class UsbPeripheralService : Service() {
     ) {
         val link = videoLink ?: UsbVideoLink(token).also { it.start() }
         videoLink = link
-        val video = UsbVideoSource(this) { data, width, height, format, pts ->
+        /*
+         * Reuse one source for the whole session. Its worker serialises "release
+         * the old camera, then open the new one"; a fresh instance per switch
+         * raced the previous camera's asynchronous release, failed with
+         * "camera in use", and left the host frozen on the last frame.
+         */
+        val video = videoSource ?: UsbVideoSource(this) { data, width, height, format, pts ->
             link.send(data, width, height, format, pts)
-        }
+        }.also { videoSource = it }
         // The daemon reports the frame the host committed; capture and encode
         // have to match it or the picture is the wrong size on the host.
         link.onMode = { width, height -> video.setTargetSize(width, height) }
@@ -584,16 +590,15 @@ class UsbPeripheralService : Service() {
             UsbCameraSource.SCREEN -> if (screenData != null) {
                 video.startScreen(screenResult, screenData)
             } else {
-                link.stop()
+                Log.i(TAG, "USB_CAMERA_SCREEN_NO_CONSENT")
+                video.stop()
                 return
             }
             UsbCameraSource.OFF -> {
-                link.stop()
+                video.stop()
                 return
             }
         }
-        videoLink = link
-        videoSource = video
     }
 
     /**
@@ -617,12 +622,13 @@ class UsbPeripheralService : Service() {
         } else {
             camera
         }
-        videoSource?.stop()
-        videoSource = null
+        if (source == UsbCameraSource.OFF) {
+            videoSource?.stop()
+        }
         /*
-         * Keep the daemon link: tearing the client down and reconnecting leaves a
-         * gap in the stream right when a host is re-syncing after the source
-         * change, and some hosts never leave their black frame afterwards.
+         * Keep the source and the daemon link: starting the new capture on the
+         * same instance makes its worker release the old camera before opening
+         * the new one. The link stays up so the host never sees a gap.
          */
         activeCamera = source
         if (source != UsbCameraSource.OFF) {
