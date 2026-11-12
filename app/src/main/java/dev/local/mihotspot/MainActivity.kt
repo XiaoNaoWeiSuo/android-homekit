@@ -68,6 +68,7 @@ import dev.local.mihotspot.ui.createPageHeader
 import dev.local.mihotspot.ui.onHapticClick
 import dev.local.mihotspot.peripheral.BtHidPeripheral
 import dev.local.mihotspot.peripheral.KeyHaptics
+import dev.local.mihotspot.peripheral.KeySounds
 import dev.local.mihotspot.peripheral.PeripheralHub
 import dev.local.mihotspot.peripheral.PeripheralPadActivity
 import dev.local.mihotspot.peripheral.PeripheralService
@@ -1821,6 +1822,87 @@ class MainActivity : Activity() {
             })
         })
 
+        // Mouse DPI multiplies the finger-to-counts ratio for both transports.
+        touchCard.addView(createCardDivider(this))
+        val dpiRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        dpiRow.addView(TextView(this).apply {
+            text = "鼠标 DPI"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        val dpiPrefs = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+        val initialDpi = dpiPrefs.getInt(KEY_POINTER_DPI, 1000)
+        val dpiValue = TextView(this).apply {
+            text = "$initialDpi DPI"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_ACCENT)
+            setPadding(dp(8), 0, 0, 0)
+        }
+        dpiRow.addView(dpiValue)
+        touchCard.addView(dpiRow)
+        touchCard.addView(SeekBar(this).apply {
+            max = 28
+            progress = ((initialDpi - 400) / 100).coerceIn(0, 28)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seek: SeekBar, p: Int, fromUser: Boolean) {
+                    val dpi = 400 + p * 100
+                    getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                        .edit().putInt(KEY_POINTER_DPI, dpi).apply()
+                    dpiValue.text = "$dpi DPI"
+                }
+                override fun onStartTrackingTouch(seek: SeekBar) = Unit
+                override fun onStopTrackingTouch(seek: SeekBar) = Unit
+            })
+        })
+
+        // USB-only report rate: the endpoint interval is fixed by the gadget,
+        // so this coalesces mouse deltas to the chosen cadence.
+        touchCard.addView(createCardDivider(this))
+        val hzRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        hzRow.addView(TextView(this).apply {
+            text = "USB 回报率"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        hzRow.addView(TextView(this).apply {
+            text = "仅 USB 链路"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_MUTED)
+            setPadding(dp(8), 0, 0, 0)
+        })
+        touchCard.addView(hzRow)
+        val currentHz = dpiPrefs.getInt(KEY_USB_MOUSE_HZ, 1000)
+        val hzGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        listOf(125, 250, 500, 1000).forEach { hz ->
+            hzGroup.addView(RadioButton(this).apply {
+                id = View.generateViewId()
+                tag = hz
+                text = "$hz"
+                textSize = 12f
+                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+                isChecked = hz == currentHz
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+        }
+        hzGroup.setOnCheckedChangeListener { group, checkedId ->
+            val hz = group.findViewById<RadioButton>(checkedId)?.tag as? Int
+                ?: return@setOnCheckedChangeListener
+            getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
+                .edit().putInt(KEY_USB_MOUSE_HZ, hz).apply()
+        }
+        touchCard.addView(hzGroup)
+
         touchCard.addView(createCardDivider(this))
         val keepAliveRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1884,6 +1966,38 @@ class MainActivity : Activity() {
             }
         })
         touchCard.addView(trailRow)
+
+        touchCard.addView(createCardDivider(this))
+        val soundRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        val soundCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        soundCol.addView(TextView(this).apply {
+            text = "按键音效"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        })
+        soundCol.addView(TextView(this).apply {
+            text = "按键时播放轻微的机械键盘点击声"
+            textSize = 12f
+            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+        })
+        soundRow.addView(soundCol)
+        soundRow.addView(Switch(this).apply {
+            isChecked = KeySounds.isEnabled(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                KeySounds.setEnabled(this@MainActivity, checked)
+                if (checked) KeySounds.play(this@MainActivity)
+            }
+        })
+        touchCard.addView(soundRow)
 
         touchCard.addView(createCardDivider(this))
         val hapticsRow = LinearLayout(this).apply {
@@ -2739,6 +2853,8 @@ class MainActivity : Activity() {
         private const val REQUEST_DISCOVERABLE = 104
         private const val KEY_HID_SENSITIVITY = "touchpad_sensitivity"
         private const val KEY_TOUCHPAD_TRAIL = "touchpad_trail"
+        private const val KEY_POINTER_DPI = "pointer_dpi"
+        private const val KEY_USB_MOUSE_HZ = "usb_mouse_hz"
         private const val SLIDER_UI_HOLD_MS = 1_200L
         private const val SLIDER_UI_SETTLE_MS = 700L
     }

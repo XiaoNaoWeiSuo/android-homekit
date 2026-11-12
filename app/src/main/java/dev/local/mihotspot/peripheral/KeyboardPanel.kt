@@ -244,6 +244,7 @@ class KeyboardPanel(context: Context) : LinearLayout(context) {
         target.keyPressed = true
         target.invalidate()
         KeyHaptics.tap(context)
+        KeySounds.play(context)
         notifyState()
     }
 

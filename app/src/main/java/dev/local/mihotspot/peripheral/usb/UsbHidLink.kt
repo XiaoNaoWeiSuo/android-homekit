@@ -41,6 +41,18 @@ class UsbHidLink(private val port: Int, private val token: String) {
     @Volatile private var connected = false
     private val keyboardGeneration = AtomicInteger()
 
+    /**
+     * Effective mouse report rate. The USB endpoint interval is fixed by the
+     * gadget descriptor, so this coalesces deltas and pushes reports at the
+     * requested cadence (125/250/500/1000 Hz).
+     */
+    @Volatile var reportHz: Int = 1000
+
+    private val mouseLock = Any()
+    private var pendingDx = 0
+    private var pendingDy = 0
+    private var flushScheduled = false
+
     fun addListener(listener: Listener) {
         if (!listeners.contains(listener)) listeners.add(listener)
     }
@@ -81,10 +93,12 @@ class UsbHidLink(private val port: Int, private val token: String) {
     }
 
     fun releaseAll() {
+        flushMouse()
         enqueue(releaseReport())
     }
 
     fun sendKeyboardState(modifiers: Int, usages: IntArray) {
+        flushMouse()
         val generation = keyboardGeneration.incrementAndGet()
         enqueue(byteArrayOf(HidProtocol.REPORT_ID_KEYBOARD.toByte()) +
             HidProtocol.keyboardReport(modifiers, usages))
@@ -102,6 +116,40 @@ class UsbHidLink(private val port: Int, private val token: String) {
 
     fun mouseMove(dx: Int, dy: Int) {
         if (dx == 0 && dy == 0) return
+        if (reportHz >= 1000) {
+            sendMouseDelta(dx, dy)
+            return
+        }
+        var schedule = false
+        synchronized(mouseLock) {
+            pendingDx += dx
+            pendingDy += dy
+            if (!flushScheduled) {
+                flushScheduled = true
+                schedule = true
+            }
+        }
+        if (schedule) {
+            val interval = (1000L / reportHz.coerceIn(60, 1000)).coerceAtLeast(1L)
+            scheduler.schedule({ flushMouse() }, interval, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    /** Send whatever delta is pending; called before buttons/scroll/keys. */
+    fun flushMouse() {
+        val dx: Int
+        val dy: Int
+        synchronized(mouseLock) {
+            dx = pendingDx
+            dy = pendingDy
+            pendingDx = 0
+            pendingDy = 0
+            flushScheduled = false
+        }
+        if (dx != 0 || dy != 0) sendMouseDelta(dx, dy)
+    }
+
+    private fun sendMouseDelta(dx: Int, dy: Int) {
         var x = dx
         var y = dy
         var guard = 0
@@ -118,6 +166,7 @@ class UsbHidLink(private val port: Int, private val token: String) {
 
     fun mouseScroll(steps: Int) {
         if (steps == 0) return
+        flushMouse()
         var w = steps
         var guard = 0
         do {
@@ -130,6 +179,7 @@ class UsbHidLink(private val port: Int, private val token: String) {
     }
 
     fun mouseButton(button: Int, down: Boolean) {
+        flushMouse()
         buttons = if (down) buttons or button else buttons and button.inv()
         enqueue(byteArrayOf(HidProtocol.REPORT_ID_MOUSE.toByte()) +
             HidProtocol.mouseReport(buttons, 0, 0, 0))

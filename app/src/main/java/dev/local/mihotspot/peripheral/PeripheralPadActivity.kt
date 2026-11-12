@@ -52,6 +52,8 @@ class PeripheralPadActivity : Activity() {
         const val PREFS = BtHidPeripheral.PREFS
         const val KEY_SENSITIVITY = "touchpad_sensitivity"
         const val KEY_TRAIL = "touchpad_trail"
+        const val KEY_DPI = "pointer_dpi"
+        const val KEY_USB_MOUSE_HZ = "usb_mouse_hz"
 
         fun intent(
             context: Context,
@@ -148,6 +150,8 @@ class PeripheralPadActivity : Activity() {
             registerBackSwallow()
         }
         if (usbMode) {
+            usbLink.reportHz = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getInt(KEY_USB_MOUSE_HZ, 1000)
             usbLink.addListener(usbLinkListener)
             usbLink.start()
             // The link only reports a *lost* connection; a link that never
@@ -265,10 +269,13 @@ class PeripheralPadActivity : Activity() {
         }
         touchpad = TouchpadView(this).apply {
             darkTheme = dark
-            trailEnabled = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getBoolean(KEY_TRAIL, false)
-            sensitivity = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getInt(KEY_SENSITIVITY, 180) / 100f
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            trailEnabled = prefs.getBoolean(KEY_TRAIL, false)
+            // DPI scales the finger→counts ratio; the sensitivity slider stays
+            // as a fine trim on top of it.
+            val base = prefs.getInt(KEY_SENSITIVITY, 180) / 100f
+            val dpiScale = prefs.getInt(KEY_DPI, 1000) / 1000f
+            sensitivity = (base * dpiScale).coerceIn(0.2f, 8f)
             listener = object : TouchpadView.Listener {
                 override fun onMove(dx: Int, dy: Int) = moveMouse(dx, dy)
                 override fun onScroll(steps: Int) = scrollMouse(steps)
