@@ -1,6 +1,6 @@
 # USB 外设（摄像头 / 麦克风 / 扬声器 / 键鼠）
 
-更新：2026-11-12（视频已改为 1280x720 MJPEG；该改动**尚未上机验证**，详见 §12）
+更新：2026-11-12（MJPEG 视频、FRONT/BACK 切换与全功能生命周期均已上机验证，详见 §12）
 
 目标：手机通过 **USB 标准类协议** 变成主机的外设，主机零安装、零驱动：
 
@@ -177,9 +177,10 @@ UVC 目前只暴露**一种**格式：`V4L2_PIX_FMT_MJPEG`、1280x720、单帧�
 - UVC：**YUYV 640×480 路径已验证可用**（2026-11-12）。灌入亮度 235 的 NV21 合成帧后，
   `/data/local/tmp/uvc_qbuf.log` 记录 `len=614400 used=614400 y0=235 y1=235 y2=235 u=128 v=128`；
   主机 `ffprobe` 收到 **94 帧、640×480、约 39 fps**，首帧平均亮度 255。
-  - ⚠️ 该基线的格式（YUYV / 640×480 / 614400 字节帧）随后被 `519a4ee`、`56f8717`、`d5fb2d9`
-    改成了 **1280×720 MJPEG**，**新格式尚未上机复验**。判据不变：`uvc_qbuf.log` 的
-    `used` 应等于真实 JPEG 字节数，主机 `ffprobe` 应报 `mjpeg 1280x720`。
+  - 该基线的格式（YUYV / 640×480 / 614400 字节帧）随后被 `519a4ee`、`56f8717`、`d5fb2d9`
+    改成了 **MJPEG + 阶梯**。2026-11-12 已用 App 真实相机复验：主机 `ffmpeg` 抓到
+    **2560×1440**（主机自选阶梯最高档），守护进程 `out=86`（3 秒约 90 帧），
+    `uvc_qbuf.log` 的 `used` 为 203–275 KB 的真实 JPEG 长度。
   - 之前判为“空白帧”是**测试方法问题**，不是 gadget 缺陷：重启后 AVFoundation 里
     UVC 相机的索引会变（曾由 `1` 变成 `0`），索引错了就开到内置相机上；
     另外用 `dd` 逐帧的喂帧脚本并未真正连上 47832。判据以 `uvc_qbuf.log` 的 `y0` 为准。
@@ -385,52 +386,58 @@ STREAMON/STREAMOFF。`VIDIOC_STREAMOFF` 不是“随时可用的暂停”。
 - ADB 保持：开启→关闭 USB 外设后 `adb devices` 仍有设备（`127ee43`、`a8098dc`）。
 - 画面源切换：FRONT→BACK→FRONT 全程守护进程 pid 不变、UDC 保持 `configured`（`36cb191`）。
 
-**摄像头（YUYV 640×480 已验证，MJPEG 720p 待验证）**：合成 NV21（Y=235）经 47832 灌入后，
-`/data/local/tmp/uvc_qbuf.log` 记录 `y0=235`，主机 `ffprobe` 收到 94 帧 640×480、
-首帧平均亮度 255。此前“空白帧”的结论来自错误的测试条件（AVFoundation 索引变化 +
-喂帧脚本未连上），与 gadget 无关。
+**摄像头（2026-11-12 已用 App 真实相机验证）**
 
-⚠️ 此后 `519a4ee` / `56f8717` / `d5fb2d9` 把整条视频链改成了 **1280x720 MJPEG**（App 采集侧
-压 JPEG、守护进程直通、`start.sh` 只暴露 `mjpeg/m/720p`、单帧上限 300000）：
+- 早期合成帧基线（YUYV 640×480）：灌入 Y=235 后 `uvc_qbuf.log` 记 `y0=235`，主机收到 94 帧。
+  此前“空白帧”的结论是测试方法错误（AVFoundation 索引变化 + 喂帧脚本未连上）。
+- 当前链路：App 采集 → JPEG → 47832 直通 → UVC MJPEG 阶梯。实测主机 `ffmpeg` 抓 3 秒，
+  `ffprobe` 报 **2560×1440**（主机自选阶梯最高档），守护进程 `out=86`，`used` 203–275 KB。
+- FRONT→BACK 切换实测：画面完全不同（首帧 PSNR 仅 **6.24 dB**），确认是另一路相机。
+- 仍待验证：SCREEN 源（需 MediaProjection 授权，只能 UI 确认）。
 
-- 代码已完成且已提交，但**未上机验证**；上面 640×480 的数字不代表当前代码。
-- 回滚判据：若 MJPEG 在本机跑不通，恢复为 640×480 YUYV 需同时改三处
-  （`UsbVideoSource` 的格式/尺寸、`uvc_stream.cpp` 的 `S_FMT`、`start.sh` 的 streaming 描述符），
-  单改一处只会导致主机停在 alt 0。
+复现步骤（App 驱动，2026-11-12 实测有效的顺序）：
 
-复现步骤：
-
-1. `start_test.sh`（相机开、音频关）绑定并启动守护进程，确认 `UVC: /dev/videoN ready`；
-2. 手机侧持续灌帧：
-   `(printf 'HELLO TESTTOKEN\n'; while true; do cat frames.bin; done) | nc 127.0.0.1 47832`；
-   MJPEG 验证时 `frames.bin` 需是「MRV1 帧头（format=2）+ 完整 JPEG」的完整帧；
-3. 主机侧先列设备（**每次重启后索引可能变**）：
-   `ffmpeg -f avfoundation -list_devices true -i ""`，确认 UVC 相机的当前索引；
-4. `ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i <索引> -t 3 /tmp/t.mkv`；
-5. 判据：`uvc_qbuf.log` 的 `used`（应等于该 JPEG 字节数）与主机 `ffprobe` 报的
-   `mjpeg 1280x720`。
-
-仍待补的验证：用 App 自己的相机源（前置/后置/屏幕）走同一条 47832 通道，
-而不是合成帧；管线代码已存在于 `UsbVideoSource`，需一次 App 驱动的会话。
+1. 主机线插着（厂商 gadget 已附着，`cat /sys/class/udc/a600000.dwc3/state` = `configured`）；
+2. App 里开 USB 外设（或发 START intent），等日志出现 `USB_SESSION_READY state=configured`；
+3. 主机列设备并确认索引（**每次重启后索引可能变**）：
+   `ffmpeg -f avfoundation -list_devices true -i ""`；
+4. 抓 3 秒：`ffmpeg -f avfoundation -framerate 30 -i <索引> -t 3 /tmp/t.mkv`；
+5. 判据：`ffprobe` 的尺寸命中阶梯某一档、守护进程统计 `out>0`、
+   `uvc_qbuf.log` 的 `used` 等于真实 JPEG 字节数。
 
 风险：含 UVC 的解绑/重绑已多次触发 `POWERUP_REASON kpanic`（11-11 两次、11-12 一次）；
 重启后厂商默认 gadget 自动恢复，App 不会自动重跑 USB 外设。
 画面源切换已不再走重绑（见 §13）。
 
-### 12.0 拔线后的状态刷新（2026-11-12 修复）
+### 12.0 生命周期状态机（2026-11-12 重写并实测）
 
-以前拔线后 UI 永远停在「已就绪」：拔线并不会 unbind gadget，UDC 只是从
-`configured` 变成 `not attached`，而服务只在 start/adopt/switchCamera 三处
-`publish()`，没有任何拔插监听。现在补上了三层：
+单一事实来源：`/sys/class/udc/a600000.dwc3/state`。`usb/online`(VBUS) 与
+`typec data_role` 在这台机上**不可靠**（拔线后仍读 1 / 显示 host 时数据其实是通的），
+只能做提示，不能做判据。
 
-1. `UsbManager.ACTION_USB_STATE`（`connected` extra）接收器 —— 插拔即时刷新；
-   注意这两个常量在公开 SDK 里被隐藏，代码里用字面量。
-2. 运行期 4 s 轮询 `controller.status()` 做兼底（某些宿主不发该广播）。
-3. 会话消失（daemon/gadget 没了）时把状态置为 `error` 并停止服务，
-   且 `teardownOnDestroy = false`（不去 unbind 半个死的 gadget）。
+| 状态 | 触发 → 行为 |
+| --- | --- |
+| OFF | 开启时先看 UDC：主机在线 → 直接接管；不在线 → ARMING |
+| ARMING | 「● 插线后自动开启」；主机一接上（厂商 gadget 变 `configured`）就自动接管 |
+| PROVISIONING | 执行 `start.sh`（UVC 描述符未变则复用 function） |
+| READY | 「● 运行中」；主机在线期间绝不解绑 |
+| WAITING | 主机离开 → **把端口交还厂商 gadget**，等它再次 `configured` 后自动接管 |
+| DISARMING | 插线时点关闭 → 「● 拔线后自动关闭」，拔线后才解绑并还原厂商 |
 
-拔线时先 `releaseAll()` 再改状态，避免主机侧留一个一直自动重复的按键。
-这条修复尚未上机验证。
+关键约束（都来自实测）：
+
+1. **无主机时绑定的 gadget 永不 attach**（PHY 醒但无 CONNECTED），所以只能借厂商
+   gadget 探测主机；这也是 WAITING 要把端口交还的原因。
+2. **有主机时解绑是三次 kpanic 的来源**（`module_put/__fput`、`percpu_ref` UAF、
+   slab 野指针），所以 stop 必须等拔线。
+3. UVC 是 `bind_deactivated`：守护进程必须先打开 `/dev/videoN` 才会 activate/attach，
+   不能因为「UDC 未附着」而不开节点（那会死锁）。
+4. 接管后 6 s 稳定窗口 + 恢复后「连续 2 次探测、稳定 3 s」才重新接管，避免与厂商
+   HAL 的重配竞态；绑定失败只给一次 3 s 重试。
+5. 拔线时先 `releaseAll()` 再改状态，避免主机侧留一个自动重复的按键。
+
+已验证：全功能接管、脱离→交还→自动重新接管、关闭延后与厂商还原（adb 保持）、
+音频空闲不再重连（30 s 计数 0）。
 
 ### 12.1 源码核对（2026-11-11，android13-5.15）
 
