@@ -9,8 +9,17 @@ A=$G/functions/uac2.marionette
 killall -TERM marionette_usbd 2>/dev/null
 sleep 0.2
 stop vendor.usbgadget-hal-1-1 2>/dev/null
-echo "" > $G/UDC
-sleep 0.4
+echo "" > $G/UDC 2>/dev/null
+# configfs rejects new links while a function is still bound (EBUSY). Wait for
+# the composite to actually let go of the UDC before touching descriptors;
+# otherwise every ln below fails silently and the host keeps the old format.
+i=0
+while [ -n "$(cat $G/UDC 2>/dev/null)" ] && [ $i -lt 30 ]; do
+  sleep 0.1
+  i=$((i + 1))
+  echo "" > $G/UDC 2>/dev/null
+done
+sleep 0.2
 echo high-speed > $G/max_speed 2>/dev/null
 
 cd $G/configs/b.1 || exit 10
@@ -29,23 +38,41 @@ HIDDEV=$(cat $H/dev 2>/dev/null)
 HIDMINOR=${HIDDEV#*:}
 HIDNODE=/dev/hidg$HIDMINOR
 
-# ---- UVC: 640x480 YUYV@30 ----
+# ---- UVC: 1280x720 MJPEG@30 ----
+# USB 2.0 (this port enumerates as high-speed through the adapter) tops out at
+# ~24.6 MB/s for one isoc endpoint. Uncompressed 720p needs 55 MB/s and native
+# 1080x2400 needs 155 MB/s, so the only way to carry 720p is a compressed UVC
+# format; MJPEG is supported by macOS and Windows without extra drivers.
 if [ "__ENABLE_CAMERA__" = "1" ]; then
+  # f_uvc freezes its streaming descriptors on first bind: after that, configfs
+  # answers EBUSY to any new format link even once the UDC is cleared, so a
+  # gadget provisioned by an older script can never gain MJPEG in place. Drop
+  # the whole function and build it again from scratch every time.
+  # (rm -rf fails on configfs: it unlinks attributes first and gets EPERM. Walk
+  # the tree deepest-first and rmdir instead.)
+  for d in $(find $F -mindepth 1 -depth -type d 2>/dev/null); do rmdir "$d" 2>/dev/null; done
+  rmdir $F 2>/dev/null
   mkdir $F 2>/dev/null
   mkdir -p $F/control/header/h
   [ -L $F/control/class/fs/h ] || ( cd $F/control/class/fs && ln -s ../../header/h h )
   [ -L $F/control/class/ss/h ] || ( cd $F/control/class/ss && ln -s ../../header/h h )
-  mkdir -p $F/streaming/uncompressed/u/640x480
-  D=$F/streaming/uncompressed/u/640x480
-  echo 640 > $D/wWidth 2>/dev/null
-  echo 480 > $D/wHeight 2>/dev/null
-  echo 614400 > $D/dwMaxVideoFrameBufferSize 2>/dev/null
+  mkdir -p $F/streaming/mjpeg/m/720p
+  D=$F/streaming/mjpeg/m/720p
+  echo 1280 > $D/wWidth 2>/dev/null
+  echo 720 > $D/wHeight 2>/dev/null
+  # Upper bound for one JPEG; the daemon reports the real size per frame.
+  echo 300000 > $D/dwMaxVideoFrameBufferSize 2>/dev/null
   echo 147456000 > $D/dwMinBitRate 2>/dev/null
   echo 147456000 > $D/dwMaxBitRate 2>/dev/null
   echo 333333 > $D/dwDefaultFrameInterval 2>/dev/null
   echo 333333 > $D/dwFrameInterval 2>/dev/null
   mkdir -p $F/streaming/header/h
-  [ -L $F/streaming/header/h/u ] || ( cd $F/streaming/header/h && ln -s ../../uncompressed/u u )
+  ( cd $F/streaming/header/h && ln -s ../../mjpeg/m m )
+  if [ ! -L $F/streaming/header/h/m ]; then
+    echo "UVC_LINK_FAILED header/h/m missing (udc=$(cat $G/UDC 2>/dev/null))" > /data/local/tmp/uvc_link.log
+  else
+    rm -f /data/local/tmp/uvc_link.log
+  fi
   [ -L $F/streaming/class/fs/h ] || ( cd $F/streaming/class/fs && ln -s ../../header/h h )
   [ -L $F/streaming/class/hs/h ] || ( cd $F/streaming/class/hs && ln -s ../../header/h h )
   [ -L $F/streaming/class/ss/h ] || ( cd $F/streaming/class/ss && ln -s ../../header/h h )
