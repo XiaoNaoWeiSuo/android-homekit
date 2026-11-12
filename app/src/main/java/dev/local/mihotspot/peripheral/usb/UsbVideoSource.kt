@@ -87,6 +87,9 @@ class UsbVideoSource(
          * settles at every second frame (~20 fps). Allow 25% early. */
         private const val MIN_FRAME_GAP_NANOS = FRAME_INTERVAL_NANOS * 3 / 4
         private const val DEFAULT_SCREEN_DPI = 320
+        /* How long to wait before retrying a camera open that failed because
+         * another session had not finished letting go of it. */
+        private const val CAMERA_RETRY_DELAY_MILLIS = 400L
     }
 
     /** Receives fatal capture errors. Invoked on the internal capture thread. */
@@ -314,8 +317,16 @@ class UsbVideoSource(
         val handler = requireWorkerHandler()
         reader.setOnImageAvailableListener({ r -> onCameraImage(r, gen) }, handler)
 
-        try {
-            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+        /*
+         * Opening can fail with "camera in use" when the previous session's
+         * release has not landed yet (a rapid switch, or a stale session left
+         * behind by an earlier crash). One delayed retry recovers that state;
+         * without it the host keeps the last frame and the picture looks
+         * frozen until the app is restarted.
+         */
+        fun open(attempt: Int) {
+            if (gen != generation.get()) return
+            val callback = object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     Log.i(TAG, "USB_CAMERA_OPENED after ${sinceStart()}ms")
                     if (gen != generation.get()) {
@@ -336,17 +347,43 @@ class UsbVideoSource(
 
                 override fun onError(device: CameraDevice, error: Int) {
                     device.close()
-                    if (gen == generation.get()) {
-                        if (cameraDevice === device) cameraDevice = null
-                        fail(gen, "相机错误 ($error)")
+                    if (gen != generation.get()) return
+                    if (cameraDevice === device) cameraDevice = null
+                    val busy = error == ERROR_CAMERA_IN_USE || error == ERROR_MAX_CAMERAS_IN_USE
+                    if (busy && attempt == 0) {
+                        retryOpen(handler, gen, "busy($error)") { open(1) }
+                        return
                     }
+                    fail(gen, "相机错误 ($error)")
                 }
-            }, handler)
-        } catch (e: SecurityException) {
-            fail(gen, "没有相机权限")
-        } catch (e: Exception) {
-            fail(gen, "打开相机失败: ${e.message ?: e.javaClass.simpleName}")
+            }
+
+            try {
+                manager.openCamera(cameraId, callback, handler)
+            } catch (e: SecurityException) {
+                fail(gen, "没有相机权限")
+            } catch (e: Exception) {
+                if (attempt == 0) {
+                    retryOpen(handler, gen, e.javaClass.simpleName) { open(1) }
+                } else {
+                    fail(gen, "打开相机失败: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }
         }
+        open(0)
+    }
+
+    /** Retries a camera open once, after releasing whatever is still holding it. */
+    private fun retryOpen(handler: Handler, gen: Long, reason: String, open: () -> Unit) {
+        Log.i(TAG, "USB_CAMERA_OPEN_RETRY reason=$reason")
+        handler.postDelayed(
+            {
+                if (gen != generation.get()) return@postDelayed
+                releaseCameraOnWorker()
+                open()
+            },
+            CAMERA_RETRY_DELAY_MILLIS
+        )
     }
 
     private fun findCameraId(manager: CameraManager, facing: Int): String? {
