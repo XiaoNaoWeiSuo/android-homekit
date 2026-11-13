@@ -71,7 +71,7 @@ object UsbPeripheralStatus {
     }
 
     private fun startingRecently(): Boolean =
-        SystemClock.elapsedRealtime() - startRequestedAt < START_GRACE_MS
+        startRequestedAt != 0L && SystemClock.elapsedRealtime() - startRequestedAt < START_GRACE_MS
 
     /**
      * Published by [UsbPeripheralService] whenever it learns a new session state.
@@ -84,6 +84,7 @@ object UsbPeripheralStatus {
         hostAttached: Boolean?,
         hint: String? = null
     ) {
+        startRequestedAt = 0L
         liveState = state
         liveDetail = detail
         liveHint = hint
@@ -91,12 +92,13 @@ object UsbPeripheralStatus {
         liveReady = state == "ready" || state == "waiting" ||
             state == "armed" || state == "armed_stop"
         UsbSession.setState(context, state, liveHostAttached, detail, hint)
-        if (liveReady) UsbSession.setEnabled(context, true)
+        if (liveReady && state != "armed_stop") UsbSession.setEnabled(context, true)
         cache(serviceSnapshot(context))
     }
 
     /** Published by [UsbPeripheralService.onDestroy] once the session is gone. */
     fun onServiceStopped(context: Context) {
+        startRequestedAt = 0L
         liveState = "off"
         liveDetail = null
         liveHint = null
@@ -125,7 +127,12 @@ object UsbPeripheralStatus {
 
     /** Cheap, main-thread safe: memory and SharedPreferences only, never root. */
     fun snapshot(context: Context): Snapshot {
-        if (UsbPeripheralService.running) return serviceSnapshot(context)
+        if (UsbPeripheralService.servicePresent && liveState != null && liveState != "off") {
+            return serviceSnapshot(context)
+        }
+        if (startingRecently() && UsbSession.isEnabled(context)) {
+            return off().copy(pending = true, enabled = true, state = "starting")
+        }
         val cachedValue = cached
         if (cachedValue != null &&
             SystemClock.elapsedRealtime() - cachedAt <= VERIFY_CACHE_MS
@@ -163,19 +170,7 @@ object UsbPeripheralStatus {
      * because unbinding a gadget can wedge the vendor kernel.
      */
     fun verify(context: Context): Snapshot {
-        if (UsbPeripheralService.running) return cache(serviceSnapshot(context))
-        if (startingRecently()) {
-            return cache(
-                Snapshot(
-                    active = false,
-                    hostAttached = false,
-                    pending = true,
-                    enabled = true,
-                    state = "starting",
-                    detail = "USB 外设正在绑定"
-                )
-            )
-        }
+        if (UsbPeripheralService.servicePresent || startingRecently()) return snapshot(context)
         if (!UsbSession.isEnabled(context)) {
             UsbSession.setState(context, "off", false, null)
             return cache(off())
@@ -215,16 +210,6 @@ object UsbPeripheralStatus {
                 detail = status.raw
             )
         )
-    }
-
-    /** UsbPeripheralActivity can clear the record right after it stops the session. */
-    fun forget(context: Context) {
-        liveState = "off"
-        liveDetail = null
-        liveReady = false
-        liveHostAttached = false
-        UsbSession.setState(context, "off", false, null)
-        cache(off())
     }
 
     private fun cache(value: Snapshot): Snapshot {

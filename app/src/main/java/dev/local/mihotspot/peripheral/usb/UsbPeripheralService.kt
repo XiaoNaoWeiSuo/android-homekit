@@ -64,11 +64,15 @@ class UsbPeripheralService : Service() {
         @Volatile var running: Boolean = false
             private set
 
+        @Volatile internal var servicePresent = false
+            private set
+
         /** What the live session is actually streaming; decides in-place swaps. */
         @Volatile private var activeCamera = UsbCameraSource.OFF
         @Volatile private var activeAudio = false
 
         fun streamingCamera(): UsbCameraSource = activeCamera
+        internal fun streamingAudio(): Boolean = activeAudio
 
         fun start(
             context: Context,
@@ -115,6 +119,11 @@ class UsbPeripheralService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, UsbPeripheralService::class.java))
+        }
+
+        /** Stop through the serialized session path, including its cable safety check. */
+        internal fun stopFromUi(context: Context) {
+            context.startForegroundService(Intent(context, UsbPeripheralService::class.java).setAction(ACTION_STOP))
         }
 
         /**
@@ -236,6 +245,7 @@ class UsbPeripheralService : Service() {
     override fun onCreate() {
         super.onCreate()
         controller = UsbGadgetController(this)
+        servicePresent = true
         ensureChannel()
         registerCableReceiver()
         startForegroundCompat(buildNotification("正在准备 USB 外设…"))
@@ -904,6 +914,8 @@ class UsbPeripheralService : Service() {
 
     /** Public stop entry: serialises against a provisioning run. */
     private fun requestStop() {
+        UsbSession.setEnabled(this, false)
+        publish("stopping", "正在停止 USB 外设", hint = "正在恢复普通 USB 模式")
         pendingStart = null
         mainHandler.removeCallbacks(pendingPoll)
         if (provisioning) {
@@ -929,9 +941,15 @@ class UsbPeripheralService : Service() {
          * stop.sh here would unbind the vendor gadget for no reason.
          */
         if (!provisioned) {
+            // A request can reach a fresh service after the app process died.
+            // Verify that the composition belongs to Marionette before touching it.
             teardownOnDestroy = false
-            stopSelf()
-            return
+            val survivingSession = runCatching { controller.status() }.getOrNull()
+            provisioned = survivingSession?.let { it.ready && it.gadgetBound } == true
+            if (!provisioned) {
+                stopSelf()
+                return
+            }
         }
         provisioning = true
         try {
@@ -1038,7 +1056,7 @@ class UsbPeripheralService : Service() {
         // `armed_stop` are lifecycle states too - dropping them here left the UI
         // reading a stale "ready" after a real unplug.
         if (state == "ready" || state == "waiting" || state == "error" ||
-            state == "armed" || state == "armed_stop"
+            state == "armed" || state == "armed_stop" || state == "stopping"
         ) {
             UsbPeripheralStatus.onServiceState(this, state, detail, hostAttached, hint)
         }
@@ -1072,6 +1090,7 @@ class UsbPeripheralService : Service() {
         if (teardownOnDestroy) executor.execute { controller.stop() }
         executor.shutdown()
         running = false
+        servicePresent = false
         activeCamera = UsbCameraSource.OFF
         activeAudio = false
         UsbSession.setEnabled(this, false)

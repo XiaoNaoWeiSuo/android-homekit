@@ -1,29 +1,22 @@
 package dev.local.mihotspot
 
 import android.Manifest
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.text.TextUtils
+import android.widget.ProgressBar
 import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
-import android.text.Editable
-import android.text.TextWatcher
 import android.view.Gravity
-import android.view.HapticFeedbackConstants
 import android.view.View
-import android.view.ViewGroup
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.FrameLayout
 import android.widget.ImageView
-import android.widget.RadioButton
-import android.widget.RadioGroup
-import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
@@ -56,22 +49,30 @@ import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
 import android.app.PendingIntent
-import android.content.res.ColorStateList
-import android.graphics.drawable.GradientDrawable
 import dev.local.mihotspot.ui.UiTheme
-import dev.local.mihotspot.ui.createHelpBubble
-import dev.local.mihotspot.ui.createSectionHeader
-import dev.local.mihotspot.ui.createCard
-import dev.local.mihotspot.ui.createCardDivider
-import dev.local.mihotspot.ui.createStatusBadge
-import dev.local.mihotspot.ui.createPageHeader
-import dev.local.mihotspot.ui.onHapticClick
 import dev.local.mihotspot.peripheral.BtHidPeripheral
 import dev.local.mihotspot.peripheral.KeyHaptics
 import dev.local.mihotspot.peripheral.KeySounds
 import dev.local.mihotspot.peripheral.PeripheralHub
 import dev.local.mihotspot.peripheral.PeripheralPadActivity
 import dev.local.mihotspot.peripheral.PeripheralService
+import dev.local.mihotspot.airdrop.AirDropState
+import dev.local.mihotspot.airdrop.AirDropActivity
+import dev.local.mihotspot.airdrop.AirDropResidentService
+import dev.local.mihotspot.airdrop.AirDropService
+import dev.local.mihotspot.airdrop.AirDropStore
+import dev.local.mihotspot.airdrop.confirmAirDropReception
+import dev.local.mihotspot.peripheral.usb.UsbCameraSource
+import dev.local.mihotspot.peripheral.usb.UsbSession
+import dev.local.mihotspot.peripheral.usb.isSwitchOn
+import dev.local.mihotspot.airdrop.airDropStatus
+import dev.local.mihotspot.peripheral.usb.usbStatus
+import dev.local.mihotspot.ui.ProductUi
+import dev.local.mihotspot.ui.ScreenRoutes
+import dev.local.mihotspot.ui.StatusTone
+import dev.local.mihotspot.ui.Symbol
+import dev.local.mihotspot.ui.UiStatus
+import dev.local.mihotspot.ui.renderStatus
 
 private class SliderWriteState {
     val lock = Any()
@@ -83,36 +84,36 @@ private class SliderWriteState {
 }
 
 class MainActivity : Activity() {
-    private lateinit var titleView: TextView
+    private enum class Route {
+        HOME, HOMEKIT, PAIRING, DEVICE, MEDIA, NETWORK, HOTSPOT, SYSTEM, ACCESS, BROADCAST, RECOVERY,
+        PERIPHERALS, BLUETOOTH, INPUT, FEEDBACK
+    }
+
+    private val ui by lazy { ProductUi(this) }
+    private lateinit var routes: ScreenRoutes<Route>
+    private val inputPrefs by lazy { getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE) }
     private lateinit var statusBadge: TextView
     private lateinit var rootBadge: TextView
     private lateinit var statusInfo: TextView
     private lateinit var serviceSwitch: Switch
+    private var updatingServiceSwitch = false
     private lateinit var hidSwitch: Switch
-    private lateinit var hidStatusBadge: TextView
     private lateinit var hidDetailText: TextView
-    /** Last HID state seen, so the peripheral entry can be re-evaluated without a new event. */
     private var hidState: BtHidPeripheral.State = BtHidPeripheral.State.STOPPED
     private var lastHidFailure: String? = null
     private val usbStateProbe = AtomicBoolean(false)
-    private var peripheralModesCard: LinearLayout? = null
-    private var peripheralModesHint: TextView? = null
-    private var hidSettingsPage: View? = null
-    private var hidHapticsPage: View? = null
     private var hidPageBadge: TextView? = null
-    private var hapticsSwitch: Switch? = null
+    private var bondedHosts: LinearLayout? = null
+    private var lastBondedHosts: List<Pair<String, String>>? = null
     private var updatingHidSwitch = false
     private var pendingHidEnable = false
     private var brightnessSeek: SeekBar? = null
     private var volumeSeek: SeekBar? = null
     private var brightnessValueText: TextView? = null
     private var volumeValueText: TextView? = null
-    /** Whether HomeKit is allowed to invoke each command; independent from live state. */
-    private val commandEnableToggles = mutableMapOf<HomeKitFeature, CheckBox>()
     private val featureButtons = mutableMapOf<HomeKitFeature, Button>()
     private val featureLoading = mutableSetOf<HomeKitFeature>()
     private val refreshingState = AtomicBoolean(false)
-    private var rootStatus = "Root检测中"
     private val stateRefreshHandler = Handler(Looper.getMainLooper())
     private val stateRefreshRunnable = object : Runnable {
         override fun run() {
@@ -130,20 +131,36 @@ class MainActivity : Activity() {
     private val brightnessSliderState = SliderWriteState()
     private val volumeSliderState = SliderWriteState()
     private val viewModel by lazy { MainViewModel(this) }
-    private var pairingCard: LinearLayout? = null
+    private var pairingState: TextView? = null
     private var pairingQrView: ImageView? = null
-    private var pairingCardTitle: TextView? = null
-    private var pairingCardHint: TextView? = null
-    private var pairingCardKeyLabel: TextView? = null
-    private var pairingCardKey: TextView? = null
+    private var pairingCode: TextView? = null
+    private var pairingHint: TextView? = null
+    private var renderedSetupPayload: String? = null
+    private var deviceNameValue: TextView? = null
     private var pairingModeSummary: TextView? = null
     private var strategySummary: TextView? = null
-    private var strategyRadioGroup: RadioGroup? = null
-    private var pairingPayloadText: TextView? = null
-    private var airDropStatusBadge: TextView? = null
-    private var airDropSummaryText: TextView? = null
-    private var mainPage: View? = null
-    private var settingsPage: View? = null
+    private lateinit var overviewHomeKitStatus: TextView
+    private lateinit var overviewHomeKitDetail: TextView
+    private lateinit var overviewHomeKitSwitch: Switch
+    private lateinit var overviewAirDropStatus: TextView
+    private lateinit var overviewAirDropDetail: TextView
+    private lateinit var overviewAirDropSwitch: Switch
+    private lateinit var overviewAirDropProgress: ProgressBar
+    private lateinit var overviewBluetoothStatus: TextView
+    private lateinit var overviewBluetoothDetail: TextView
+    private lateinit var overviewBluetoothSwitch: Switch
+    private lateinit var overviewUsbStatus: TextView
+    private lateinit var overviewUsbDetail: TextView
+    private lateinit var overviewUsbSwitch: Switch
+    private var updatingOverviewSwitches = false
+    private var airDropTarget: Boolean? = null
+    private var airDropRequestUntil = 0L
+    private var usbStartRequested = false
+    private var usbStopRequestedUntil = 0L
+    private var peripheralHidStatus: TextView? = null
+    private var peripheralUsbStatus: TextView? = null
+    private var keyboardShortcut: View? = null
+    private val airDropUiListener: () -> Unit = { if (!isDestroyed) refreshAirDropCard() }
     private var eventsRegistered = false
     private var nfcWriteArmed = false
     private var nfcStatusText: TextView? = null
@@ -176,7 +193,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(buildUi())
+        usbStartRequested = savedInstanceState?.getBoolean("usbStartRequested") == true
+        pendingHidEnable = savedInstanceState?.getBoolean("pendingHidEnable") == true
+        setContentView(buildUi(savedInstanceState))
         updatePairingCard()
         updateConnectionStatus()
         PeripheralHub.bridge(this).addListener(hidListener)
@@ -195,6 +214,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         registerUiEvents()
+        AirDropState.addListener(airDropUiListener)
         if (nfcWriteArmed) enableNfcForegroundDispatch()
         updateConnectionStatus(refreshRoot = false)
         updateNfcStatus()
@@ -204,6 +224,7 @@ class MainActivity : Activity() {
         ensureHidRunningIfEnabled()
         applyHidState(PeripheralHub.bridge(this).state, PeripheralHub.bridge(this).hostName)
         refreshUsbPeripheralState(verify = true)
+        refreshOverviewStatuses()
         stateRefreshHandler.removeCallbacks(stateRefreshRunnable)
         stateRefreshHandler.postDelayed(stateRefreshRunnable, 3_000L)
     }
@@ -212,6 +233,7 @@ class MainActivity : Activity() {
         stateRefreshHandler.removeCallbacks(stateRefreshRunnable)
         disableNfcForegroundDispatch()
         unregisterUiEvents()
+        AirDropState.removeListener(airDropUiListener)
         super.onPause()
     }
 
@@ -224,857 +246,839 @@ class MainActivity : Activity() {
         viewModel.close()
     }
 
-    @Suppress("DEPRECATION")
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString("route", routes.current?.name)
+        outState.putBoolean("usbStartRequested", usbStartRequested)
+        outState.putBoolean("pendingHidEnable", pendingHidEnable)
+    }
+
+    @Deprecated("Legacy Activity Back API")
     override fun onBackPressed() {
-        when {
-            hidHapticsPage?.visibility == View.VISIBLE -> backFromHidHaptics()
-            hidSettingsPage?.visibility == View.VISIBLE -> backFromHidSettings()
-            settingsPage?.visibility == View.VISIBLE -> showMainPage()
-            else -> super.onBackPressed()
-        }
+        if (!routes.back()) super.onBackPressed()
     }
 
     private fun dp(v: Float): Int = UiTheme.dp(this, v)
     private fun dp(v: Int): Int = dp(v.toFloat())
 
-    private fun buildUi(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            setPadding(0, dp(12), 0, dp(24))
-        }
-
-        // === Header Card: Title, Status Pills, Service Switch, Settings Button ===
-        val headerCard = createCard(this, verticalPaddingDp = 14f, horizontalPaddingDp = 16f)
-        val topRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val titleCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-
-        titleView = TextView(this).apply {
-            text = "Marionette"
-            textSize = 20f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        }
-        titleCol.addView(titleView)
-
-        val badgeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, 0)
-        }
-        statusBadge = createStatusBadge(this, "● 等待连接", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-        badgeRow.addView(statusBadge)
-
-        val badgeSpacer = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(6), 1)
-        }
-        badgeRow.addView(badgeSpacer)
-
-        rootBadge = createStatusBadge(this, "Root检测中", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-        badgeRow.addView(rootBadge)
-
-        val badgeSpacer2 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(6), 1)
-        }
-        badgeRow.addView(badgeSpacer2)
-        hidStatusBadge = createStatusBadge(this, "HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-        badgeRow.addView(hidStatusBadge)
-
-        titleCol.addView(badgeRow)
-        topRow.addView(titleCol)
-
-        serviceSwitch = Switch(this).apply {
-            text = "HomeKit"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            isChecked = ServiceControl.isEnabled(this@MainActivity)
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            setOnCheckedChangeListener { _, checked ->
-                if (checked) {
-                    ensurePermissionsAndStart()
-                } else {
-                    stopHomeKitService()
-                }
-            }
-        }
-
-        val settingsBtn = Button(this).apply {
-            text = "设置"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(dp(64), dp(38)).apply {
-                setMargins(dp(10), 0, 0, 0)
-            }
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 19f)
-            onHapticClick { showSettingsPage() }
-            contentDescription = "打开设备设置"
-        }
-        topRow.addView(settingsBtn)
-
-        headerCard.addView(topRow)
-
-        // Two product switches in the same header card: HomeKit and HID.
-        val switchRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        switchRow.addView(
-            serviceSwitch,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        hidSwitch = Switch(this).apply {
-            text = "HID"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            isChecked = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-                .getBoolean(BtHidPeripheral.KEY_ENABLED, false)
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            setOnCheckedChangeListener { _, checked ->
-                if (updatingHidSwitch) return@setOnCheckedChangeListener
-                if (checked) enableHidFromUi() else disableHidFromUi()
-            }
-        }
-        switchRow.addView(
-            hidSwitch,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        headerCard.addView(switchRow)
-
-        // Reason shown when HID registration fails; silence used to leave the
-        // user with a switch that did nothing.
-        hidDetailText = TextView(this).apply {
-            textSize = 11f
-            setTextColor(UiTheme.COLOR_DANGER)
-            setPadding(0, dp(6), 0, 0)
-            visibility = View.GONE
-        }
-        headerCard.addView(hidDetailText)
-
-        statusInfo = TextView(this).apply {
-            textSize = 12f
-            typeface = Typeface.MONOSPACE
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(0, dp(10), 0, 0)
-        }
-        headerCard.addView(statusInfo)
-        root.addView(headerCard)
-
-        pairingCard = buildPairingCard()
-        root.addView(pairingCard)
-
-        // === Bluetooth HID peripheral entry (keyboard + touchpad) ===
-        peripheralModesCard = buildPeripheralModesCard()
-        root.addView(peripheralModesCard)
-
-        // === Device name card ===
-        val nameCard = createCard(this, verticalPaddingDp = 10f, horizontalPaddingDp = 16f)
-        val nameRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val nameLabel = TextView(this).apply {
-            text = "设备名称"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        }
-        nameRow.addView(nameLabel)
-
-        val nameHelp = createHelpBubble(
-            this,
-            "设备名称说明",
-            "此名称将作为 BLE 广播名称和 HomeKit 配件在家庭 App 中显示的设备名称。保存后服务将自动重启广播以应用新名称。"
-        )
-        nameRow.addView(nameHelp)
-
-        val nameEdit = EditText(this).apply {
-            hint = "设置设备名称"
-            setText(viewModel.deviceName)
-            setSingleLine(true)
-            textSize = 14f
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = GradientDrawable().apply {
-                cornerRadius = dp(8).toFloat()
-                setColor(UiTheme.COLOR_INPUT_BG)
-            }
-            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                setMargins(dp(8), 0, dp(8), 0)
-            }
-            layoutParams = lp
-        }
-        nameRow.addView(nameEdit)
-
-        val nameSaveBtn = Button(this).apply {
-            text = "保存"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(dp(64), dp(38))
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 12f)
-            onHapticClick {
-                val name = nameEdit.text.toString().trim()
-                if (name.isNotEmpty()) {
-                    viewModel.saveDeviceName(name)
-                    log("DEVICE_NAME_UPDATED name=$name")
-                    restartHomeKitService()
-                    Toast.makeText(this@MainActivity, "设备名称已保存", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-        nameRow.addView(nameSaveBtn)
-        nameCard.addView(nameRow)
-        root.addView(nameCard)
-
-        // === Feature Controls ===
-        val featuresHelp = "• 左侧开关：设置是否允许 HomeKit 远程读取与控制该功能。\n• 右侧按钮：当前设备真实状态（ON/OFF），点击可立即在本地切换并测试该功能。"
-        root.addView(createSectionHeader(this, "功能控制", "功能控制说明", featuresHelp))
-
-        val featuresCard = createCard(this, verticalPaddingDp = 4f, horizontalPaddingDp = 16f)
-        HomeKitFeature.tileFeatures.forEachIndexed { index, feature ->
-            if (index > 0) {
-                featuresCard.addView(createCardDivider(this))
-            }
-            featuresCard.addView(buildFeatureRow(feature))
-        }
-        root.addView(featuresCard)
-
-        // === Continuous Adjustments ===
-        val slidersHelp = "支持屏幕亮度和媒体音量的平滑调节。\n• 亮度档位已映射为 Android 系统真值。\n• 滑块操作自带防抖与延迟平抑，避免与 HomeKit 定时轮询互相冲突。"
-        root.addView(createSectionHeader(this, "连续调节", "连续调节说明", slidersHelp))
-
-        val slidersCard = createCard(this, verticalPaddingDp = 14f, horizontalPaddingDp = 16f)
-
-        // Brightness
-        val bHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val bLabel = TextView(this).apply {
-            text = "屏幕亮度"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        brightnessValueText = TextView(this).apply {
-            text = "0%"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_ACCENT)
-        }
-        bHeader.addView(bLabel)
-        bHeader.addView(brightnessValueText)
-        slidersCard.addView(bHeader)
-
-        brightnessSeek = SeekBar(this).apply {
-            max = 100
-            val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, dp(8), 0, dp(12))
-            }
-            layoutParams = p
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
-                    if (!fromUser) return
-                    brightnessValueText?.text = "$progress%"
-                    scheduleSliderWrite(brightnessSliderState, brightnessDebounce, progress) {
-                        setBrightnessFromUi(it)
-                    }
-                }
-                override fun onStartTrackingTouch(s: SeekBar) {
-                    brightnessSliderState.tracking = true
-                    brightnessSliderState.pendingRunnable?.let(brightnessDebounce::removeCallbacks)
-                    brightnessSliderState.pendingRunnable = null
-                }
-                override fun onStopTrackingTouch(s: SeekBar) {
-                    brightnessSliderState.pendingRunnable?.let(brightnessDebounce::removeCallbacks)
-                    brightnessSliderState.pendingRunnable = null
-                    brightnessSliderState.tracking = false
-                    setBrightnessFromUi(s.progress)
-                }
+    private fun buildUi(saved: Bundle?): View {
+        routes = ScreenRoutes(this)
+        routes.register(Route.HOME, null, buildOverviewPage())
+        page(Route.HOMEKIT, Route.HOME, "HomeKit") {
+            serviceSwitch = settingSwitch("启用 HomeKit", ServiceControl.isEnabled(this@MainActivity), ::changeHomeKitEnabled)
+            statusBadge = ui.status()
+            addView(ui.surface().apply {
+                addView(ui.row("家庭连接", "通过蓝牙在 Apple 家庭中使用这台手机", serviceSwitch, Symbol.HOME))
+                addView(statusBadge, LinearLayout.LayoutParams(-2, -2))
+            })
+            addView(ui.surface().apply {
+                addView(ui.row("配对与设备名称", "扫码、输入配对码或写入 NFC 标签", symbol = Symbol.LINK) { open(Route.PAIRING) })
+                addView(ui.row("本机控制", "显示与声音、网络、设备状态", symbol = Symbol.SLIDERS) { open(Route.DEVICE) })
+                addView(ui.row("家庭控制权限", "选择 Apple 家庭可以操作的项目", symbol = Symbol.SETTINGS) { open(Route.ACCESS) })
+            })
+            addView(ui.surface().apply {
+                addView(ui.row("广播与响应", "选择发现速度和功耗", symbol = Symbol.BLUETOOTH) { open(Route.BROADCAST) })
+                addView(ui.row("配件维护", "查看配件 ID、修复或清除配对", symbol = Symbol.POWER) { open(Route.RECOVERY) })
             })
         }
-        slidersCard.addView(brightnessSeek)
-
-        slidersCard.addView(createCardDivider(this))
-
-        // Volume
-        val vHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        val vLabel = TextView(this).apply {
-            text = "媒体音量"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        volumeValueText = TextView(this).apply {
-            text = "0%"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_ACCENT)
-        }
-        vHeader.addView(vLabel)
-        vHeader.addView(volumeValueText)
-        slidersCard.addView(vHeader)
-
-        volumeSeek = SeekBar(this).apply {
-            max = 100
-            val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, dp(8), 0, dp(4))
+        page(Route.PAIRING, Route.HOMEKIT, "配对与设备名称") {
+            pairingState = ui.text("", 16, bold = true)
+            pairingHint = ui.text("", 13, UiTheme.COLOR_TEXT_SECONDARY)
+            pairingCode = ui.text("", 22, UiTheme.COLOR_ACCENT, bold = true)
+            pairingQrView = ImageView(this@MainActivity).apply {
+                contentDescription = "HomeKit 配对二维码"
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                layoutParams = LinearLayout.LayoutParams(dp(188), dp(188)).apply { gravity = Gravity.CENTER_HORIZONTAL }
             }
-            layoutParams = p
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
-                    if (!fromUser) return
-                    volumeValueText?.text = "$progress%"
-                    scheduleSliderWrite(volumeSliderState, volumeDebounce, progress) {
-                        setVolumeFromUi(it)
+            addView(ui.surface().apply {
+                addView(pairingState)
+                addView(pairingQrView)
+                addView(pairingCode)
+                addView(pairingHint)
+            })
+            addView(ui.surface().apply {
+                addView(ui.row("设备名称", trailing = ui.text(viewModel.deviceName).also { deviceNameValue = it }) {
+                    editName("HomeKit 设备名称", viewModel.deviceName) {
+                        viewModel.saveDeviceName(it)
+                        deviceNameValue?.text = it
+                        restartHomeKitIfEnabled()
                     }
-                }
-                override fun onStartTrackingTouch(s: SeekBar) {
-                    volumeSliderState.tracking = true
-                    volumeSliderState.pendingRunnable?.let(volumeDebounce::removeCallbacks)
-                    volumeSliderState.pendingRunnable = null
-                }
-                override fun onStopTrackingTouch(s: SeekBar) {
-                    volumeSliderState.pendingRunnable?.let(volumeDebounce::removeCallbacks)
-                    volumeSliderState.pendingRunnable = null
-                    volumeSliderState.tracking = false
-                    setVolumeFromUi(s.progress)
-                }
+                })
+                addView(ui.row("配对方式", trailing = ui.text("").also { pairingModeSummary = it }) { choosePairingMode() })
+                addView(ui.row("修改 8 位配对码") { showSetupCodeDialog() })
+                addView(ui.row("写入 NFC 标签", "使用可写的 NFC Forum Type 2 标签") { armNfcWriter() })
+                nfcStatusText = ui.text("", 12, UiTheme.COLOR_TEXT_SECONDARY)
+                addView(nfcStatusText)
             })
         }
-        slidersCard.addView(volumeSeek)
-
-        root.addView(slidersCard)
-
-        // === AirDrop Feature Entry ===
-        val airDropHelp = "• 原生实验扩展：基于点对点 AWDL 协议，面向苹果设备的「所有人」模式。\n• 常驻待机：开机自启并保持正常 Wi-Fi 联网，兼容驱动就绪后可实现无缝后台互传。\n• 独占实验：10 分钟临时会话，用于当前硬件的收发协议与功能验证。"
-        root.addView(createSectionHeader(this, "AirDrop 互传", "AirDrop 说明", airDropHelp))
-
-        val airDropCard = createCard(this, verticalPaddingDp = 14f, horizontalPaddingDp = 16f).apply {
-            background = UiTheme.createButtonRipple(
-                this@MainActivity,
-                UiTheme.COLOR_CARD_BG,
-                UiTheme.adjustAlpha(Color.BLACK, 0.05f),
-                radiusDp = 16f,
-                strokeColor = UiTheme.COLOR_CARD_BORDER,
-                strokeWidthDp = 0.8f
-            )
-            isClickable = true
-            isFocusable = true
-            onHapticClick {
-                startActivity(Intent(this@MainActivity, dev.local.mihotspot.airdrop.AirDropActivity::class.java))
+        page(Route.DEVICE, Route.HOMEKIT, "本机控制") {
+            addView(ui.surface().apply {
+                addView(ui.row("显示与声音", "屏幕、亮度、媒体音量、静音", symbol = Symbol.DISPLAY) { open(Route.MEDIA) })
+                addView(ui.row("网络与定位", "热点、移动数据、定位", symbol = Symbol.NETWORK) { open(Route.NETWORK) })
+                addView(ui.row("设备状态", "手电筒、省电和勿扰", symbol = Symbol.POWER) { open(Route.SYSTEM) })
+            })
+        }
+        page(Route.MEDIA, Route.DEVICE, "显示与声音") {
+            addView(ui.surface().apply {
+                addView(featureControl(HomeKitFeature.SCREEN))
+                addView(liveSlider("屏幕亮度", brightnessSliderState, brightnessDebounce, ::setBrightnessFromUi) { seek, value ->
+                    brightnessSeek = seek
+                    brightnessValueText = value
+                })
+            })
+            addView(ui.surface().apply {
+                addView(featureControl(HomeKitFeature.MUTE))
+                addView(liveSlider("媒体音量", volumeSliderState, volumeDebounce, ::setVolumeFromUi) { seek, value ->
+                    volumeSeek = seek
+                    volumeValueText = value
+                })
+            })
+        }
+        page(Route.NETWORK, Route.DEVICE, "网络与定位") {
+            addView(ui.surface().apply {
+                addView(featureControl(HomeKitFeature.HOTSPOT))
+                addView(ui.row("配置热点", "名称、密码、频段和自动关闭") { open(Route.HOTSPOT) })
+            })
+            addView(ui.surface().apply {
+                addView(featureControl(HomeKitFeature.MOBILE_DATA))
+                addView(featureControl(HomeKitFeature.GPS))
+            })
+        }
+        page(Route.HOTSPOT, Route.NETWORK, "配置热点") { addView(buildHotspotSettings()) }
+        page(Route.SYSTEM, Route.DEVICE, "设备状态") {
+            addView(ui.surface().apply {
+                addView(featureControl(HomeKitFeature.FLASHLIGHT))
+                addView(featureControl(HomeKitFeature.LOW_POWER_MODE))
+                addView(featureControl(HomeKitFeature.DO_NOT_DISTURB))
+            })
+        }
+        page(Route.ACCESS, Route.HOMEKIT, "家庭控制权限") {
+            addView(ui.text("关闭某项权限后，仍可在本机操作。", 14, UiTheme.COLOR_TEXT_SECONDARY))
+            listOf(
+                "显示与声音" to listOf(HomeKitFeature.SCREEN, HomeKitFeature.BRIGHTNESS, HomeKitFeature.MUTE),
+                "网络与定位" to listOf(HomeKitFeature.HOTSPOT, HomeKitFeature.MOBILE_DATA, HomeKitFeature.GPS),
+                "设备状态" to listOf(HomeKitFeature.FLASHLIGHT, HomeKitFeature.LOW_POWER_MODE, HomeKitFeature.DO_NOT_DISTURB)
+            ).forEach { (label, features) ->
+                addView(ui.section(label))
+                addView(ui.surface().apply {
+                    features.forEach { feature ->
+                        addView(ui.row(feature.title, trailing = settingSwitch(feature.title, viewModel.isFeatureEnabled(feature)) {
+                            viewModel.setFeatureEnabled(feature, it)
+                        }))
+                    }
+                })
             }
         }
-
-        val airDropRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        page(Route.BROADCAST, Route.HOMEKIT, "广播与响应") {
+            strategySummary = ui.status()
+            addView(ui.surface().apply {
+                addView(strategySummary, LinearLayout.LayoutParams(-2, -2))
+                addView(ui.row("响应策略", "自动模式会在夜间降低功耗") { chooseBroadcastStrategy() })
+            })
         }
-
-        val airDropTextCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        page(Route.RECOVERY, Route.HOMEKIT, "配件维护") {
+            statusInfo = ui.text("")
+            rootBadge = ui.status()
+            addView(ui.surface().apply {
+                addView(statusInfo)
+                addView(rootBadge, LinearLayout.LayoutParams(-2, -2))
+            })
+            addView(ui.surface().apply {
+                addView(ui.row("清除家庭配对", "保留配件 ID，之后可重新配对") {
+                    confirmAction("清除家庭配对？", "需要在 Apple 家庭中重新添加配件。", ::clearPairingState)
+                })
+                addView(ui.row("重置配件 ID", "为这台手机生成新的配件身份") {
+                    confirmAction("重置配件 ID？", "会同时清除现有配对。", ::resetAccessoryId)
+                })
+                addView(ui.row("修复配对与名称", "更换配件身份并清理缓存", action = ::confirmHomeKitRecovery))
+            })
         }
-
-        val airDropTitleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        page(Route.PERIPHERALS, Route.HOME, "外设") {
+            val bt = ui.status().also { peripheralHidStatus = it }
+            val usb = ui.status().also { peripheralUsbStatus = it }
+            addView(ui.surface().apply {
+                addView(ui.row("蓝牙键鼠", "配对或切换主机", bt, Symbol.BLUETOOTH) { open(Route.BLUETOOTH) })
+                addView(ui.row("USB 外设", "键鼠、摄像头、麦克风和扬声器", usb, Symbol.USB) {
+                    startActivity(Intent(this@MainActivity, UsbPeripheralActivity::class.java))
+                })
+            })
+            addView(ui.surface().apply {
+                addView(ui.row("键盘与触控板", "调整显示方式、指针速度和按键反馈", symbol = Symbol.KEYBOARD) { open(Route.INPUT) })
+            })
         }
+        page(Route.BLUETOOTH, Route.PERIPHERALS, "蓝牙键鼠") { buildBluetoothSettings(this) }
+        page(Route.INPUT, Route.PERIPHERALS, "键盘与触控板") { buildInputSettings(this) }
+        page(Route.FEEDBACK, Route.INPUT, "按键反馈") { buildFeedbackSettings(this) }
 
-        val airDropTitle = TextView(this).apply {
-            text = "AirDrop 文件收发"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
+        val restored = Route.entries.firstOrNull { it.name == saved?.getString("route") } ?: Route.HOME
+        return routes.host.also { open(restored) }
+    }
+
+    private fun page(route: Route, parent: Route, title: String, content: LinearLayout.() -> Unit) {
+        routes.register(route, parent, ui.screen(title, ::back, content))
+    }
+
+    private fun open(route: Route) {
+        routes.show(route)
+        if (route == Route.BLUETOOTH) refreshBondedHosts()
+        if (route == Route.BROADCAST) updateBroadcastStrategySummary()
+        if (route == Route.PAIRING) updatePairingCard()
+        if (route == Route.MEDIA || route == Route.NETWORK || route == Route.SYSTEM) refreshDeviceState()
+    }
+
+    private fun back() {
+        if (!routes.back()) finish()
+    }
+
+    private fun buildOverviewPage(): View = ui.screen(null) {
+        addView(ui.heading("Marionette"))
+        overviewHomeKitStatus = ui.status()
+        overviewHomeKitDetail = overviewDetail()
+        overviewHomeKitSwitch = settingSwitch("首页 HomeKit 开关", ServiceControl.isEnabled(this@MainActivity), ::changeHomeKitEnabled)
+        addView(ui.featureCard("HomeKit", Symbol.HOME, 0xFF865410.toInt(), 0xFFFFEFD5.toInt(),
+            action = { open(Route.HOMEKIT) }) {
+            addView(ui.statusControl("家庭服务", overviewHomeKitStatus, overviewHomeKitDetail, overviewHomeKitSwitch))
+        })
+
+        overviewAirDropStatus = ui.status()
+        overviewAirDropDetail = overviewDetail()
+        overviewAirDropSwitch = settingSwitch("首页 AirDrop 接收开关", false, ::changeAirDropReception)
+        overviewAirDropProgress = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            visibility = View.GONE
+            contentDescription = "AirDrop 传输进度"
+            layoutParams = LinearLayout.LayoutParams(-1, dp(6)).apply { topMargin = dp(8) }
         }
-        airDropTitleRow.addView(airDropTitle)
+        addView(ui.featureCard("AirDrop", Symbol.AIRDROP, 0xFF2D568D.toInt(), 0xFFE5EDFA.toInt(),
+            action = { startActivity(Intent(this@MainActivity, AirDropActivity::class.java)) }) {
+            addView(ui.statusControl("接收", overviewAirDropStatus, overviewAirDropDetail, overviewAirDropSwitch))
+            addView(overviewAirDropProgress)
+        })
 
-        val airDropTag = createStatusBadge(this, "实验版", UiTheme.COLOR_ACCENT, UiTheme.COLOR_ACCENT_LIGHT).apply {
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                marginStart = dp(6)
-            }
-            layoutParams = lp
-        }
-        airDropTitleRow.addView(airDropTag)
-        airDropTextCol.addView(airDropTitleRow)
-
-        airDropSummaryText = TextView(this).apply {
-            text = "面向苹果设备 · 点击进入配置与收发"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(0, dp(4), 0, 0)
-        }
-        airDropTextCol.addView(airDropSummaryText)
-        airDropRow.addView(airDropTextCol)
-
-        airDropStatusBadge = createStatusBadge(this, "○ 未开启", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-        airDropRow.addView(airDropStatusBadge)
-
-        val chevron = ImageView(this).apply {
-            setImageResource(R.drawable.ic_chevron_right)
-            val lp = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
-                marginStart = dp(6)
-            }
-            layoutParams = lp
-        }
-        airDropRow.addView(chevron)
-
-        airDropCard.addView(airDropRow)
-        root.addView(airDropCard)
-
-        val mainScroll = ScrollView(this).apply {
-            isFillViewport = true
-            setBackgroundColor(UiTheme.COLOR_BG)
-            addView(root)
-        }
-        mainPage = mainScroll
-
-        // === Settings Page Layout ===
-        val settingsScrollContent = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            setPadding(0, 0, 0, dp(24))
-        }
-        settingsScrollContent.addView(buildBroadcastStrategySettings())
-        settingsScrollContent.addView(buildPairingSettings())
-        settingsScrollContent.addView(buildHotspotSettings())
-        settingsScrollContent.addView(buildNfcSettings())
-        settingsScrollContent.addView(buildHidSettingsEntry())
-        settingsScrollContent.addView(buildUsbSettingsEntry())
-        settingsScrollContent.addView(buildDeviceManagement())
-        val settingsScroll = ScrollView(this).apply {
-            isFillViewport = true
-            setBackgroundColor(UiTheme.COLOR_BG)
-            addView(settingsScrollContent)
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-        }
-        val settingsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            addView(buildSettingsHeader())
-            addView(settingsScroll)
+        overviewBluetoothStatus = ui.status()
+        overviewBluetoothDetail = overviewDetail()
+        overviewBluetoothSwitch = settingSwitch("首页蓝牙键鼠开关", false, ::changeHidEnabled)
+        overviewUsbStatus = ui.status()
+        overviewUsbDetail = overviewDetail()
+        overviewUsbSwitch = settingSwitch("首页 USB 外设开关", false, ::changeUsbEnabled)
+        keyboardShortcut = ui.iconAction(Symbol.KEYBOARD, "打开键盘与触控板", ::openKeyboard).apply {
             visibility = View.GONE
         }
-        settingsPage = settingsContainer
+        addView(ui.featureCard("外设", Symbol.PERIPHERALS, UiTheme.COLOR_ACCENT, UiTheme.COLOR_ACCENT_LIGHT,
+            shortcut = keyboardShortcut, action = { open(Route.PERIPHERALS) }) {
+            addView(ui.statusControl("蓝牙键鼠", overviewBluetoothStatus, overviewBluetoothDetail, overviewBluetoothSwitch))
+            addView(View(this@MainActivity).apply {
+                setBackgroundColor(UiTheme.COLOR_DIVIDER)
+                layoutParams = LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(8) }
+            })
+            addView(ui.statusControl("USB 外设", overviewUsbStatus, overviewUsbDetail, overviewUsbSwitch))
+        })
+    }
 
-        hidSettingsPage = buildHidSettingsPage().apply { visibility = View.GONE }
-        hidHapticsPage = buildHidHapticsPage().apply { visibility = View.GONE }
-        return FrameLayout(this).apply {
-            addView(mainScroll, FrameLayout.LayoutParams(-1, -1))
-            addView(settingsContainer, FrameLayout.LayoutParams(-1, -1))
-            addView(hidSettingsPage, FrameLayout.LayoutParams(-1, -1))
-            addView(hidHapticsPage, FrameLayout.LayoutParams(-1, -1))
+    private fun overviewDetail() = ui.text("", 12, UiTheme.COLOR_TEXT_SECONDARY).apply {
+        maxLines = 2
+        ellipsize = TextUtils.TruncateAt.END
+    }
+
+    private fun changeHomeKitEnabled(enabled: Boolean) {
+        if (updatingServiceSwitch) return
+        if (enabled) ensurePermissionsAndStart() else stopHomeKitService()
+        refreshOverviewStatuses()
+    }
+
+    private fun changeHidEnabled(enabled: Boolean) {
+        if (updatingHidSwitch) return
+        if (enabled) enableHidFromUi() else disableHidFromUi()
+        refreshOverviewStatuses()
+    }
+
+    private fun changeAirDropReception(enabled: Boolean) {
+        if (updatingOverviewSwitches || airDropTarget != null) return
+        val resident = AirDropResidentService.isEnabled(this)
+        refreshOverviewStatuses()
+        when {
+            enabled -> confirmAirDropReception(this) {
+                if (!isAirDropReceptionEnabled()) {
+                    requestAirDropReception(true) { AirDropService.startWindow(this) }
+                }
+            }
+            resident -> AlertDialog.Builder(this)
+                .setTitle("关闭 AirDrop 常驻接收？")
+                .setMessage("关闭后也会停用开机自动接收。")
+                .setPositiveButton("关闭") { _, _ ->
+                    requestAirDropReception(false) { AirDropResidentService.disable(this) }
+                }
+                .setNegativeButton("取消", null).show()
+            else -> requestAirDropReception(false) { AirDropService.stop(this) }
         }
     }
 
-    private fun buildSettingsHeader(): View = createPageHeader(
-        context = this,
-        titleText = "设备设置",
-        onBackClick = { showMainPage() }
-    )
+    private fun isAirDropReceptionEnabled(): Boolean =
+        AirDropResidentService.isEnabled(this) || AirDropService.isAlive() || AirDropService.isRunning(this)
 
-    private fun buildBroadcastStrategySettings(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        val help = "控制 BLE 广播间隔与重连优先级：\n\n• 自动：白天低延迟响应，夜间（23:00~07:00）自动切入低功耗静默。\n• 低延迟：保持高频广播，优先保证从家庭 App 打开时的秒级响应。\n• 均衡：响应速度与待机功耗兼顾。\n• 低功耗：增大广播间隔，最大程度减少电量消耗。\n\n各档位互斥，修改后立即重启广播生效。"
-        addView(createSectionHeader(this@MainActivity, "广播与响应策略", "广播策略说明", help))
-
-        val card = createCard(this@MainActivity)
-        strategySummary = TextView(this@MainActivity).apply {
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_ACCENT)
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            background = UiTheme.createPillDrawable(this@MainActivity, UiTheme.COLOR_ACCENT_LIGHT)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = dp(8)
-            }
-            layoutParams = lp
+    private fun requestAirDropReception(enabled: Boolean, command: () -> Unit) {
+        airDropTarget = enabled
+        airDropRequestUntil = SystemClock.uptimeMillis() + 5_000L
+        runCatching(command).onFailure {
+            airDropTarget = null
+            toast(if (enabled) "无法启动 AirDrop" else "无法停止 AirDrop")
         }
-        card.addView(strategySummary)
+        refreshOverviewStatuses()
+    }
 
-        val group = RadioGroup(this@MainActivity).apply {
-            orientation = RadioGroup.VERTICAL
+    private fun changeUsbEnabled(enabled: Boolean) {
+        if (updatingOverviewSwitches) return
+        if (enabled) {
+            usbStartRequested = true
+            refreshOverviewStatuses()
+            authorizeUsbStart()
+        } else {
+            runCatching { UsbPeripheralService.stopFromUi(this) }
+                .onSuccess { usbStopRequestedUntil = SystemClock.uptimeMillis() + 5_000L }
+                .onFailure { toast("无法停止 USB 外设") }
+            refreshOverviewStatuses()
         }
-        BroadcastStrategy.entries.forEachIndexed { index, strategy ->
-            if (index > 0) {
-                group.addView(createCardDivider(this@MainActivity))
+    }
+
+    private fun authorizeUsbStart() {
+        val camera = usbCameraPreference()
+        val audio = UsbSession.prefs(this).getBoolean(UsbSession.KEY_AUDIO, false)
+        val missing = buildList {
+            if (audio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                add(Manifest.permission.RECORD_AUDIO)
             }
-            group.addView(RadioButton(this@MainActivity).apply {
-                id = View.generateViewId()
-                tag = strategy.storageValue
-                text = when (strategy) {
-                    BroadcastStrategy.AUTO -> "自动 · 白天低延迟，夜间低功耗"
-                    BroadcastStrategy.LOW_LATENCY -> "低延迟 · 优先响应速度"
-                    BroadcastStrategy.BALANCED -> "均衡 · 响应与功耗折中"
-                    BroadcastStrategy.LOW_POWER -> "低功耗 · 优先降低待机耗电"
+            if ((camera == UsbCameraSource.FRONT || camera == UsbCameraSource.BACK) &&
+                checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                add(Manifest.permission.CAMERA)
+            }
+        }
+        when {
+            missing.isNotEmpty() -> requestPermissions(missing.toTypedArray(), REQUEST_USB_PERMISSIONS)
+            camera == UsbCameraSource.SCREEN -> {
+                val projection = getSystemService(MediaProjectionManager::class.java)
+                @Suppress("DEPRECATION")
+                startActivityForResult(projection.createScreenCaptureIntent(), REQUEST_USB_SCREEN)
+            }
+            else -> startUsbFromOverview()
+        }
+    }
+
+    private fun startUsbFromOverview(screenResult: Int = 0, screenData: Intent? = null) {
+        usbStartRequested = false
+        val camera = usbCameraPreference()
+        val audio = UsbSession.prefs(this).getBoolean(UsbSession.KEY_AUDIO, false)
+        runCatching {
+            UsbPeripheralService.start(this, camera, audio, screenResult, screenData)
+            UsbSession.setEnabled(this, true)
+        }.onFailure { toast("无法启动 USB 外设") }
+        refreshOverviewStatuses()
+    }
+
+    private fun usbCameraPreference(): UsbCameraSource =
+        runCatching {
+            UsbCameraSource.valueOf(UsbSession.prefs(this).getString(UsbSession.KEY_CAMERA_SOURCE, "OFF") ?: "OFF")
+        }.getOrDefault(UsbCameraSource.OFF)
+
+    @Deprecated("Legacy Activity result API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_USB_SCREEN || !usbStartRequested) return
+        if (resultCode == RESULT_OK && data != null) startUsbFromOverview(resultCode, data)
+        else {
+            usbStartRequested = false
+            refreshOverviewStatuses()
+            toast("未授权屏幕录制")
+        }
+    }
+
+    private fun openKeyboard() {
+        val transport = keyboardTransport(UsbPeripheralStatus.snapshot(this))
+        if (transport == null) {
+            refreshPeripheralEntry()
+            toast("主机已断开")
+            return
+        }
+        startActivity(PeripheralPadActivity.intent(this, inputPrefs.getBoolean("immersive_keyboard", false), transport))
+    }
+
+    private fun keyboardTransport(usb: UsbPeripheralStatus.Snapshot): String? = when {
+        usb.state == "ready" && usb.hostAttached && SystemClock.uptimeMillis() >= usbStopRequestedUntil ->
+            PeripheralPadActivity.TRANSPORT_USB
+        hidState == BtHidPeripheral.State.CONNECTED -> PeripheralPadActivity.TRANSPORT_BT
+        else -> null
+    }
+
+    private fun refreshOverviewStatuses(usb: UsbPeripheralStatus.Snapshot = UsbPeripheralStatus.snapshot(this)) {
+        val homeKitEnabled = ServiceControl.isEnabled(this)
+        val paired = viewModel.isPaired
+        val advertising = getSharedPreferences("homekit", MODE_PRIVATE).getBoolean("runtime_advertising", false)
+        val homeKit = when {
+            !homeKitEnabled -> UiStatus("已关闭")
+            viewModel.isConnected -> UiStatus("家庭已连接", StatusTone.ACTIVE)
+            advertising -> UiStatus("广播中", StatusTone.WAITING)
+            else -> UiStatus("等待广播", StatusTone.BUSY)
+        }
+        overviewHomeKitStatus.renderStatus(homeKit)
+        if (::statusBadge.isInitialized) statusBadge.renderStatus(homeKit)
+        val pairing = if (paired) "已配对" else "未配对"
+        val strategy = ServiceControl.effectiveBroadcastStrategy(this, paired).title
+        overviewHomeKitDetail.text = if (homeKitEnabled) "${viewModel.deviceName} · $pairing · $strategy"
+            else "${viewModel.deviceName} · $pairing"
+        updatingServiceSwitch = true
+        overviewHomeKitSwitch.isChecked = homeKitEnabled
+        if (::serviceSwitch.isInitialized) serviceSwitch.isChecked = homeKitEnabled
+        updatingServiceSwitch = false
+
+        val bridge = PeripheralHub.bridge(this)
+        val hid = when (hidState) {
+            BtHidPeripheral.State.CONNECTED -> UiStatus("已连接", StatusTone.ACTIVE)
+            BtHidPeripheral.State.READY -> UiStatus("等待主机", StatusTone.WAITING)
+            BtHidPeripheral.State.REGISTERING -> UiStatus("注册中", StatusTone.BUSY)
+            BtHidPeripheral.State.FAILED -> UiStatus("连接异常", StatusTone.ERROR)
+            BtHidPeripheral.State.UNSUPPORTED -> UiStatus("不支持", StatusTone.ERROR)
+            BtHidPeripheral.State.STOPPED -> if (bridge.isRunning)
+                UiStatus("重连中", StatusTone.BUSY) else UiStatus("已关闭")
+        }
+        val hidEnabled = when (hidState) {
+            BtHidPeripheral.State.CONNECTED, BtHidPeripheral.State.READY, BtHidPeripheral.State.REGISTERING -> true
+            BtHidPeripheral.State.STOPPED -> bridge.isRunning
+            else -> false
+        }
+        updatingHidSwitch = true
+        overviewBluetoothSwitch.isChecked = hidEnabled || pendingHidEnable
+        overviewBluetoothSwitch.isEnabled = !pendingHidEnable
+        if (::hidSwitch.isInitialized) {
+            hidSwitch.isChecked = hidEnabled || pendingHidEnable
+            hidSwitch.isEnabled = !pendingHidEnable
+        }
+        updatingHidSwitch = false
+        overviewBluetoothStatus.renderStatus(hid)
+        overviewBluetoothDetail.text = when {
+            pendingHidEnable -> "等待系统授权"
+            hidState == BtHidPeripheral.State.CONNECTED -> bridge.hostName?.let { "主机 · $it" } ?: "主机已连接"
+            hidState == BtHidPeripheral.State.FAILED -> lastHidFailure ?: "注册失败"
+            else -> "设备名称 · ${bridge.deviceName}"
+        }
+
+        val usbSwitchOn = usb.isSwitchOn()
+        if (!usbSwitchOn) usbStopRequestedUntil = 0L
+        val usbStopRequested = SystemClock.uptimeMillis() < usbStopRequestedUntil
+        val wired = when {
+            usbStartRequested -> UiStatus("等待授权", StatusTone.BUSY)
+            usbStopRequested -> UiStatus("正在停止", StatusTone.BUSY)
+            else -> usbStatus(usb)
+        }
+        overviewUsbStatus.renderStatus(wired)
+        overviewUsbDetail.text = if (usbStopRequested) "正在恢复普通 USB 模式" else usbOverviewDetail(usb)
+        updatingOverviewSwitches = true
+        overviewUsbSwitch.isChecked = usbStartRequested || (usbSwitchOn && !usbStopRequested)
+        overviewUsbSwitch.isEnabled = !usbStartRequested && !usbStopRequested &&
+            usb.state !in listOf("starting", "stopping", "armed_stop")
+        updatingOverviewSwitches = false
+        peripheralHidStatus?.renderStatus(hid)
+        peripheralUsbStatus?.renderStatus(wired)
+        hidPageBadge?.renderStatus(hid)
+        keyboardShortcut?.visibility = if (keyboardTransport(usb) != null) View.VISIBLE else View.GONE
+        refreshAirDropCard()
+    }
+
+    private fun usbOverviewDetail(usb: UsbPeripheralStatus.Snapshot): String {
+        if (usbStartRequested) return "等待相机、麦克风或录屏授权"
+        usb.hint?.takeIf { it.isNotBlank() }?.let { return it }
+        val camera = usbCameraPreference()
+        val activeCamera = UsbPeripheralService.streamingCamera()
+        val wantAudio = UsbSession.prefs(this).getBoolean(UsbSession.KEY_AUDIO, false)
+        return buildList {
+            add("键盘与触控板")
+            if (camera != UsbCameraSource.OFF || activeCamera != UsbCameraSource.OFF) {
+                val label = when (if (activeCamera == UsbCameraSource.OFF) camera else activeCamera) {
+                    UsbCameraSource.FRONT -> "前置摄像头"
+                    UsbCameraSource.BACK -> "后置摄像头"
+                    UsbCameraSource.SCREEN -> "屏幕"
+                    UsbCameraSource.OFF -> ""
                 }
-                textSize = 14f
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                isChecked = ServiceControl.broadcastStrategy(this@MainActivity) == strategy
-                setPadding(dp(8), dp(8), 0, dp(8))
+                add(if (activeCamera != UsbCameraSource.OFF) label else "${label}待启用")
+            }
+            if (UsbPeripheralService.streamingAudio()) add("音频")
+            else if (wantAudio) add("音频待启用")
+        }.joinToString(" · ")
+    }
+
+    private fun refreshAirDropCard() {
+        val resident = AirDropResidentService.isEnabled(this)
+        val receiving = isAirDropReceptionEnabled()
+        if (airDropTarget == receiving || SystemClock.uptimeMillis() >= airDropRequestUntil) airDropTarget = null
+        val target = airDropTarget
+        val status = when (target) {
+            true -> UiStatus("启动中", StatusTone.BUSY)
+            false -> UiStatus("正在停止", StatusTone.BUSY)
+            null -> airDropStatus(this)
+        }
+        overviewAirDropStatus.renderStatus(status)
+        updatingOverviewSwitches = true
+        overviewAirDropSwitch.isChecked = target ?: receiving
+        overviewAirDropSwitch.isEnabled = target == null
+        updatingOverviewSwitches = false
+
+        val phase = AirDropState.phase
+        val progress = AirDropState.progress
+        val transferring = phase == AirDropState.Phase.RECEIVING || phase == AirDropState.Phase.SENDING
+        val mode = if (resident) "常驻接收" else "限时接收"
+        overviewAirDropDetail.text = when {
+            target == false -> "正在结束接收会话"
+            target == true -> "正在准备附近发现"
+            transferring && progress != null -> buildString {
+                if (AirDropState.peerName.isNotBlank()) append("${AirDropState.peerName} · ")
+                append(AirDropStore.formatSize(progress.done))
+                if (progress.total > 0) append(" / ${AirDropStore.formatSize(progress.total)}")
+            }
+            phase == AirDropState.Phase.AWAITING || phase == AirDropState.Phase.ERROR ||
+                phase == AirDropState.Phase.DONE || phase == AirDropState.Phase.STARTING -> AirDropState.status
+            receiving -> "$mode · 附近 ${AirDropState.peers().size} 台设备"
+            else -> "开启后接收 10 分钟"
+        }
+        overviewAirDropProgress.visibility = if (transferring) View.VISIBLE else View.GONE
+        if (transferring) {
+            val fraction = progress?.fraction
+            overviewAirDropProgress.isIndeterminate = fraction == null
+            if (fraction != null) overviewAirDropProgress.progress = (fraction * 100).toInt()
+        }
+    }
+
+    private fun featureControl(feature: HomeKitFeature): View {
+        val button = ui.button("读取中") { runCommandFromUi(feature) }.apply {
+            layoutParams = LinearLayout.LayoutParams(-2, -2)
+            isEnabled = false
+            contentDescription = feature.title
+        }
+        featureButtons[feature] = button
+        return ui.row(feature.title, trailing = button)
+    }
+
+    private fun liveSlider(
+        label: String, state: SliderWriteState, debounce: Handler, write: (Int) -> Unit,
+        bind: (SeekBar, TextView) -> Unit
+    ) = ui.column().apply {
+        val value = ui.text("—", 14, UiTheme.COLOR_ACCENT, bold = true)
+        val seek = SeekBar(this@MainActivity).apply {
+            max = 100
+            contentDescription = label
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    value.text = "$progress%"
+                    scheduleSliderWrite(state, debounce, progress, write)
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) {
+                    state.tracking = true
+                    state.pendingRunnable?.let(debounce::removeCallbacks)
+                    state.pendingRunnable = null
+                }
+                override fun onStopTrackingTouch(bar: SeekBar) {
+                    state.pendingRunnable?.let(debounce::removeCallbacks)
+                    state.pendingRunnable = null
+                    state.tracking = false
+                    write(bar.progress)
+                }
             })
         }
-        strategyRadioGroup = group
-        group.setOnCheckedChangeListener { radioGroup, checkedId ->
-            val selected = radioGroup.findViewById<RadioButton>(checkedId)
-                ?.tag?.toString()?.let(BroadcastStrategy::fromStorage) ?: return@setOnCheckedChangeListener
-            if (selected == ServiceControl.broadcastStrategy(this@MainActivity)) return@setOnCheckedChangeListener
-            ServiceControl.setBroadcastStrategy(this@MainActivity, selected)
-            updateBroadcastStrategySummary()
-            log("BROADCAST_STRATEGY_CHANGED configured=${selected.storageValue}")
-            if (ServiceControl.isEnabled(this@MainActivity)) restartHomeKitService()
-            else Toast.makeText(this@MainActivity, "已保存，启动服务后生效", Toast.LENGTH_SHORT).show()
+        addView(ui.row(label, trailing = value))
+        addView(seek)
+        bind(seek, value)
+    }
+
+    private fun settingSwitch(label: String, enabled: Boolean, change: (Boolean) -> Unit) = Switch(this).apply {
+        contentDescription = label
+        isChecked = enabled
+        setOnCheckedChangeListener { _, checked -> change(checked) }
+    }
+
+    private fun buildBluetoothSettings(content: LinearLayout) = with(content) {
+        val bridge = PeripheralHub.bridge(this@MainActivity)
+        hidSwitch = settingSwitch("启用蓝牙键鼠", bridge.isRunning, ::changeHidEnabled)
+        hidPageBadge = ui.status()
+        hidDetailText = ui.text("", 13, UiTheme.COLOR_DANGER).apply { visibility = View.GONE }
+        addView(ui.surface().apply {
+            addView(ui.row("蓝牙键鼠", trailing = hidSwitch, symbol = Symbol.BLUETOOTH))
+            addView(hidPageBadge, LinearLayout.LayoutParams(-2, -2))
+            addView(hidDetailText)
+            addView(ui.button("让主机发现手机", primary = true, action = ::requestHidDiscoverable))
+        })
+        addView(ui.section("已配对主机"))
+        bondedHosts = ui.surface()
+        addView(bondedHosts)
+        addView(ui.surface().apply {
+            addView(ui.row("自动连接上次主机", trailing = settingSwitch("自动连接上次主机", bridge.autoReconnectLastHost) {
+                bridge.autoReconnectLastHost = it
+            }))
+            addView(ui.row("低延迟保活", "空闲时保持连接活跃", settingSwitch("低延迟保活", bridge.keepAliveEnabled) {
+                bridge.keepAliveEnabled = it
+            }))
+            val name = ui.text(bridge.deviceName)
+            addView(ui.row("蓝牙名称", trailing = name) {
+                editName("蓝牙名称", bridge.deviceName) { bridge.deviceName = it; name.text = it }
+            })
+        })
+        addView(ui.surface().apply {
+            addView(ui.row("重新连接已配对主机") {
+                bridge.start()
+                if (!bridge.connectBonded()) toast("没有可连接的已配对主机")
+            })
+            addView(ui.row("断开当前主机") {
+                toast(if (bridge.disconnectHost()) "已请求断开" else "当前没有已连接主机")
+            })
+            addView(ui.row("重置蓝牙连接", "用于修复 HID 注册失败") {
+                confirmAction("重置蓝牙连接？", "系统蓝牙连接会暂时中断。") {
+                    Thread {
+                        val success = bridge.resetBluetoothStack()
+                        runOnUiThread { toast(if (success) "蓝牙已重置，正在重新注册" else "重置失败，请检查 Root 授权") }
+                    }.start()
+                }
+            })
+        })
+    }
+
+    private fun refreshBondedHosts() {
+        val container = bondedHosts ?: return
+        val bridge = PeripheralHub.bridge(this)
+        val devices = bridge.bondedDevices()
+        val hosts = devices.map { device ->
+            device.address to (runCatching { device.name }.getOrNull()?.takeIf(String::isNotBlank) ?: device.address)
         }
-        card.addView(group)
-        addView(card)
-        updateBroadcastStrategySummary()
+        if (hosts == lastBondedHosts) return
+        lastBondedHosts = hosts
+        container.removeAllViews()
+        if (hosts.isEmpty()) container.addView(ui.text("暂无已配对主机", 14, UiTheme.COLOR_TEXT_SECONDARY))
+        hosts.forEach { (address, name) ->
+            container.addView(ui.row(name, symbol = Symbol.DISPLAY) {
+                bridge.start()
+                toast(if (bridge.connectTo(address)) "正在连接 $name" else "连接请求未成功")
+            })
+        }
+    }
+
+    private fun buildInputSettings(content: LinearLayout) = with(content) {
+        addView(ui.surface().apply {
+            addView(ui.row("沉浸模式", "打开键盘时使用低亮度黑色界面",
+                settingSwitch("沉浸模式", inputPrefs.getBoolean("immersive_keyboard", false)) {
+                    inputPrefs.edit().putBoolean("immersive_keyboard", it).apply()
+                }))
+            addView(ui.row("按键反馈", "音效、震动和强度") { open(Route.FEEDBACK) })
+        })
+        addView(ui.section("指针"))
+        addView(ui.surface().apply {
+            addView(preferenceSlider("触控板灵敏度", 50, 300, 1, inputPrefs.getInt(KEY_HID_SENSITIVITY, 180),
+                { "%.1f×".format(it / 100f) }) { inputPrefs.edit().putInt(KEY_HID_SENSITIVITY, it).apply() })
+            addView(preferenceSlider("鼠标 DPI", 400, 3200, 100, inputPrefs.getInt(KEY_POINTER_DPI, 1000),
+                { "$it DPI" }) { inputPrefs.edit().putInt(KEY_POINTER_DPI, it).apply() })
+            addView(ui.row("显示触控轨迹", trailing = settingSwitch("显示触控轨迹", inputPrefs.getBoolean(KEY_TOUCHPAD_TRAIL, false)) {
+                inputPrefs.edit().putBoolean(KEY_TOUCHPAD_TRAIL, it).apply()
+            }))
+            val rate = ui.text("${inputPrefs.getInt(KEY_USB_MOUSE_HZ, 1000)} Hz")
+            addView(ui.row("USB 回报率", "仅适用于 USB 连接", rate) {
+                val values = listOf(125, 250, 500, 1000)
+                choose("USB 回报率", values.map { "$it Hz" }, values.indexOf(inputPrefs.getInt(KEY_USB_MOUSE_HZ, 1000))) {
+                    val hz = values[it]
+                    inputPrefs.edit().putInt(KEY_USB_MOUSE_HZ, hz).apply()
+                    rate.text = "$hz Hz"
+                }
+            })
+        })
+    }
+
+    private fun buildFeedbackSettings(content: LinearLayout) = with(content) {
+        addView(ui.surface().apply {
+            addView(ui.row("按键音效", trailing = settingSwitch("按键音效", KeySounds.isEnabled(this@MainActivity)) {
+                KeySounds.setEnabled(this@MainActivity, it)
+                if (it) KeySounds.play(this@MainActivity)
+            }))
+            addView(ui.row("按键震动", trailing = settingSwitch("按键震动", KeyHaptics.isEnabled(this@MainActivity)) {
+                KeyHaptics.setEnabled(this@MainActivity, it)
+                if (it) KeyHaptics.tap(this@MainActivity)
+            }))
+            addView(preferenceSlider("震动强度", 1, 100, 1, KeyHaptics.strength(this@MainActivity), { "$it%" }) {
+                KeyHaptics.setStrength(this@MainActivity, it)
+            })
+            addView(ui.button("试一下") { KeyHaptics.tap(this@MainActivity) })
+        })
+    }
+
+    private fun preferenceSlider(
+        title: String, minimum: Int, maximum: Int, step: Int, initial: Int,
+        label: (Int) -> String, change: (Int) -> Unit
+    ) = ui.column().apply {
+        val value = ui.text(label(initial), 14, UiTheme.COLOR_ACCENT)
+        addView(ui.row(title, trailing = value))
+        addView(SeekBar(this@MainActivity).apply {
+            contentDescription = title
+            max = (maximum - minimum) / step
+            progress = ((initial - minimum) / step).coerceIn(0, max)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    val selected = minimum + progress * step
+                    value.text = label(selected)
+                    change(selected)
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) = Unit
+                override fun onStopTrackingTouch(bar: SeekBar) = Unit
+            })
+        })
+    }
+
+    private fun choose(title: String, options: List<String>, selected: Int, change: (Int) -> Unit) {
+        AlertDialog.Builder(this).setTitle(title)
+            .setSingleChoiceItems(options.toTypedArray(), selected) { dialog, index ->
+                dialog.dismiss()
+                if (index != selected) change(index)
+            }.setNegativeButton("取消", null).show()
+    }
+
+    private fun choosePairingMode() {
+        val modes = PairingBroadcastMode.entries
+        choose("配对方式", modes.map { pairingModeLabel(it) }, modes.indexOf(viewModel.pairingBroadcastMode)) {
+            viewModel.setPairingBroadcastMode(modes[it])
+            updatePairingCard()
+            restartHomeKitIfEnabled()
+        }
+    }
+
+    private fun chooseBroadcastStrategy() {
+        val strategies = BroadcastStrategy.entries
+        choose("响应策略", strategies.map { it.title }, strategies.indexOf(ServiceControl.broadcastStrategy(this))) {
+            ServiceControl.setBroadcastStrategy(this, strategies[it])
+            updateBroadcastStrategySummary()
+            restartHomeKitIfEnabled()
+        }
     }
 
     private fun updateBroadcastStrategySummary() {
-        val configured = ServiceControl.broadcastStrategy(this)
-        val paired = getSharedPreferences("homekit", MODE_PRIVATE).contains("controller_key")
-        val effective = ServiceControl.effectiveBroadcastStrategy(this, paired)
-        val reason = when {
-            configured != BroadcastStrategy.AUTO -> "手动指定"
-            paired && ServiceControl.isNightQuietWindow() -> "自动挡 · 夜间静默时段"
-            else -> "自动挡 · 当前优先响应"
-        }
-        strategySummary?.text = "当前生效：${effective.title}（$reason）"
+        val effective = ServiceControl.effectiveBroadcastStrategy(this, viewModel.isPaired)
+        strategySummary?.renderStatus(UiStatus("当前生效 · ${effective.title}", StatusTone.WAITING))
     }
 
-    private fun buildPairingSettings(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        val help = "• 二维码：4 位 Setup ID，使用家庭 App 扫码即连。\n• 配对码：8 位数字配对码，在家庭 App「更多选项」中手动输入。\n\n切换广播模式仅重启广播，不会破坏已有的配对关系。"
-        addView(createSectionHeader(this@MainActivity, "配对方式", "配对方式说明", help))
-
-        val card = createCard(this@MainActivity)
-        val tabs = RadioGroup(this@MainActivity).apply {
-            orientation = RadioGroup.HORIZONTAL
-            val qr = RadioButton(this@MainActivity).apply {
-                id = View.generateViewId()
-                text = "二维码 · 4位"
-                textSize = 14f
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                isChecked = viewModel.pairingBroadcastMode == PairingBroadcastMode.QR_SETUP_PAYLOAD
-                layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
-            }
-            val code = RadioButton(this@MainActivity).apply {
-                id = View.generateViewId()
-                text = "配对码 · 8位"
-                textSize = 14f
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                isChecked = viewModel.pairingBroadcastMode == PairingBroadcastMode.LEGACY_SETUP_CODE
-                layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
-            }
-            addView(qr)
-            addView(code)
-            setOnCheckedChangeListener { _, checkedId ->
-                val selected = when (checkedId) {
-                    qr.id -> PairingBroadcastMode.QR_SETUP_PAYLOAD
-                    code.id -> PairingBroadcastMode.LEGACY_SETUP_CODE
-                    else -> return@setOnCheckedChangeListener
-                }
-                if (selected == viewModel.pairingBroadcastMode) return@setOnCheckedChangeListener
-                viewModel.setPairingBroadcastMode(selected)
-                updatePairingCard()
-                log("PAIRING_BROADCAST_MODE_UPDATED mode=$selected")
-                restartHomeKitService()
-                Toast.makeText(this@MainActivity, "已切换配对广播：${pairingModeLabel(selected)}", Toast.LENGTH_SHORT).show()
+    private fun editName(title: String, current: String, save: (String) -> Unit) {
+        val edit = EditText(this).apply {
+            setSingleLine(true)
+            setText(current)
+            selectAll()
+        }
+        val box = ui.column().apply {
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(edit)
+        }
+        val dialog = AlertDialog.Builder(this).setTitle(title).setView(box)
+            .setPositiveButton("保存", null).setNegativeButton("取消", null).show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val name = edit.text.toString().trim()
+            if (name.isBlank()) edit.error = "请输入名称"
+            else {
+                save(name)
+                dialog.dismiss()
             }
         }
-        card.addView(tabs)
-
-        pairingModeSummary = TextView(this@MainActivity).apply {
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(0, dp(6), 0, dp(6))
-        }
-        card.addView(pairingModeSummary)
-
-        pairingPayloadText = TextView(this@MainActivity).apply {
-            text = "Setup ID：${viewModel.setupId}\nPayload：${viewModel.setupPayload}"
-            textSize = 11f
-            typeface = Typeface.MONOSPACE
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = GradientDrawable().apply {
-                cornerRadius = dp(8).toFloat()
-                setColor(UiTheme.COLOR_INPUT_BG)
-            }
-            val lp = LinearLayout.LayoutParams(-1, -2).apply {
-                topMargin = dp(4)
-                bottomMargin = dp(10)
-            }
-            layoutParams = lp
-        }
-        card.addView(pairingPayloadText)
-
-        val editCodeBtn = Button(this@MainActivity).apply {
-            text = "修改 8 位配对码"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(-1, dp(46))
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
-            onHapticClick { showSetupCodeDialog() }
-        }
-        card.addView(editCodeBtn)
-
-        addView(card)
     }
 
-    private fun buildHotspotSettings(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
+    private fun confirmAction(title: String, message: String, action: () -> Unit) {
+        AlertDialog.Builder(this).setTitle(title).setMessage(message)
+            .setPositiveButton("继续") { _, _ -> action() }.setNegativeButton("取消", null).show()
+    }
+
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+
+    private fun restartHomeKitIfEnabled() {
+        if (ServiceControl.isEnabled(this)) restartHomeKitService()
+    }
+
+    private fun buildHotspotSettings(): View = ui.column().apply {
         val current = viewModel.hotspotConfiguration()
-        val help = "Marionette 与系统共用这一套热点配置；启动前会自动停用已有 SoftAP，避免出现两个个人热点冲突。\n\n• 功耗策略说明：\n  - 省电：优先 2.4 GHz 频段\n  - 平衡：保持选定频段\n  - 性能：优先双频加速\n\n• SSID、密码和频段由本页直接应用；Wi-Fi 6、自动关闭时长等由 MIUI 系统热点页最终落地。"
-        addView(createSectionHeader(this@MainActivity, "热点设置", "热点设置说明", help))
+        fun field(label: String, value: String, secret: Boolean = false) = EditText(this@MainActivity).apply {
+            hint = label
+            contentDescription = label
+            setSingleLine(true)
+            if (secret) inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(value)
+        }
+        val ssid = field("热点名称", current.ssid)
+        val password = field("热点密码", current.password, secret = true)
+        addView(ui.surface().apply {
+            addView(ui.section("热点名称"))
+            addView(ssid)
+            addView(ui.section("热点密码"))
+            addView(password)
+        })
 
-        val card = createCard(this@MainActivity)
-
-        fun field(label: String, value: String, password: Boolean = false): EditText {
-            val row = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(6), 0, dp(6))
-            }
-            row.addView(TextView(this@MainActivity).apply {
-                text = label
-                textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            }, LinearLayout.LayoutParams(dp(76), -2))
-            val editor = EditText(this@MainActivity).apply {
-                setText(value)
-                textSize = 14f
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                setSingleLine(true)
-                if (password) inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
-                setPadding(dp(10), dp(6), dp(10), dp(6))
-                background = GradientDrawable().apply {
-                    cornerRadius = dp(8).toFloat()
-                    setColor(UiTheme.COLOR_INPUT_BG)
+        var band = current.band
+        var power = current.powerMode
+        var waitMinutes = current.shutdownTimeoutMinutes
+        val bands = listOf("2" to "2.4 GHz", "5" to "5 GHz", "bridged" to "双频")
+        val modes = listOf("省电" to "省电", "balanced" to "平衡", "性能" to "性能")
+        val wifi6 = settingSwitch("Wi-Fi 6", current.wifi6Enabled) {}
+        val autoShutdown = settingSwitch("自动关闭", current.autoShutdownEnabled) {}
+        addView(ui.surface().apply {
+            val bandValue = ui.text(bands.find { it.first == band }?.second ?: band)
+            val powerValue = ui.text(modes.find { it.first == power }?.second ?: power)
+            addView(ui.row("频段", trailing = bandValue) {
+                choose("热点频段", bands.map { it.second }, bands.indexOfFirst { it.first == band }) {
+                    band = bands[it].first
+                    bandValue.text = bands[it].second
                 }
-            }
-            row.addView(editor, LinearLayout.LayoutParams(0, -2, 1f))
-            card.addView(row)
-            return editor
-        }
-
-        val ssid = field("名称", current.ssid)
-        card.addView(createCardDivider(this@MainActivity))
-        val password = field("密码", current.password, password = true)
-        card.addView(createCardDivider(this@MainActivity))
-
-        val bandRow = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
-            addView(TextView(this@MainActivity).apply {
-                text = "频段"
-                textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            }, LinearLayout.LayoutParams(dp(76), -2))
-        }
-        val band = RadioGroup(this@MainActivity).apply {
-            orientation = RadioGroup.HORIZONTAL
-            val options = listOf("2" to "2.4G", "5" to "5G", "bridged" to "双频")
-            options.forEach { (value, label) ->
-                addView(RadioButton(this@MainActivity).apply {
-                    id = View.generateViewId()
-                    tag = value
-                    text = label
-                    textSize = 13f
-                    setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                    isChecked = current.band == value
-                    layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
-                })
-            }
-        }
-        bandRow.addView(band, LinearLayout.LayoutParams(0, -2, 1f))
-        card.addView(bandRow)
-        card.addView(createCardDivider(this@MainActivity))
-
-        fun option(text: String, checked: Boolean): Switch = Switch(this@MainActivity).apply {
-            this.text = text
-            textSize = 14f
-            isChecked = checked
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val wifi6 = option("启用 Wi-Fi 6（802.11ax）", current.wifi6Enabled)
-        card.addView(wifi6)
-        card.addView(createCardDivider(this@MainActivity))
-
-        val autoShutdown = option("无设备连接时自动关闭", current.autoShutdownEnabled)
-        card.addView(autoShutdown)
-        card.addView(createCardDivider(this@MainActivity))
-
-        val timeoutLabel = TextView(this@MainActivity).apply {
-            textSize = 13f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            text = "自动关闭等待：${(current.shutdownTimeoutMinutes / 5).coerceIn(1, 24) * 5} 分钟"
-            setPadding(0, dp(8), 0, dp(2))
-        }
-        card.addView(timeoutLabel)
-        val timeout = SeekBar(this@MainActivity).apply {
-            max = 23
-            progress = ((current.shutdownTimeoutMinutes / 5).coerceIn(1, 24) - 1)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    timeoutLabel.text = "自动关闭等待：${(progress + 1) * 5} 分钟"
-                }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
             })
-        }
-        card.addView(timeout)
-        card.addView(createCardDivider(this@MainActivity))
-
-        val powerRow = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
-            addView(TextView(this@MainActivity).apply {
-                text = "功耗策略"
-                textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            }, LinearLayout.LayoutParams(dp(76), -2))
-        }
-        val power = RadioGroup(this@MainActivity).apply {
-            orientation = RadioGroup.HORIZONTAL
-            listOf("省电" to "省电", "balanced" to "平衡", "性能" to "性能").forEach { (value, label) ->
-                addView(RadioButton(this@MainActivity).apply {
-                    id = View.generateViewId()
-                    tag = value
-                    text = label
-                    textSize = 13f
-                    setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                    isChecked = current.powerMode == value
-                    layoutParams = RadioGroup.LayoutParams(0, -2, 1f)
-                })
-            }
-        }
-        powerRow.addView(power, LinearLayout.LayoutParams(0, -2, 1f))
-        card.addView(powerRow)
-
-        val saveBtn = Button(this@MainActivity).apply {
-            text = "保存并应用热点配置"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(-1, dp(48)).apply {
-                topMargin = dp(14)
-            }
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 12f)
-            onHapticClick {
-                val ssidText = ssid.text.toString().trim()
-                val passwordText = password.text.toString()
-                if (ssidText.isEmpty() || ssidText.toByteArray().size > 32) {
-                    Toast.makeText(this@MainActivity, "热点名称必须为 1～32 字节", Toast.LENGTH_SHORT).show()
-                    return@onHapticClick
+            addView(ui.row("功耗策略", "省电优先 2.4 GHz，性能优先双频", powerValue) {
+                choose("热点功耗策略", modes.map { it.second }, modes.indexOfFirst { it.first == power }) {
+                    power = modes[it].first
+                    powerValue.text = modes[it].second
                 }
-                if (passwordText.toByteArray().size !in 8..63) {
-                    Toast.makeText(this@MainActivity, "热点密码必须为 8～63 字节", Toast.LENGTH_SHORT).show()
-                    return@onHapticClick
-                }
-                val selectedBand = band.findViewById<RadioButton>(band.checkedRadioButtonId)?.tag as? String ?: "2"
-                val selectedPower = power.findViewById<RadioButton>(power.checkedRadioButtonId)?.tag as? String ?: "balanced"
-                val finalBand = when (selectedPower) {
-                    "省电" -> "2"
-                    "性能" -> "bridged"
-                    else -> selectedBand
-                }
-                val finalWifi6 = when (selectedPower) {
-                    "省电" -> false
-                    "性能" -> true
-                    else -> wifi6.isChecked
-                }
-                viewModel.saveHotspotConfiguration(HotspotConfiguration(
-                    ssid = ssidText,
-                    password = passwordText,
-                    band = finalBand,
-                    wifi6Enabled = finalWifi6,
-                    autoShutdownEnabled = autoShutdown.isChecked,
-                    shutdownTimeoutMinutes = (timeout.progress + 1) * 5,
-                    powerMode = selectedPower
-                ))
-                Thread {
-                    val result = viewModel.restartHotspotIfActive()
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, if (result.success) "热点配置已保存" else "配置已保存：${result.message}", Toast.LENGTH_SHORT).show()
-                    }
-                }.start()
+            })
+            addView(ui.row("Wi-Fi 6", trailing = wifi6))
+        })
+        addView(ui.surface().apply {
+            addView(ui.row("自动关闭", "没有设备连接时关闭热点", autoShutdown))
+            addView(preferenceSlider("等待时长", 5, 120, 5, waitMinutes, { "$it 分钟" }) {
+                waitMinutes = it
+            })
+        })
+        addView(ui.button("保存并应用", primary = true) {
+            val name = ssid.text.toString().trim()
+            val key = password.text.toString()
+            if (name.toByteArray().size !in 1..32) {
+                ssid.error = "名称必须为 1～32 字节"
+                return@button
             }
-        }
-        card.addView(saveBtn)
-
-        val sysBtn = Button(this@MainActivity).apply {
-            text = "打开系统热点设置"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(-1, dp(46)).apply {
-                topMargin = dp(8)
+            if (key.toByteArray().size !in 8..63) {
+                password.error = "密码必须为 8～63 字节"
+                return@button
             }
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
-            onHapticClick {
-                try {
-                    startActivity(Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"))
-                } catch (_: Throwable) {
-                    startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
-                }
+            val configuredBand = when (power) {
+                "省电" -> "2"
+                "性能" -> "bridged"
+                else -> band
             }
-        }
-        card.addView(sysBtn)
-
-        addView(card)
-    }
-
-    private fun buildNfcSettings(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        val help = "可将 HomeKit 配对 Payload 写入到外置 NFC Forum Type 2 标签中。靠近支持 NFC 的 iPhone 即可直接唤起家庭 App 配对流程。\n\n注意：仅在未配对且为二维码广播模式时可用。"
-        addView(createSectionHeader(this@MainActivity, "NFC 配对", "NFC 配对说明", help))
-
-        val card = createCard(this@MainActivity)
-        nfcStatusText = TextView(this@MainActivity).apply {
-            textSize = 13f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, 0, 0, dp(10))
-        }
-        card.addView(nfcStatusText)
-
-        val nfcBtn = Button(this@MainActivity).apply {
-            text = "写入 HomeKit 二维码到 NFC 标签"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(-1, dp(46))
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
-            onHapticClick { armNfcWriter() }
-        }
-        card.addView(nfcBtn)
-        addView(card)
-        updateNfcStatus()
+            val configuredWifi6 = when (power) {
+                "省电" -> false
+                "性能" -> true
+                else -> wifi6.isChecked
+            }
+            viewModel.saveHotspotConfiguration(HotspotConfiguration(
+                ssid = name, password = key, band = configuredBand,
+                wifi6Enabled = configuredWifi6, autoShutdownEnabled = autoShutdown.isChecked,
+                shutdownTimeoutMinutes = waitMinutes, powerMode = power
+            ))
+            Thread {
+                val result = viewModel.restartHotspotIfActive()
+                runOnUiThread { toast(if (result.success) "热点配置已保存" else "已保存，应用失败：${result.message}") }
+            }.start()
+        })
+        addView(ui.button("打开系统热点设置") {
+            try {
+                startActivity(Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"))
+            } catch (_: android.content.ActivityNotFoundException) {
+                startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+            }
+        })
+        addView(ui.text("Wi-Fi 6 和自动关闭最终以系统热点设置为准。", 13, UiTheme.COLOR_TEXT_SECONDARY).apply {
+            setPadding(0, dp(12), 0, 0)
+        })
     }
 
     private fun updateNfcStatus() {
@@ -1167,130 +1171,6 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun buildDeviceManagement(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        val help = "• 重置配件 ID：生成全新的配件身份与密钥，清除旧配对，用于彻底模拟新设备。\n• 清除配对：保留现有配件 ID，仅清除绑定的家庭 App 控制器密钥。\n• 一键修复：如果家庭 App 出现无法连接、旧卡片残留或服务名称混乱，使用此功能可重建配件身份并重新发布服务。"
-        addView(createSectionHeader(this@MainActivity, "设备管理", "设备管理说明", help))
-
-        val card = createCard(this@MainActivity)
-        val dangerRow = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        val resetBtn = Button(this@MainActivity).apply {
-            text = "重置配件ID"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(0, 0, dp(4), 0) }
-            UiTheme.styleButton(this, UiTheme.COLOR_DANGER_LIGHT, UiTheme.COLOR_DANGER, radiusDp = 12f)
-            onHapticClick { resetAccessoryId() }
-        }
-        dangerRow.addView(resetBtn)
-
-        val clearBtn = Button(this@MainActivity).apply {
-            text = "清除配对"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(4), 0, 0, 0) }
-            UiTheme.styleButton(this, UiTheme.COLOR_WARNING_LIGHT, UiTheme.COLOR_WARNING, radiusDp = 12f)
-            onHapticClick { clearPairingState() }
-        }
-        dangerRow.addView(clearBtn)
-        card.addView(dangerRow)
-
-        val repairBtn = Button(this@MainActivity).apply {
-            text = "一键修复 HomeKit 配对/命名"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(10) }
-            UiTheme.styleButton(this, UiTheme.COLOR_DANGER, Color.WHITE, radiusDp = 12f)
-            onHapticClick { confirmHomeKitRecovery() }
-        }
-        card.addView(repairBtn)
-        addView(card)
-    }
-
-    /**
-     * Two peripheral surfaces. Shown while a Bluetooth host is connected or the
-     * USB session is usable; the pad picks its transport from the same state.
-     */
-    private fun buildPeripheralModesCard(): LinearLayout = createCard(
-        this, verticalPaddingDp = 12f, horizontalPaddingDp = 16f
-    ).apply {
-        visibility = View.GONE
-        addView(TextView(this@MainActivity).apply {
-            text = "外设模式"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        peripheralModesHint = TextView(this@MainActivity).apply {
-            text = "主机已连接，选择接下来在手机上使用的键鼠界面"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        }
-        addView(peripheralModesHint)
-        addView(createCardDivider(this@MainActivity))
-        addView(buildModeRow(
-            "沉浸模式",
-            "纯黑界面 + 发光键帽 + 最低亮度，适合长时间当键鼠用",
-            immersive = true
-        ))
-        addView(createCardDivider(this@MainActivity))
-        addView(buildModeRow(
-            "默认模式",
-            "同样的键鼠界面，白色主题，正常亮度",
-            immersive = false
-        ))
-    }
-
-    private fun buildModeRow(title: String, desc: String, immersive: Boolean): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(10))
-            val col = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            col.addView(TextView(this@MainActivity).apply {
-                text = title
-                textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            })
-            col.addView(TextView(this@MainActivity).apply {
-                text = desc
-                textSize = 12f
-                setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-                setPadding(0, dp(4), 0, 0)
-            })
-            addView(col)
-            addView(Button(this@MainActivity).apply {
-                text = "进入"
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                layoutParams = LinearLayout.LayoutParams(dp(64), dp(38)).apply {
-                    setMargins(dp(8), 0, 0, 0)
-                }
-                UiTheme.styleButton(
-                    this,
-                    if (immersive) UiTheme.COLOR_TEXT_PRIMARY else UiTheme.COLOR_ACCENT,
-                    Color.WHITE,
-                    radiusDp = 12f
-                )
-                onHapticClick {
-                    startActivity(
-                        PeripheralPadActivity.intent(
-                            this@MainActivity,
-                            immersive,
-                            activePeripheralTransport()
-                        )
-                    )
-                }
-            })
-        }
-
     private val hidListener = object : BtHidPeripheral.Listener {
         override fun onStateChanged(state: BtHidPeripheral.State, detail: String?) {
             runOnUiThread { applyHidState(state, detail) }
@@ -1312,9 +1192,6 @@ class MainActivity : Activity() {
             }
             if (missing.isNotEmpty()) {
                 pendingHidEnable = true
-                updatingHidSwitch = true
-                hidSwitch.isChecked = false
-                updatingHidSwitch = false
                 requestPermissions(missing.toTypedArray(), REQUEST_HID)
                 return
             }
@@ -1323,7 +1200,7 @@ class MainActivity : Activity() {
             android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
             pendingHidEnable = true
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_HID_NOTIFICATIONS)
             return
         }
         startHid()
@@ -1354,46 +1231,6 @@ class MainActivity : Activity() {
         val bridge = PeripheralHub.bridge(this)
         val stillRunning = bridge.isRunning
         hidState = state
-        updatingHidSwitch = true
-        hidSwitch.isChecked = when (state) {
-            BtHidPeripheral.State.CONNECTED,
-            BtHidPeripheral.State.READY,
-            BtHidPeripheral.State.REGISTERING -> true
-            // STOPPED while the bridge still runs is a transient re-acquire
-            // (Bluetooth restart); the switch must not flicker off.
-            BtHidPeripheral.State.STOPPED -> stillRunning
-            BtHidPeripheral.State.FAILED,
-            BtHidPeripheral.State.UNSUPPORTED -> false
-        }
-        updatingHidSwitch = false
-
-        val (label, fg, bg) = when (state) {
-            BtHidPeripheral.State.CONNECTED ->
-                Triple("HID 已连接", UiTheme.COLOR_SUCCESS, UiTheme.COLOR_SUCCESS_LIGHT)
-            BtHidPeripheral.State.READY ->
-                Triple("HID 待机", UiTheme.COLOR_ACCENT, UiTheme.COLOR_ACCENT_LIGHT)
-            BtHidPeripheral.State.REGISTERING ->
-                Triple("HID 注册中", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
-            BtHidPeripheral.State.FAILED ->
-                Triple("HID 失败", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
-            BtHidPeripheral.State.UNSUPPORTED ->
-                Triple("HID 不支持", UiTheme.COLOR_DANGER, UiTheme.COLOR_DANGER_LIGHT)
-            BtHidPeripheral.State.STOPPED ->
-                if (stillRunning) {
-                    Triple("HID 重连中", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
-                } else {
-                    Triple("HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-                }
-        }
-        hidStatusBadge.text = label
-        hidStatusBadge.setTextColor(fg)
-        hidStatusBadge.background = UiTheme.createPillDrawable(this, bg)
-        hidPageBadge?.let {
-            it.text = label
-            it.setTextColor(fg)
-            it.background = UiTheme.createPillDrawable(this, bg)
-        }
-
         // Keep the stored intent equal to the real bridge, so the switch value
         // after the next launch and the boot recovery do not lie to the user.
         val gaveUp = (state == BtHidPeripheral.State.STOPPED && !stillRunning) ||
@@ -1419,31 +1256,12 @@ class MainActivity : Activity() {
             lastHidFailure = null
         }
 
+        if (routes.current == Route.BLUETOOTH) refreshBondedHosts()
         refreshPeripheralEntry()
     }
 
-    /**
-     * Single place that decides whether the peripheral entry is shown and which
-     * transport the pad will use. It reads both live transports instead of only
-     * the in-memory Bluetooth state, so a USB session that is alive but whose
-     * service was restarted still keeps its entry.
-     */
-    private fun refreshPeripheralEntry(
-        usb: UsbPeripheralStatus.Snapshot = UsbPeripheralStatus.snapshot(this)
-    ) {
-        val card = peripheralModesCard ?: return
-        val btConnected = hidState == BtHidPeripheral.State.CONNECTED
-        // The card is the indicator: it appears when a host can actually use the
-        // peripheral and disappears the moment it cannot. "ready" means the UDC
-        // is attached and the daemon is up; armed/waiting states are not usable.
-        val usbUsable = usb.state == "ready"
-        val wanted = if (btConnected || usbUsable) View.VISIBLE else View.GONE
-        if (card.visibility != wanted) card.visibility = wanted
-        peripheralModesHint?.text = when {
-            usbUsable && btConnected -> "USB 与蓝牙主机均可用"
-            usbUsable -> ""
-            else -> "主机已连接，选择接下来在手机上使用的键鼠界面"
-        }
+    private fun refreshPeripheralEntry(usb: UsbPeripheralStatus.Snapshot = UsbPeripheralStatus.snapshot(this)) {
+        refreshOverviewStatuses(usb)
     }
 
     /**
@@ -1485,659 +1303,6 @@ class MainActivity : Activity() {
         bridge.start()
     }
 
-    private fun activePeripheralTransport(): String =
-        if (UsbPeripheralStatus.snapshot(this).active) {
-            PeripheralPadActivity.TRANSPORT_USB
-        } else {
-            PeripheralPadActivity.TRANSPORT_BT
-        }
-
-    private fun buildHidSettingsEntry(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        addView(createSectionHeader(
-            this@MainActivity,
-            "蓝牙键鼠",
-            "键鼠说明",
-            "手机作为标准蓝牙键盘 / 触控板，主机无需安装任何软件。开关在首页卡片里，这里放设备与手感设置。"
-        ))
-        val card = createCard(this@MainActivity)
-        val row = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
-        }
-        val col = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        col.addView(TextView(this@MainActivity).apply {
-            text = "设备、触控与手感受设置"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        col.addView(TextView(this@MainActivity).apply {
-            text = "设备名 / 重新连接 / 重置蓝牙 / 灵敏度 / 按键震动"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        row.addView(col)
-        row.addView(ImageView(this@MainActivity).apply {
-            setImageResource(R.drawable.ic_chevron_right)
-            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginStart = dp(6) }
-        })
-        row.onHapticClick { showHidSettingsPage() }
-        card.addView(row)
-        addView(card)
-    }
-
-    private fun buildUsbSettingsEntry(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        addView(createSectionHeader(
-            this@MainActivity,
-            "USB 外设",
-            "USB 外设说明",
-            "手机通过标准 USB 协议作为键盘 / 触控板 / 摄像头 / 麦克风 / 扬声器，主机无需安装任何软件或驱动。"
-        ))
-        val card = createCard(this@MainActivity)
-        val row = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
-        }
-        val col = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        col.addView(TextView(this@MainActivity).apply {
-            text = "USB 外设模式"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        col.addView(TextView(this@MainActivity).apply {
-            text = "USB 键鼠已可用 · 摄像头 / 麦克风 / 扬声器接入中"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        row.addView(col)
-        row.addView(ImageView(this@MainActivity).apply {
-            setImageResource(R.drawable.ic_chevron_right)
-            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginStart = dp(6) }
-        })
-        row.onHapticClick {
-            startActivity(Intent(this@MainActivity, UsbPeripheralActivity::class.java))
-        }
-        card.addView(row)
-        addView(card)
-    }
-
-    private fun buildHidSettingsPage(): View {
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            setPadding(0, 0, 0, dp(24))
-        }
-
-        val statusCard = createCard(this, 14f, 16f)
-        hidPageBadge = createStatusBadge(this, "HID 关闭", UiTheme.COLOR_TEXT_MUTED, UiTheme.COLOR_INPUT_BG)
-        statusCard.addView(hidPageBadge)
-        statusCard.addView(TextView(this).apply {
-            text = "开关在首页卡片；这里用于设备名、重连与故障恢复。"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(8), 0, 0)
-        })
-        val actionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        actionRow.addView(Button(this).apply {
-            text = "允许被发现"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
-            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 10f)
-            onHapticClick { requestHidDiscoverable() }
-        })
-        actionRow.addView(Button(this).apply {
-            text = "重新连接"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { setMargins(dp(8), 0, 0, 0) }
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 10f)
-            onHapticClick {
-                val bridge = PeripheralHub.bridge(this@MainActivity)
-                bridge.start()
-                if (!bridge.connectBonded()) {
-                    Toast.makeText(this@MainActivity, "没有已配对主机", Toast.LENGTH_SHORT).show()
-                }
-            }
-        })
-        statusCard.addView(actionRow)
-        statusCard.addView(Button(this).apply {
-            text = "断开当前主机（切换到另一台电脑）"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(-1, dp(38)).apply { topMargin = dp(8) }
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 10f)
-            onHapticClick {
-                val ok = PeripheralHub.bridge(this@MainActivity).disconnectHost()
-                Toast.makeText(
-                    this@MainActivity,
-                    if (ok) "已断开，可在另一台电脑上连接" else "当前没有已连接主机",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        })
-        statusCard.addView(Button(this).apply {
-            text = "重置蓝牙（修复「已有另一个 app 注册」）"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(-1, dp(38)).apply { topMargin = dp(8) }
-            UiTheme.styleButton(this, UiTheme.COLOR_INPUT_BG, UiTheme.COLOR_TEXT_SECONDARY, radiusDp = 10f)
-            onHapticClick {
-                Toast.makeText(this@MainActivity, "正在重置蓝牙…", Toast.LENGTH_SHORT).show()
-                Thread {
-                    val ok = PeripheralHub.bridge(this@MainActivity).resetBluetoothStack()
-                    runOnUiThread {
-                        Toast.makeText(
-                            this@MainActivity,
-                            if (ok) "蓝牙已重置，正在重新注册" else "重置失败：需要 root",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                }.start()
-            }
-        })
-        content.addView(statusCard)
-
-        // Connection policy: keep the single HID link free for another host.
-        val policyCard = createCard(this, 12f, 16f)
-        val autoRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val autoCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        autoCol.addView(TextView(this).apply {
-            text = "自动重连上次主机"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        autoCol.addView(TextView(this).apply {
-            text = "关闭后手机只等待主机连入，不会主动回连 Mac，适合把键鼠交给 Windows 使用"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        autoRow.addView(autoCol)
-        autoRow.addView(Switch(this).apply {
-            isChecked = PeripheralHub.bridge(this@MainActivity).autoReconnectLastHost
-            setOnCheckedChangeListener { _, checked ->
-                PeripheralHub.bridge(this@MainActivity).autoReconnectLastHost = checked
-            }
-        })
-        policyCard.addView(autoRow)
-        content.addView(policyCard)
-
-        // Manual host picker: an HID device has one active host at a time.
-        val hostCard = createCard(this, 12f, 16f)
-        hostCard.addView(TextView(this).apply {
-            text = "已配对主机"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        hostCard.addView(TextView(this).apply {
-            text = "点「连接」把键鼠交给这台设备；Windows 需先在这里配对成功。"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, dp(6))
-        })
-        val bridge = PeripheralHub.bridge(this@MainActivity)
-        val bonded = bridge.bondedDevices()
-        if (bonded.isEmpty()) {
-            hostCard.addView(TextView(this).apply {
-                text = "暂无已配对设备"
-                textSize = 12f
-                setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            })
-        } else {
-            bonded.forEachIndexed { index, device ->
-                if (index > 0) hostCard.addView(createCardDivider(this))
-                val name = try {
-                    device.name?.takeIf { it.isNotBlank() } ?: device.address
-                } catch (e: SecurityException) {
-                    device.address
-                }
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(0, dp(8), 0, dp(8))
-                }
-                val col = LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                }
-                col.addView(TextView(this).apply {
-                    text = name
-                    textSize = 14f
-                    setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                })
-                col.addView(TextView(this).apply {
-                    text = device.address
-                    textSize = 11f
-                    setTextColor(UiTheme.COLOR_TEXT_MUTED)
-                })
-                row.addView(col)
-                row.addView(Button(this).apply {
-                    text = "连接"
-                    textSize = 12f
-                    layoutParams = LinearLayout.LayoutParams(dp(64), dp(34))
-                    UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 10f)
-                    onHapticClick {
-                        PeripheralHub.bridge(this@MainActivity).start()
-                        val ok = PeripheralHub.bridge(this@MainActivity).connectTo(device.address)
-                        Toast.makeText(
-                            this@MainActivity,
-                            if (ok) "正在连接 $name" else "连接请求被系统拒绝",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                })
-                hostCard.addView(row)
-            }
-        }
-        content.addView(hostCard)
-
-        val nameCard = createCard(this, 12f, 16f)
-        val nameRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        nameRow.addView(TextView(this).apply {
-            text = "设备名称"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        val nameEdit = EditText(this).apply {
-            setText(PeripheralHub.bridge(this@MainActivity).deviceName)
-            setSingleLine(true)
-            textSize = 13f
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = UiTheme.createCardDrawable(this@MainActivity, radiusDp = 8f, bgColor = UiTheme.COLOR_INPUT_BG)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                setMargins(dp(8), 0, dp(8), 0)
-            }
-        }
-        nameRow.addView(nameEdit)
-        nameRow.addView(Button(this).apply {
-            text = "保存"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(dp(60), dp(36))
-            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT, Color.WHITE, radiusDp = 10f)
-            onHapticClick {
-                val name = nameEdit.text.toString().trim()
-                if (name.isNotEmpty()) {
-                    PeripheralHub.bridge(this@MainActivity).deviceName = name
-                    Toast.makeText(this@MainActivity, "已保存", Toast.LENGTH_SHORT).show()
-                }
-            }
-        })
-        nameCard.addView(nameRow)
-        content.addView(nameCard)
-
-        val touchCard = createCard(this, 12f, 16f)
-        val sensRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        sensRow.addView(TextView(this).apply {
-            text = "触控板灵敏度"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        val sensValue = TextView(this).apply {
-            text = String.format("%.1fx", hidSensitivity())
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_ACCENT)
-            setPadding(dp(8), 0, 0, 0)
-        }
-        sensRow.addView(sensValue)
-        touchCard.addView(sensRow)
-        touchCard.addView(SeekBar(this).apply {
-            max = 250
-            progress = ((hidSensitivity() * 100).toInt() - 50).coerceAtLeast(0)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seek: SeekBar, p: Int, fromUser: Boolean) {
-                    val value = (p + 50) / 100f
-                    getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-                        .edit().putInt(KEY_HID_SENSITIVITY, (value * 100).toInt()).apply()
-                    sensValue.text = String.format("%.1fx", value)
-                }
-                override fun onStartTrackingTouch(seek: SeekBar) = Unit
-                override fun onStopTrackingTouch(seek: SeekBar) = Unit
-            })
-        })
-
-        // Mouse DPI multiplies the finger-to-counts ratio for both transports.
-        touchCard.addView(createCardDivider(this))
-        val dpiRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        dpiRow.addView(TextView(this).apply {
-            text = "鼠标 DPI"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        val dpiPrefs = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-        val initialDpi = dpiPrefs.getInt(KEY_POINTER_DPI, 1000)
-        val dpiValue = TextView(this).apply {
-            text = "$initialDpi DPI"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_ACCENT)
-            setPadding(dp(8), 0, 0, 0)
-        }
-        dpiRow.addView(dpiValue)
-        touchCard.addView(dpiRow)
-        touchCard.addView(SeekBar(this).apply {
-            max = 28
-            progress = ((initialDpi - 400) / 100).coerceIn(0, 28)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seek: SeekBar, p: Int, fromUser: Boolean) {
-                    val dpi = 400 + p * 100
-                    getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-                        .edit().putInt(KEY_POINTER_DPI, dpi).apply()
-                    dpiValue.text = "$dpi DPI"
-                }
-                override fun onStartTrackingTouch(seek: SeekBar) = Unit
-                override fun onStopTrackingTouch(seek: SeekBar) = Unit
-            })
-        })
-
-        // USB-only report rate: the endpoint interval is fixed by the gadget,
-        // so this coalesces mouse deltas to the chosen cadence.
-        touchCard.addView(createCardDivider(this))
-        val hzRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        hzRow.addView(TextView(this).apply {
-            text = "USB 回报率"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        hzRow.addView(TextView(this).apply {
-            text = "仅 USB 链路"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(dp(8), 0, 0, 0)
-        })
-        touchCard.addView(hzRow)
-        val currentHz = dpiPrefs.getInt(KEY_USB_MOUSE_HZ, 1000)
-        val hzGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        listOf(125, 250, 500, 1000).forEach { hz ->
-            hzGroup.addView(RadioButton(this).apply {
-                id = View.generateViewId()
-                tag = hz
-                text = "$hz"
-                textSize = 12f
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                isChecked = hz == currentHz
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            })
-        }
-        hzGroup.setOnCheckedChangeListener { group, checkedId ->
-            val hz = group.findViewById<RadioButton>(checkedId)?.tag as? Int
-                ?: return@setOnCheckedChangeListener
-            getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-                .edit().putInt(KEY_USB_MOUSE_HZ, hz).apply()
-        }
-        touchCard.addView(hzGroup)
-
-        touchCard.addView(createCardDivider(this))
-        val keepAliveRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(10))
-        }
-        val keepCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        keepCol.addView(TextView(this).apply {
-            text = "低延迟保活"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        keepCol.addView(TextView(this).apply {
-            text = "空闲时保持链路活跃，消除键盘首击延迟"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        keepAliveRow.addView(keepCol)
-        keepAliveRow.addView(Switch(this).apply {
-            isChecked = PeripheralHub.bridge(this@MainActivity).keepAliveEnabled
-            setOnCheckedChangeListener { _, checked ->
-                PeripheralHub.bridge(this@MainActivity).keepAliveEnabled = checked
-            }
-        })
-        touchCard.addView(keepAliveRow)
-
-        touchCard.addView(createCardDivider(this))
-        val trailRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(10))
-        }
-        val trailCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        trailCol.addView(TextView(this).apply {
-            text = "拖尾轨迹"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        trailCol.addView(TextView(this).apply {
-            text = "在触控板上显示手指滑过的淡出轨迹"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        trailRow.addView(trailCol)
-        trailRow.addView(Switch(this).apply {
-            isChecked = getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-                .getBoolean(KEY_TOUCHPAD_TRAIL, false)
-            setOnCheckedChangeListener { _, checked ->
-                getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-                    .edit().putBoolean(KEY_TOUCHPAD_TRAIL, checked).apply()
-            }
-        })
-        touchCard.addView(trailRow)
-
-        touchCard.addView(createCardDivider(this))
-        val soundRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(10))
-        }
-        val soundCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        soundCol.addView(TextView(this).apply {
-            text = "按键音效"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        soundCol.addView(TextView(this).apply {
-            text = "按键时播放轻微的机械键盘点击声"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        soundRow.addView(soundCol)
-        soundRow.addView(Switch(this).apply {
-            isChecked = KeySounds.isEnabled(this@MainActivity)
-            setOnCheckedChangeListener { _, checked ->
-                KeySounds.setEnabled(this@MainActivity, checked)
-                if (checked) KeySounds.play(this@MainActivity)
-            }
-        })
-        touchCard.addView(soundRow)
-
-        touchCard.addView(createCardDivider(this))
-        val hapticsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(12), 0, dp(12))
-        }
-        val hapticsCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        hapticsCol.addView(TextView(this).apply {
-            text = "按键触感"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        })
-        hapticsCol.addView(TextView(this).apply {
-            text = "每次按键的轻微震动，强度可调"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        })
-        hapticsRow.addView(hapticsCol)
-        hapticsRow.addView(ImageView(this).apply {
-            setImageResource(R.drawable.ic_chevron_right)
-            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20))
-        })
-        hapticsRow.onHapticClick { showHidHapticsPage() }
-        touchCard.addView(hapticsRow)
-        content.addView(touchCard)
-
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            addView(createPageHeader(this@MainActivity, "蓝牙键鼠", onBackClick = { backFromHidSettings() }))
-            addView(
-                ScrollView(this@MainActivity).apply {
-                    isFillViewport = true
-                    addView(content)
-                },
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-            )
-        }
-    }
-
-    private fun buildHidHapticsPage(): View {
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            setPadding(0, 0, 0, dp(24))
-        }
-        val card = createCard(this, 14f, 16f)
-        val enabledRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        enabledRow.addView(TextView(this).apply {
-            text = "启用按键震动"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        })
-        hapticsSwitch = Switch(this).apply {
-            isChecked = KeyHaptics.isEnabled(this@MainActivity)
-            setOnCheckedChangeListener { _, checked ->
-                KeyHaptics.setEnabled(this@MainActivity, checked)
-                if (checked) KeyHaptics.tap(this@MainActivity)
-                hapticsSwitch?.isChecked = checked
-            }
-        }
-        enabledRow.addView(hapticsSwitch)
-        card.addView(enabledRow)
-
-        card.addView(createCardDivider(this))
-        val strengthHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        strengthHeader.addView(TextView(this).apply {
-            text = "震动强度"
-            textSize = 13f
-            setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-        })
-        val strengthValue = TextView(this).apply {
-            text = "${KeyHaptics.strength(this@MainActivity)}%"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_ACCENT)
-            setPadding(dp(8), 0, 0, 0)
-        }
-        strengthHeader.addView(strengthValue)
-        card.addView(strengthHeader)
-        card.addView(SeekBar(this).apply {
-            max = 99
-            progress = (KeyHaptics.strength(this@MainActivity) - 1).coerceIn(0, 99)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seek: SeekBar, p: Int, fromUser: Boolean) {
-                    val value = p + 1
-                    KeyHaptics.setStrength(this@MainActivity, value)
-                    strengthValue.text = "$value%"
-                }
-                override fun onStartTrackingTouch(seek: SeekBar) = Unit
-                override fun onStopTrackingTouch(seek: SeekBar) = Unit
-            })
-        })
-        card.addView(Button(this).apply {
-            text = "试一下"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(-1, dp(42)).apply { topMargin = dp(10) }
-            UiTheme.styleButton(this, UiTheme.COLOR_ACCENT_LIGHT, UiTheme.COLOR_ACCENT, radiusDp = 10f)
-            onHapticClick { KeyHaptics.tap(this@MainActivity) }
-        })
-        content.addView(card)
-
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-            addView(createPageHeader(this@MainActivity, "按键触感", onBackClick = { backFromHidHaptics() }))
-            addView(
-                ScrollView(this@MainActivity).apply {
-                    isFillViewport = true
-                    addView(content)
-                },
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-            )
-        }
-    }
-
-    private fun hidSensitivity(): Float =
-        getSharedPreferences(BtHidPeripheral.PREFS, MODE_PRIVATE)
-            .getInt(KEY_HID_SENSITIVITY, 180) / 100f
-
     private fun requestHidDiscoverable() {
         try {
             startActivityForResult(
@@ -2150,157 +1315,34 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showHidSettingsPage() {
-        mainPage?.visibility = View.GONE
-        settingsPage?.visibility = View.GONE
-        hidHapticsPage?.visibility = View.GONE
-        hidSettingsPage?.visibility = View.VISIBLE
-        val bridge = PeripheralHub.bridge(this)
-        applyHidState(bridge.state, bridge.hostName)
-    }
-
-    private fun showHidHapticsPage() {
-        hidSettingsPage?.visibility = View.GONE
-        hidHapticsPage?.visibility = View.VISIBLE
-    }
-
-    private fun backFromHidSettings() {
-        hidSettingsPage?.visibility = View.GONE
-        showSettingsPage()
-    }
-
-    private fun backFromHidHaptics() {
-        hidHapticsPage?.visibility = View.GONE
-        hidSettingsPage?.visibility = View.VISIBLE
-    }
-
-    private fun buildPairingCard(): LinearLayout = createCard(this, verticalPaddingDp = 16f, horizontalPaddingDp = 16f).apply {
-        tag = "pairing_card_root"
-
-        val header = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(12))
-        }
-        val cardTitle = TextView(this@MainActivity).apply {
-            tag = "pairing_card_title"
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        }
-        header.addView(cardTitle)
-
-        val help = createHelpBubble(
-            this@MainActivity,
-            "配对说明",
-            "打开 iPhone 原生「家庭」App：\n• 若为二维码模式：点击右上角「+」→「添加配件」，扫描二维码即可。\n• 若为配对码模式：在家庭 App 选择「更多选项」，点击配件并输入 8 位配对码。\n• 配对成功后，此卡片将自动隐藏。"
-        )
-        header.addView(help)
-
-        val spacer = View(this@MainActivity).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) }
-        header.addView(spacer)
-        addView(header)
-        addView(createCardDivider(this@MainActivity))
-
-        val contentRow = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(12), 0, 0)
-        }
-
-        val qrCol = FrameLayout(this@MainActivity).apply {
-            tag = "pairing_qr_column"
-            background = GradientDrawable().apply {
-                cornerRadius = dp(12).toFloat()
-                setColor(Color.WHITE)
-                setStroke(dp(1), UiTheme.COLOR_CARD_BORDER)
-            }
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            pairingQrView = ImageView(this@MainActivity).apply {
-                adjustViewBounds = true
-                scaleType = ImageView.ScaleType.CENTER_INSIDE
-                layoutParams = FrameLayout.LayoutParams(dp(130), dp(130))
-            }
-            addView(pairingQrView)
-        }
-        contentRow.addView(qrCol, LinearLayout.LayoutParams(dp(146), dp(146)))
-
-        val dividerView = View(this@MainActivity).apply {
-            tag = "pairing_divider"
-            setBackgroundColor(UiTheme.COLOR_DIVIDER)
-            val lp = LinearLayout.LayoutParams(dp(1), dp(120)).apply {
-                setMargins(dp(16), 0, dp(16), 0)
-            }
-            layoutParams = lp
-        }
-        contentRow.addView(dividerView)
-
-        val infoCol = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            pairingCardKeyLabel = TextView(this@MainActivity).apply {
-                tag = "pairing_card_key_label"
-                textSize = 12f
-                setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            }
-            addView(pairingCardKeyLabel)
-
-            pairingCardKey = TextView(this@MainActivity).apply {
-                tag = "pairing_card_key"
-                textSize = 22f
-                typeface = Typeface.MONOSPACE
-                setTextColor(UiTheme.COLOR_ACCENT)
-                setPadding(0, dp(2), 0, dp(6))
-            }
-            addView(pairingCardKey)
-
-            pairingCardHint = TextView(this@MainActivity).apply {
-                tag = "pairing_card_hint"
-                textSize = 12f
-                setTextColor(UiTheme.COLOR_TEXT_SECONDARY)
-            }
-            addView(pairingCardHint)
-        }
-        contentRow.addView(infoCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-
-        addView(contentRow)
-        updatePairingCard()
-    }
-
     private fun pairingModeLabel(mode: PairingBroadcastMode): String = when (mode) {
         PairingBroadcastMode.QR_SETUP_PAYLOAD -> "二维码 / Setup ID ${viewModel.setupId}"
         PairingBroadcastMode.LEGACY_SETUP_CODE -> "8 位配对码"
     }
 
     private fun updatePairingCard() {
-        val card = pairingCard ?: return
-        val qrColumn = card.findViewWithTag<View>("pairing_qr_column") ?: return
-        val divider = card.findViewWithTag<View>("pairing_divider") ?: return
         val paired = viewModel.isPaired
         val qrMode = viewModel.pairingBroadcastMode == PairingBroadcastMode.QR_SETUP_PAYLOAD
-        card.visibility = if (paired) View.GONE else View.VISIBLE
-        pairingModeSummary?.text = "当前广播：${pairingModeLabel(viewModel.pairingBroadcastMode)}"
-        pairingPayloadText?.text = if (paired) {
-            "Setup ID：${viewModel.setupId}\nPayload：已隐藏"
-        } else {
-            "Setup ID：${viewModel.setupId}\nPayload：${viewModel.setupPayload}"
+        pairingModeSummary?.text = if (qrMode) "二维码" else "配对码"
+        pairingState?.text = when {
+            paired -> "已与 Apple 家庭配对"
+            qrMode -> "扫描二维码"
+            else -> "输入配对码"
         }
-        if (paired) return
-        qrColumn.visibility = if (qrMode) View.VISIBLE else View.GONE
-        divider.visibility = if (qrMode) View.VISIBLE else View.GONE
-        if (qrMode) {
-            pairingQrView?.setImageBitmap(createQrBitmap(viewModel.setupPayload))
-            pairingCardTitle?.text = "扫码配对"
-            pairingCardHint?.text = "打开 iPhone 家庭 App\n扫描左侧二维码"
-            pairingCardKeyLabel?.text = "Setup ID"
-            pairingCardKey?.text = viewModel.setupId
-            pairingCardKey?.setTextColor(UiTheme.COLOR_ACCENT)
-        } else {
-            pairingCardTitle?.text = "输入配对码"
-            pairingCardHint?.text = "在 iPhone 家庭 App 选择“更多选项”输入"
-            pairingCardKeyLabel?.text = "配对码"
-            pairingCardKey?.text = viewModel.formatSetupCode(viewModel.setupCodeDigits)
-            pairingCardKey?.setTextColor(UiTheme.COLOR_ACCENT)
+        pairingQrView?.visibility = if (!paired && qrMode) View.VISIBLE else View.GONE
+        pairingCode?.visibility = if (!paired && !qrMode) View.VISIBLE else View.GONE
+        pairingCode?.text = if (paired) "" else viewModel.formatSetupCode(viewModel.setupCodeDigits)
+        pairingHint?.text = when {
+            paired -> "可在 Apple 家庭中查看和控制这台设备。"
+            qrMode -> "在 iPhone 的家庭 App 中选择「添加配件」，扫描上方二维码。"
+            else -> "在家庭 App 中选择「更多选项」，然后输入上方配对码。"
+        }
+        if (!paired && qrMode && routes.current == Route.PAIRING) {
+            val payload = viewModel.setupPayload
+            if (renderedSetupPayload != payload) {
+                pairingQrView?.setImageBitmap(createQrBitmap(payload))
+                renderedSetupPayload = payload
+            }
         }
     }
 
@@ -2318,185 +1360,35 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showSettingsPage() {
-        updatePairingCard()
-        updateBroadcastStrategySummary()
-        hidHapticsPage?.visibility = View.GONE
-        hidSettingsPage?.visibility = View.GONE
-        mainPage?.visibility = View.GONE
-        settingsPage?.visibility = View.VISIBLE
-    }
-
-    private fun showMainPage() {
-        settingsPage?.visibility = View.GONE
-        hidHapticsPage?.visibility = View.GONE
-        hidSettingsPage?.visibility = View.GONE
-        mainPage?.visibility = View.VISIBLE
-        updateConnectionStatus(refreshRoot = false)
-    }
-
-    private fun buildFeatureRow(feature: HomeKitFeature): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-
-        val label = TextView(this).apply {
-            text = getFeatureTitle(feature)
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-        }
-        textCol.addView(label)
-
-        val toggleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(2), 0, 0)
-        }
-
-        val toggle = CheckBox(this).apply {
-            isChecked = viewModel.isFeatureEnabled(feature)
-            buttonTintList = ColorStateList.valueOf(UiTheme.COLOR_ACCENT)
-            setOnCheckedChangeListener { _, checked ->
-                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                viewModel.setFeatureEnabled(feature, checked)
-                log("COMMAND_TOGGLE feature=$feature enabled=$checked")
-            }
-        }
-        commandEnableToggles[feature] = toggle
-        toggleRow.addView(toggle)
-
-        val toggleLabel = TextView(this).apply {
-            text = "允许 HomeKit 控制"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setOnClickListener { toggle.toggle() }
-        }
-        toggleRow.addView(toggleLabel)
-
-        textCol.addView(toggleRow)
-        row.addView(textCol)
-
-        // Live state toggle button (tap to execute)
-        val testBtn = Button(this).apply {
-            text = "OFF"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(dp(72), dp(36))
-            layoutParams = lp
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_SECONDARY, radiusDp = 18f)
-            onHapticClick { runCommandFromUi(feature) }
-        }
-        featureButtons[feature] = testBtn
-        row.addView(testBtn)
-
-        return row
-    }
-
     private fun showSetupCodeDialog() {
-        val digits = viewModel.setupCodeDigits.padEnd(8, '0').take(8)
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(dp(12), dp(16), dp(12), dp(16))
+        val input = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf(android.text.InputFilter.LengthFilter(8))
+            hint = "8 位数字"
+            contentDescription = "8 位配对码"
+            setSingleLine(true)
+            setText(viewModel.setupCodeDigits)
+            selectAll()
         }
-
-        val inputViews = mutableListOf<EditText>()
-        val numInputType = android.text.InputType.TYPE_CLASS_NUMBER
-
-        for (i in 0 until 8) {
-            if (i == 4) {
-                val dash = TextView(this).apply {
-                    text = "-"
-                    textSize = 18f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(UiTheme.COLOR_TEXT_MUTED)
-                    gravity = Gravity.CENTER
-                    setPadding(dp(4), 0, dp(4), 0)
-                }
-                container.addView(dash)
-            }
-
-            val et = EditText(this).apply {
-                textSize = 18f
-                typeface = Typeface.MONOSPACE
-                inputType = numInputType
-                setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-                setPadding(dp(2), dp(6), dp(2), dp(6))
-                background = GradientDrawable().apply {
-                    cornerRadius = dp(8).toFloat()
-                    setColor(UiTheme.COLOR_INPUT_BG)
-                    setStroke(dp(1), UiTheme.COLOR_CARD_BORDER)
-                }
-                gravity = Gravity.CENTER
-                filters = arrayOf(android.text.InputFilter.LengthFilter(1))
-                val lp = LinearLayout.LayoutParams(dp(30), dp(42))
-                lp.setMargins(dp(2), 0, dp(2), 0)
-                layoutParams = lp
-                setText(if (i < digits.length) digits[i].toString() else "")
-                setSelection(text.length)
-            }
-            inputViews.add(et)
-            container.addView(et)
+        val container = ui.column().apply {
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(input)
         }
-
-        // Wire up auto-advance and backspace
-        for (i in inputViews.indices) {
-            val et = inputViews[i]
-            val idx = i
-            et.addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-                override fun afterTextChanged(s: Editable?) {
-                    val text = s?.toString() ?: ""
-                    if (text.length == 1 && idx < 7) {
-                        inputViews[idx + 1].requestFocus()
-                    }
-                }
-            })
-            et.setOnKeyListener { _, keyCode, event ->
-                if (keyCode == android.view.KeyEvent.KEYCODE_DEL && event.action == android.view.KeyEvent.ACTION_DOWN) {
-                    if (et.text.isEmpty() && idx > 0) {
-                        val prev = inputViews[idx - 1]
-                        prev.setSelection(prev.text.length)
-                        prev.requestFocus()
-                        true
-                    } else false
-                } else false
+        val dialog = AlertDialog.Builder(this).setTitle("修改配对码")
+            .setView(container).setPositiveButton("保存", null).setNegativeButton("取消", null).show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val code = input.text.toString()
+            if (!viewModel.isValidSetupCode(code)) {
+                input.error = "请输入 8 位数字，不能全相同或连续递增、递减"
+                return@setOnClickListener
             }
+            viewModel.saveSetupCode(code)
+            updatePairingCard()
+            toast("配对码已更新")
+            dialog.dismiss()
         }
-
-        AlertDialog.Builder(this)
-            .setTitle("设置配对码")
-            .setView(container)
-            .setPositiveButton("保存") { _, _ ->
-                val code = inputViews.joinToString("") { it.text.toString() }.filter { it.isDigit() }
-                if (!viewModel.isValidSetupCode(code)) {
-                    Toast.makeText(this, "无效：不能全相同或连续递增/递减", Toast.LENGTH_SHORT).show()
-                } else {
-                    viewModel.saveSetupCode(code)
-                    log("SETUP_CODE_UPDATED format=4-4")
-                    updatePairingCard()
-                    Toast.makeText(this, "配对码已更新", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNegativeButton("取消", null)
-            .show()
-
-        // Focus first empty box
-        val firstEmpty = inputViews.firstOrNull { it.text.isEmpty() } ?: inputViews[0]
-        firstEmpty.requestFocus()
+        input.requestFocus()
     }
-
-    private fun getFeatureTitle(feature: HomeKitFeature): String = feature.title
 
     private fun resetAccessoryId() {
         val id = viewModel.resetAccessoryId()
@@ -2543,67 +1435,19 @@ class MainActivity : Activity() {
     } catch (_: Throwable) { false }
 
     private fun updateConnectionStatus(refreshRoot: Boolean = true) {
+        if (refreshRoot) Thread {
+            val available = rootAvailable()
+            runOnUiThread {
+                if (!isDestroyed) rootBadge.renderStatus(
+                    if (available) UiStatus("Root 可用", StatusTone.ACTIVE) else UiStatus("Root 未授权")
+                )
+            }
+        }.start()
         runOnUiThread {
-            val paired = viewModel.isPaired
-            val connected = viewModel.isConnected
-            if (refreshRoot) rootStatus = if (rootAvailable()) "Root可用" else "无Root"
-
-            titleView.text = "Marionette"
-
-            if (connected) {
-                statusBadge.text = "● 已连接"
-                statusBadge.setTextColor(UiTheme.COLOR_SUCCESS)
-                statusBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_SUCCESS_LIGHT)
-            } else if (paired) {
-                statusBadge.text = "● 已配对"
-                statusBadge.setTextColor(UiTheme.COLOR_ACCENT)
-                statusBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_ACCENT_LIGHT)
-            } else {
-                statusBadge.text = "● 等待连接"
-                statusBadge.setTextColor(UiTheme.COLOR_TEXT_MUTED)
-                statusBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_INPUT_BG)
-            }
-
-            rootBadge.text = rootStatus
-            if (rootStatus == "Root可用") {
-                rootBadge.setTextColor(0xFF6B46C1.toInt())
-                rootBadge.background = UiTheme.createPillDrawable(this, 0xFFF3E8FD.toInt())
-            } else {
-                rootBadge.setTextColor(UiTheme.COLOR_TEXT_MUTED)
-                rootBadge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_INPUT_BG)
-            }
-
-            statusInfo.text = "配件 ID：${viewModel.accessoryId()}"
+            statusInfo.text = "配件 ID · ${viewModel.accessoryId()}"
             updatePairingCard()
-            updateAirDropCardStatus()
-        }
-    }
-
-    private fun updateAirDropCardStatus() {
-        val badge = airDropStatusBadge ?: return
-        val summary = airDropSummaryText ?: return
-        val isSessionActive = java.io.File(dev.local.mihotspot.airdrop.AirDropStore.radio(this), "active").exists()
-        val isResident = dev.local.mihotspot.airdrop.AirDropResidentService.isEnabled(this)
-
-        when {
-            isSessionActive -> {
-                badge.text = "● 实验中"
-                badge.setTextColor(UiTheme.COLOR_SUCCESS)
-                badge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_SUCCESS_LIGHT)
-                summary.text = "独占无线传输正在运行 · 点此进入收发"
-            }
-            isResident -> {
-                badge.text = "● 待机中"
-                badge.setTextColor(UiTheme.COLOR_ACCENT)
-                badge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_ACCENT_LIGHT)
-                summary.text = "常驻服务已开启 · Wi-Fi 正常"
-            }
-            else -> {
-                badge.text = "○ 未开启"
-                badge.setTextColor(UiTheme.COLOR_TEXT_MUTED)
-                badge.background = UiTheme.createPillDrawable(this, UiTheme.COLOR_INPUT_BG)
-                summary.text = "面向苹果设备 · 点击进入配置与收发"
-            }
+            updateBroadcastStrategySummary()
+            refreshOverviewStatuses()
         }
     }
 
@@ -2735,7 +1579,8 @@ class MainActivity : Activity() {
 
     private fun applyFeatureState(feature: HomeKitFeature, value: Boolean) {
         val btn = featureButtons[feature] ?: return
-        btn.text = if (value) "ON" else "OFF"
+        btn.text = if (value) feature.enabledLabel else feature.disabledLabel
+        btn.isEnabled = feature !in featureLoading
         if (value) {
             UiTheme.styleButton(btn, UiTheme.COLOR_TEXT_PRIMARY, Color.WHITE, radiusDp = 18f)
         } else {
@@ -2802,9 +1647,13 @@ class MainActivity : Activity() {
 
     private fun startHomeKitService() {
         try { ServiceControl.start(this) } catch (e: Throwable) { log("SERVICE_START_FAILED ${e.message}") }
+        updateConnectionStatus(refreshRoot = false)
     }
 
-    private fun stopHomeKitService() { ServiceControl.stop(this) }
+    private fun stopHomeKitService() {
+        ServiceControl.stop(this)
+        updateConnectionStatus(refreshRoot = false)
+    }
 
     private fun restartHomeKitService() {
         stopHomeKitService()
@@ -2821,27 +1670,31 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_BLUETOOTH && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }) {
-            ensurePermissionsAndStart()
-        } else if (requestCode == REQUEST_CAMERA) {
-            if (requestNotificationPermissionIfNeeded()) startHomeKitService()
-        } else if (requestCode == REQUEST_NOTIFICATIONS && grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            if (pendingHidEnable) {
+        val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        when (requestCode) {
+            REQUEST_BLUETOOTH -> if (granted) ensurePermissionsAndStart()
+            REQUEST_CAMERA -> if (requestNotificationPermissionIfNeeded()) startHomeKitService()
+            REQUEST_NOTIFICATIONS -> if (granted) startHomeKitService()
+            REQUEST_HID -> {
+                val shouldStart = pendingHidEnable && granted
                 pendingHidEnable = false
-                startHid()
-            } else {
-                startHomeKitService()
+                if (shouldStart) enableHidFromUi()
+                else if (!granted) toast("需要蓝牙权限才能作为外设使用")
             }
-        } else if (requestCode == REQUEST_HID) {
-            if (grantResults.isNotEmpty() && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED } && pendingHidEnable) {
+            REQUEST_HID_NOTIFICATIONS -> {
+                val shouldStart = pendingHidEnable && granted
                 pendingHidEnable = false
-                enableHidFromUi()
-            } else {
-                pendingHidEnable = false
-                applyHidState(BtHidPeripheral.State.STOPPED, null)
-                Toast.makeText(this, "需要蓝牙权限才能作为外设使用", Toast.LENGTH_SHORT).show()
+                if (shouldStart) startHid()
+            }
+            REQUEST_USB_PERMISSIONS -> if (usbStartRequested) {
+                if (granted) authorizeUsbStart()
+                else {
+                    usbStartRequested = false
+                    toast("未授权相机或麦克风，USB 外设未启动")
+                }
             }
         }
+        refreshOverviewStatuses()
     }
 
     private fun log(message: String) {
@@ -2855,6 +1708,9 @@ class MainActivity : Activity() {
         private const val REQUEST_CAMERA = 102
         private const val REQUEST_HID = 103
         private const val REQUEST_DISCOVERABLE = 104
+        private const val REQUEST_HID_NOTIFICATIONS = 105
+        private const val REQUEST_USB_PERMISSIONS = 106
+        private const val REQUEST_USB_SCREEN = 107
         private const val KEY_HID_SENSITIVITY = "touchpad_sensitivity"
         private const val KEY_TOUCHPAD_TRAIL = "touchpad_trail"
         private const val KEY_POINTER_DPI = "pointer_dpi"

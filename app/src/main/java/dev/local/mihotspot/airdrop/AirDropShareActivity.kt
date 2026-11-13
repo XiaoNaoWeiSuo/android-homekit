@@ -2,32 +2,20 @@ package dev.local.mihotspot.airdrop
 
 import android.app.Activity
 import android.content.Intent
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
-import android.text.TextUtils
-import android.view.Gravity
 import android.view.View
-import android.widget.Button
-import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.ScrollView
 import android.widget.TextView
-import dev.local.mihotspot.R
+import dev.local.mihotspot.ui.ProductUi
+import dev.local.mihotspot.ui.Symbol
 import dev.local.mihotspot.ui.UiTheme
 import dev.local.mihotspot.ui.createCard
 import dev.local.mihotspot.ui.createCardDivider
-import dev.local.mihotspot.ui.createPageHeader
-import dev.local.mihotspot.ui.createSectionHeader
-import dev.local.mihotspot.ui.createStatusBadge
-import dev.local.mihotspot.ui.onHapticClick
 import java.io.File
 
 /**
@@ -47,6 +35,7 @@ import java.io.File
  * 而不是让用户对着空列表发呆。
  */
 class AirDropShareActivity : Activity() {
+    private val ui by lazy { ProductUi(this) }
     private val handler = Handler(Looper.getMainLooper())
 
     private lateinit var peersContainer: LinearLayout
@@ -58,7 +47,6 @@ class AirDropShareActivity : Activity() {
     private lateinit var progressSection: LinearLayout
     private lateinit var progressBar: ProgressBar
     private lateinit var progressText: TextView
-    private lateinit var payloadCard: LinearLayout
 
     private companion object {
         const val REQUEST_PICK_FILE = 41
@@ -77,11 +65,10 @@ class AirDropShareActivity : Activity() {
         AirDropState.addListener(listener)
         collectShare(intent)
         if (staged.isEmpty()) {
-            payloadText.text = "未选择文件 · 点此选择"
-            statusText.text = "点上面的卡片选择要发送的文件，或从其他应用分享时选择「隔空投送」。"
+            payloadText.text = "未选择文件"
+            statusText.text = "先选择文件，再点按附近设备。"
             statusBadge.text = "○ 无内容"
         }
-        payloadCard.setOnClickListener { pickFile() }
         // 即使还没选文件也要起引擎：设备列表来自常驻接收端，先扫描才能选中设备。
         ensureEngine()
         awaitBrowsing()
@@ -288,8 +275,20 @@ class AirDropShareActivity : Activity() {
 
     private fun render() {
         if (isFinishing || isDestroyed) return
+        // 传输中同步进度条（事件流驱动，节流由后端负责）。
+        val progress = AirDropState.progress
+        if (sending && progress != null) {
+            val fraction = progress.fraction
+            if (fraction == null) {
+                progressBar.isIndeterminate = true
+            } else {
+                progressBar.isIndeterminate = false
+                progressBar.progress = (fraction * 1000).toInt()
+                progressText.text = "${AirDropStore.formatSize(progress.done)} / ${AirDropStore.formatSize(progress.total)}"
+            }
+        }
         val peers = AirDropState.peers()
-        val stamp = peers.joinToString { it.name } + "|" + AirDropState.phase + "|" + AirDropState.status
+        val stamp = peers.joinToString { "${it.name}/${it.displayName}" } + "|" + AirDropState.phase + "|" + AirDropState.status
         if (stamp == lastPeerStamp) return
         lastPeerStamp = stamp
 
@@ -319,198 +318,50 @@ class AirDropShareActivity : Activity() {
             peersContainer.addView(buildEmptyPeers())
         } else {
             peers.forEachIndexed { index, peer ->
-                if (index > 0) peersContainer.addView(createCardDivider(this, insetHorizontalDp = 56f))
+                if (index > 0) peersContainer.addView(createCardDivider(this))
                 peersContainer.addView(buildPeerRow(peer))
             }
         }
 
-        // 传输中同步进度条（事件流驱动，节流由后端负责）。
-        val progress = AirDropState.progress
-        if (sending && progress != null) {
-            val fraction = progress.fraction
-            if (fraction == null) {
-                progressBar.isIndeterminate = true
-            } else {
-                progressBar.isIndeterminate = false
-                progressBar.progress = (fraction * 1000).toInt()
-                progressText.text = "${AirDropStore.formatSize(progress.done)} / ${AirDropStore.formatSize(progress.total)}"
-            }
-        }
+
     }
 
-    private fun buildEmptyPeers(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-        setPadding(dp(16), dp(28), dp(16), dp(28))
-        addView(TextView(this@AirDropShareActivity).apply {
-            text = "附近没有 AirDrop 设备"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            gravity = Gravity.CENTER
-        })
-        addView(TextView(this@AirDropShareActivity).apply {
-            text = "请让对方打开控制中心 → 隔空投送 → 「所有人」，并保持屏幕解锁。"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(6), 0, 0)
-        })
+    private fun buildEmptyPeers(): View = ui.column().apply {
+        addView(ui.text("还没有发现设备", 15, bold = true))
+        addView(ui.text("请在对方设备打开 AirDrop，并将接收范围设为「所有人」。", 13, UiTheme.COLOR_TEXT_SECONDARY))
     }
 
-    private fun buildPeerRow(peer: AirDropEvents.Peer): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(12), 0, dp(12))
-            background = UiTheme.createButtonRipple(
-                this@AirDropShareActivity,
-                Color.TRANSPARENT,
-                UiTheme.adjustAlpha(Color.BLACK, 0.06f),
-                radiusDp = 12f
-            )
-            isClickable = true
-            isFocusable = true
-            onHapticClick { sendTo(peer) }
-        }
+    private fun buildPeerRow(peer: AirDropEvents.Peer): View =
+        ui.row(peer.displayName, symbol = Symbol.DISPLAY) { sendTo(peer) }
 
-        val iconBox = FrameLayout(this).apply {
-            val size = dp(40)
-            layoutParams = LinearLayout.LayoutParams(size, size).apply { marginEnd = dp(14) }
-            background = GradientDrawable().apply {
-                cornerRadius = dp(20).toFloat()
-                setColor(UiTheme.COLOR_ACCENT_LIGHT)
-            }
-            addView(ImageView(this@AirDropShareActivity).apply {
-                setImageResource(R.drawable.ic_file)
-                layoutParams = FrameLayout.LayoutParams(dp(20), dp(20)).apply { gravity = Gravity.CENTER }
-            })
-        }
-        row.addView(iconBox)
-
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        textCol.addView(TextView(this@AirDropShareActivity).apply {
-            text = peer.displayName
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.MIDDLE
-        })
-        textCol.addView(TextView(this@AirDropShareActivity).apply {
-            text = peer.address
-            textSize = 11f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(0, dp(2), 0, 0)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.MIDDLE
-        })
-        row.addView(textCol)
-        return row
-    }
-
-    // ---- 布局 ----
-
-    private fun dp(v: Int): Int = UiTheme.dp(this, v)
-
-    private fun buildUi(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(UiTheme.COLOR_BG)
-        }
-        root.addView(
-            createPageHeader(
-                context = this,
-                titleText = "隔空投送",
-                onBackClick = { finish() },
-                subtitleBadge = createStatusBadge(this, "● 扫描中", UiTheme.COLOR_WARNING, UiTheme.COLOR_WARNING_LIGHT)
-                    .also { statusBadge = it }
-            )
-        )
-
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(24))
-        }
-
-        // 发送内容
-        content.addView(createSectionHeader(this, "发送内容"))
-        payloadCard = createCard(this)
-        payloadText = TextView(this).apply {
-            text = describePayload()
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(UiTheme.COLOR_TEXT_PRIMARY)
-            setLineSpacing(dp(3).toFloat(), 1.0f)
-        }
-        payloadCard.addView(payloadText)
-        statusText = TextView(this).apply {
-            text = "正在查找附近设备…"
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(0, dp(4), 0, 0)
-        }
-        payloadCard.addView(statusText)
-        progressSection = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+    private fun buildUi(): View = ui.screen("发送文件", { finish() }) {
+        payloadText = ui.text(describePayload(), 15, bold = true)
+        statusText = ui.text("正在查找附近设备…", 13, UiTheme.COLOR_TEXT_SECONDARY)
+        statusBadge = ui.status("扫描中")
+        progressSection = ui.column().apply {
             visibility = View.GONE
-        }
-        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 1000
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(6)
-            ).apply { topMargin = dp(10) }
-        }
-        progressSection.addView(progressBar)
-        progressText = TextView(this).apply {
-            textSize = 12f
-            setTextColor(UiTheme.COLOR_TEXT_MUTED)
-            setPadding(0, dp(6), 0, 0)
-        }
-        progressSection.addView(progressText)
-        payloadCard.addView(progressSection)
-        content.addView(payloadCard)
-
-        // 附近设备
-        content.addView(createSectionHeader(this, "附近设备", "实时扫描说明",
-            "苹果设备只在打开分享面板/隔空投送面板时才向网络宣告自己，因此列表可能随时增减。"))
-        val peersCard = createCard(this, verticalPaddingDp = 6f, horizontalPaddingDp = 16f)
-        peersContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        peersContainer.addView(buildEmptyPeers())
-        peersCard.addView(peersContainer)
-        content.addView(peersCard)
-
-        val retry = Button(this).apply {
-            text = "刷新设备列表"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(44)
-            ).apply {
-                setMargins(dp(16), dp(12), dp(16), 0)
+            progressBar = ProgressBar(this@AirDropShareActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 1000
+                contentDescription = "发送进度"
             }
-            UiTheme.styleButton(this, UiTheme.COLOR_BTN_SECONDARY_BG, UiTheme.COLOR_TEXT_PRIMARY, radiusDp = 12f)
-            onHapticClick {
-                // 列表由接收端的常驻 browse 维护，没有"重新起一个扫描进程"这回事。
-                // 清空只是让界面立刻反映"正在重新确认"，对端每 10s 宣告一次，
-                // 几秒内就会重新出现；引擎没起来则顺手拉起来。
-                AirDropState.clearPeers()
-                ensureEngine()
-                awaitBrowsing()
-            }
+            progressText = ui.text("", 13, UiTheme.COLOR_TEXT_SECONDARY)
+            addView(progressBar)
+            addView(progressText)
         }
-        content.addView(retry)
-
-        root.addView(ScrollView(this).apply {
-            isFillViewport = true
-            addView(content)
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        addView(ui.surface().apply {
+            addView(ui.row("要发送的文件", trailing = statusBadge, symbol = Symbol.SEND))
+            addView(payloadText)
+            addView(statusText)
+            addView(progressSection)
+            addView(ui.button("选择文件", action = ::pickFile))
         })
-        return root
+        addView(ui.section("附近设备"))
+        peersContainer = ui.surface().apply { addView(buildEmptyPeers()) }
+        addView(peersContainer)
+        addView(ui.button("刷新设备列表") {
+            AirDropState.clearPeers()
+            ensureEngine()
+            awaitBrowsing()
+        })
     }
 }

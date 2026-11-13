@@ -26,34 +26,34 @@ import dev.local.mihotspot.R
  */
 object UiTheme {
     // Canvas & Surface
-    const val COLOR_BG = 0xFFF5F6F8.toInt()
+    const val COLOR_BG = 0xFFF2F5F3.toInt()
     const val COLOR_CARD_BG = 0xFFFFFFFF.toInt()
-    const val COLOR_CARD_BORDER = 0xFFEBECEF.toInt()
-    const val COLOR_DIVIDER = 0xFFF0F1F4.toInt()
+    const val COLOR_CARD_BORDER = 0xFFDDE7E1.toInt()
+    const val COLOR_DIVIDER = 0xFFE8EEEA.toInt()
 
     // Typography
-    const val COLOR_TEXT_PRIMARY = 0xFF1F2329.toInt()
-    const val COLOR_TEXT_SECONDARY = 0xFF646A73.toInt()
-    const val COLOR_TEXT_MUTED = 0xFF8F959E.toInt()
+    const val COLOR_TEXT_PRIMARY = 0xFF182822.toInt()
+    const val COLOR_TEXT_SECONDARY = 0xFF50645A.toInt()
+    const val COLOR_TEXT_MUTED = 0xFF617468.toInt()
 
     // Accent & Status
-    const val COLOR_ACCENT = 0xFF0D84FF.toInt()
-    const val COLOR_ACCENT_LIGHT = 0xFFEBF3FF.toInt()
+    const val COLOR_ACCENT = 0xFF09624F.toInt()
+    const val COLOR_ACCENT_LIGHT = 0xFFE0F2EA.toInt()
 
-    const val COLOR_SUCCESS = 0xFF00B578.toInt()
-    const val COLOR_SUCCESS_LIGHT = 0xFFE6F8F0.toInt()
+    const val COLOR_SUCCESS = 0xFF246740.toInt()
+    const val COLOR_SUCCESS_LIGHT = 0xFFDEEFE3.toInt()
 
-    const val COLOR_WARNING = 0xFFFF8F1F.toInt()
-    const val COLOR_WARNING_LIGHT = 0xFFFFF4E6.toInt()
+    const val COLOR_WARNING = 0xFF865410.toInt()
+    const val COLOR_WARNING_LIGHT = 0xFFFFEFD5.toInt()
 
-    const val COLOR_DANGER = 0xFFF54A45.toInt()
-    const val COLOR_DANGER_LIGHT = 0xFFFEECEB.toInt()
+    const val COLOR_DANGER = 0xFF9E362E.toInt()
+    const val COLOR_DANGER_LIGHT = 0xFFFBE8E4.toInt()
 
     // Controls
-    const val COLOR_INPUT_BG = 0xFFF5F6F8.toInt()
-    const val COLOR_INPUT_BORDER = 0xFFE2E4E8.toInt()
-    const val COLOR_BTN_SECONDARY_BG = 0xFFF0F2F5.toInt()
-    const val COLOR_BTN_SECONDARY_TEXT = 0xFF1F2329.toInt()
+    const val COLOR_INPUT_BG = 0xFFF2F5F3.toInt()
+    const val COLOR_INPUT_BORDER = 0xFFDDE7E1.toInt()
+    const val COLOR_BTN_SECONDARY_BG = 0xFFE6EEEA.toInt()
+    const val COLOR_BTN_SECONDARY_TEXT = 0xFF182822.toInt()
 
     fun dp(context: Context, v: Float): Int =
         (v * context.resources.displayMetrics.density + 0.5f).toInt()
@@ -62,7 +62,7 @@ object UiTheme {
 
     fun createCardDrawable(
         context: Context,
-        radiusDp: Float = 16f,
+        radiusDp: Float = 22f,
         bgColor: Int = COLOR_CARD_BG,
         strokeColor: Int = COLOR_CARD_BORDER,
         strokeWidthDp: Float = 0.8f
